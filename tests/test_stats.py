@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 
 from jorgex_social.access.tokens import create_token
 from jorgex_social.clock import ManualClock
-from jorgex_social.instagram.errors import AuthError, Refused
+from jorgex_social.instagram.errors import AuthError, RateLimited, Refused
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
@@ -158,3 +158,80 @@ def test_api_rejects_dates_without_timezone(app, client):
     )
 
     assert response.status_code == 422
+
+
+def test_rate_limit_stops_the_sweep_and_keeps_what_was_saved(sessions, ig, clock):
+    for _ in range(3):
+        publish(ig, clock, IMAGE)
+    ig.fail_next("media_insights", Refused("first fails", code=100))
+    ig.fail_next("media_insights", RateLimited("slow down", code=4))
+
+    with pytest.raises(RateLimited):
+        SnapshotTask(ig, clock)(sessions)
+
+    assert count(sessions, AccountSnapshot) == BACKFILL_DAYS
+    assert count(sessions, PostSnapshot) == 0
+
+
+def test_a_gap_is_filled_without_duplicates(sessions, ig, clock):
+    task = SnapshotTask(ig, clock)
+    task(sessions)
+
+    clock.advance(days=10)
+    task(sessions)
+
+    with sessions() as session:
+        starts = session.scalars(select(AccountSnapshot.period_start)).all()
+    assert len(starts) == len(set(starts)) == BACKFILL_DAYS + 10
+
+
+def test_media_older_than_two_years_are_skipped(sessions, ig, clock):
+    publish(ig, clock, IMAGE)
+    clock.advance(days=731)
+
+    SnapshotTask(ig, clock)(sessions)
+
+    assert count(sessions, PostSnapshot) == 0
+
+
+def test_a_failing_media_waits_a_day_before_retrying(sessions, ig, clock):
+    publish(ig, clock, IMAGE)
+    task = SnapshotTask(ig, clock)
+    ig.fail_next("media_insights", Refused("temporary", code=100))
+    task(sessions)
+
+    clock.advance(hours=2)
+    ig.fail_next("media_insights", Refused("would fail again", code=100))
+    task(sessions)  # skipped: still backing off, so the queued failure is not consumed
+
+    clock.advance(days=1)
+    task(sessions)
+    assert count(sessions, PostSnapshot) == 0  # consumed the queued failure now
+    clock.advance(days=1, hours=1)
+    task(sessions)
+    assert count(sessions, PostSnapshot) == 1
+
+
+def test_simulated_rows_never_show_as_real(settings, sessions, ig, clock):
+    from fastapi.testclient import TestClient
+
+    from jorgex_social.api import create_app
+    from jorgex_social.config import Settings
+
+    publish(ig, clock, IMAGE)
+    SnapshotTask(ig, clock)(sessions)
+    real = create_app(Settings(database_path=settings.database_path, simulation=False))
+
+    response = TestClient(real).get("/v1/stats/media", headers=auth(real, stats="read"))
+
+    assert response.json() == []
+
+
+def test_media_list_pages_with_offset(app, client, sessions, ig, clock):
+    ids = [publish(ig, clock, IMAGE) for _ in range(3)]
+    SnapshotTask(ig, clock)(sessions)
+    headers = auth(app, stats="read")
+
+    page = client.get("/v1/stats/media", params={"limit": 2, "offset": 2}, headers=headers)
+
+    assert [m["media_ref"] for m in page.json()] == [ids[0]]

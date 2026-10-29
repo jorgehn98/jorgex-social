@@ -7,6 +7,7 @@ from sqlalchemy import text
 from jorgex_social.access.deps import TokenDep
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
+from jorgex_social.instagram import network_for
 from jorgex_social.stats.api import router as stats_router
 
 log = logging.getLogger(__name__)
@@ -16,6 +17,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     app = FastAPI(title="jorgex-social", version="0.1.0")
     app.state.settings = settings
+    app.state.network = network_for(settings)
     app.state.sessionmaker = make_sessionmaker(make_engine(settings))
 
     @app.get("/health", tags=["system"])

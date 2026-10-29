@@ -11,12 +11,15 @@ from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
 
 log = logging.getLogger(__name__)
 
-NETWORK = "instagram"
 SWEEP_EVERY = timedelta(hours=1)
 # Instagram data can lag up to 48 hours, so a day is only recorded once it is that old.
 DATA_DELAY = timedelta(hours=48)
 # Account insights are kept by Instagram for 90 days; on a first run, recover the last 30.
 BACKFILL_DAYS = 30
+# Instagram keeps media metrics for up to 2 years; asking for older ones only fails.
+MEDIA_INSIGHTS_RETENTION = timedelta(days=730)
+# A media whose metrics failed is not asked again for this long.
+FAILURE_BACKOFF = timedelta(days=1)
 # Recent media change fast; older media are sampled weekly.
 RECENT_MEDIA = timedelta(days=30)
 RECENT_INTERVAL = timedelta(days=1)
@@ -43,7 +46,9 @@ def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime
     with sessions() as session:
         recorded = set(
             session.scalars(
-                select(AccountSnapshot.period_start).where(AccountSnapshot.network == NETWORK)
+                select(AccountSnapshot.period_start).where(
+                    AccountSnapshot.network == instagram.network
+                )
             )
         )
     missing = [(start, end) for start, end in closed_days(now) if start not in recorded]
@@ -62,7 +67,7 @@ def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime
         with sessions() as session, session.begin():
             session.add(
                 AccountSnapshot(
-                    network=NETWORK,
+                    network=instagram.network,
                     period_start=start,
                     period_end=end,
                     taken_at=now,
@@ -75,26 +80,38 @@ def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime
 
 
 def _due(media: Media, last: datetime | None, now: datetime) -> bool:
+    if now - media.timestamp > MEDIA_INSIGHTS_RETENTION:
+        return False
     if last is None:
         return True
     interval = RECENT_INTERVAL if now - media.timestamp < RECENT_MEDIA else OLD_INTERVAL
     return now - last >= interval
 
 
-def snapshot_media(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
+def snapshot_media(
+    sessions: sessionmaker,
+    instagram: Instagram,
+    now: datetime,
+    failed_at: dict[str, datetime] | None = None,
+) -> int:
     """Feed posts and reels, including the ones published by hand. Stories come with step 4."""
     items = instagram.list_media()
     with sessions() as session:
         last_taken = dict(
             session.execute(
                 select(PostSnapshot.media_ref, func.max(PostSnapshot.taken_at))
-                .where(PostSnapshot.network == NETWORK)
+                .where(PostSnapshot.network == instagram.network)
                 .group_by(PostSnapshot.media_ref)
             ).all()
         )
     taken = 0
     for media in items:
         if not _due(media, last_taken.get(media.id), now):
+            continue
+        if (
+            failed_at is not None
+            and now - failed_at.get(media.id, now - FAILURE_BACKOFF) < FAILURE_BACKOFF
+        ):
             continue
         try:
             metrics = instagram.media_insights(media.id, media.product_type)
@@ -103,11 +120,13 @@ def snapshot_media(sessions: sessionmaker, instagram: Instagram, now: datetime) 
         except InstagramError as exc:
             # One deleted post or failing call must not hide the rest.
             log.warning("media insights failed", extra={"media_ref": media.id, "error": str(exc)})
+            if failed_at is not None:
+                failed_at[media.id] = now
             continue
         with sessions() as session, session.begin():
             session.add(
                 PostSnapshot(
-                    network=NETWORK,
+                    network=instagram.network,
                     media_ref=media.id,
                     taken_at=now,
                     product_type=media.product_type.value,
@@ -129,15 +148,20 @@ class SnapshotTask:
         self.instagram = instagram
         self.clock = clock
         self._last_sweep: datetime | None = None
+        self._failed_at: dict[str, datetime] = {}
 
     def __call__(self, sessions: sessionmaker) -> None:
         now = self.clock.now()
         if self._last_sweep and now - self._last_sweep < SWEEP_EVERY:
             return
         self._last_sweep = now
-        for step in (snapshot_account, snapshot_media):
+        steps = (
+            ("account", lambda: snapshot_account(sessions, self.instagram, now)),
+            ("media", lambda: snapshot_media(sessions, self.instagram, now, self._failed_at)),
+        )
+        for name, step in steps:
             try:
-                taken = step(sessions, self.instagram, now)
+                taken = step()
             except _STOP_SWEEP:
                 raise
             except InstagramError as exc:
@@ -146,4 +170,4 @@ class SnapshotTask:
                 )
                 continue
             if taken:
-                log.info("snapshots taken", extra={"step": step.__name__, "count": taken})
+                log.info("snapshots taken", extra={"step": name, "count": taken})

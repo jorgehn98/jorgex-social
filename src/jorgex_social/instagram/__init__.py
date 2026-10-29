@@ -10,6 +10,10 @@ from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import Instagram
 
 
+def network_for(settings: Settings) -> str:
+    return FakeInstagram.network if settings.simulation else InstagramClient.network
+
+
 def make_instagram(settings: Settings, clock: Clock) -> Instagram:
     if settings.simulation:
         return FakeInstagram(clock)

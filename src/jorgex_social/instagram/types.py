@@ -96,6 +96,9 @@ class Media:
 class Instagram(Protocol):
     """What the service needs from Instagram so far. It grows with each build step."""
 
+    # Stored with every row, so simulated data can never pass for real data.
+    network: str
+
     def account(self) -> Account: ...
     def publishing_limit(self) -> PublishingLimit: ...
     def create_container(self, request: ContainerRequest) -> str: ...
