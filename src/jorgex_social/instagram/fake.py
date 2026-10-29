@@ -11,6 +11,7 @@ from jorgex_social.instagram.types import (
     ContainerKind,
     ContainerRequest,
     ContainerStatus,
+    Instagram,
     Media,
     ProductType,
     PublishingLimit,
@@ -76,6 +77,8 @@ class FakeInstagram:
     # Test and simulation controls
 
     def fail_next(self, operation: str, error: InstagramError, *, after: bool = False) -> None:
+        if operation not in Instagram.__dict__:
+            raise ValueError(f"unknown operation {operation!r}")
         self._failures.setdefault(operation, []).append(_Failure(error, after))
 
     def mark_error(self, container_id: str) -> None:
@@ -136,6 +139,8 @@ class FakeInstagram:
                     raise Refused(f"carousel item {child} is not ready", code=9007)
         elif not request.url:
             raise Refused("media url is required", code=100)
+        elif request.kind == ContainerKind.VIDEO and not request.is_carousel_item:
+            raise Refused("VIDEO containers are only for carousel items; use REELS", code=100)
         now = self.clock.now()
         is_video = request.kind in {ContainerKind.REELS, ContainerKind.VIDEO} or request.is_video
         container_id = self._new_id()
@@ -221,6 +226,9 @@ class FakeInstagram:
 
     def _insights(self, media_id: str, product_type: ProductType) -> dict[str, Any]:
         media = self._get_media(media_id)
+        if product_type != media.product_type:
+            # The real API rejects the whole request when a metric does not apply to the media.
+            raise Refused(f"metrics for {product_type} do not apply to this media", code=100)
         age = self.clock.now() - media.timestamp
         if product_type == ProductType.STORY and age > STORY_INSIGHTS_LIFETIME:
             raise Refused("story insights are only available for 24 hours", code=10)

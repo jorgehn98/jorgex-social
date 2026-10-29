@@ -1,10 +1,11 @@
 import json
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from jorgex_social.instagram.errors import AuthError, RateLimited, Refused, Unavailable
 from jorgex_social.instagram.types import (
@@ -45,6 +46,15 @@ MEDIA_FIELDS = "id,caption,media_product_type,media_type,permalink,timestamp"
 RATE_LIMIT_CODES = {4, 17, 32, 613}
 AUTH_ERROR_CODE = 190
 
+
+class _NoRedirect(HTTPRedirectHandler):
+    # urllib would forward the Authorization header to wherever a redirect points.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = build_opener(_NoRedirect)
+
 # (method, url, headers, body) -> (status, body). Swapped in tests; the default is urllib.
 Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
 
@@ -54,7 +64,7 @@ def urllib_transport(
 ) -> tuple[int, bytes]:
     request = Request(url, data=body, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with _opener.open(request, timeout=TIMEOUT_SECONDS) as response:
             return response.status, response.read()
     except HTTPError as exc:
         return exc.code, exc.read()
@@ -62,8 +72,10 @@ def urllib_transport(
 
 def _error(status: int, raw: bytes) -> Exception:
     try:
-        error = json.loads(raw).get("error") or {}
+        error = json.loads(raw).get("error")
     except ValueError, AttributeError:
+        error = None
+    if not isinstance(error, dict):
         error = {}
     code, subcode = error.get("code"), error.get("error_subcode")
     message = f"Instagram API {status}: {str(error.get('message') or raw[:200])[:300]}"
@@ -96,10 +108,22 @@ def _metrics(data: list[dict[str, Any]]) -> dict[str, Any]:
     return values
 
 
-def _media(item: dict[str, Any]) -> Media:
+def _field(data: dict[str, Any], name: str) -> Any:
+    # A 2xx without the expected field is not an answer: for a write, the outcome is unknown.
+    if name not in data:
+        raise Unavailable(f"Instagram API response without {name!r}")
+    return data[name]
+
+
+def _media(item: dict[str, Any]) -> Media | None:
+    """None for product types this service does not handle (for example ads or legacy IGTV)."""
+    try:
+        product_type = ProductType(item.get("media_product_type") or ProductType.FEED)
+    except ValueError:
+        return None
     return Media(
         id=item["id"],
-        product_type=ProductType(item.get("media_product_type") or ProductType.FEED),
+        product_type=product_type,
         media_type=item.get("media_type", ""),
         permalink=item.get("permalink"),
         timestamp=datetime.fromisoformat(item["timestamp"]),
@@ -138,7 +162,7 @@ class InstagramClient:
         headers = {"Authorization": f"Bearer {self._token}"}
         try:
             status, raw = self._transport(method, url, headers, body)
-        except (URLError, TimeoutError, OSError) as exc:
+        except (URLError, TimeoutError, OSError, HTTPException) as exc:
             raise Unavailable(f"Instagram API connection error: {exc}") from None
         if status >= 400:
             raise _error(status, raw)
@@ -176,18 +200,21 @@ class InstagramClient:
         )
 
     def create_container(self, request: ContainerRequest) -> str:
-        return self._call("POST", f"/{self._user_id}/media", request.to_params())["id"]
+        return _field(self._call("POST", f"/{self._user_id}/media", request.to_params()), "id")
 
     def container_status(self, container_id: str) -> ContainerStatus:
         data = self._call("GET", f"/{container_id}", {"fields": "status_code"})
-        return ContainerStatus(data["status_code"])
+        return ContainerStatus(_field(data, "status_code"))
 
     def publish(self, container_id: str) -> str:
         data = self._call("POST", f"/{self._user_id}/media_publish", {"creation_id": container_id})
-        return data["id"]
+        return _field(data, "id")
 
     def media(self, media_id: str) -> Media:
-        return _media(self._call("GET", f"/{media_id}", {"fields": MEDIA_FIELDS}))
+        media = _media(self._call("GET", f"/{media_id}", {"fields": MEDIA_FIELDS}))
+        if media is None:
+            raise Refused(f"media {media_id} has an unsupported product type")
+        return media
 
     def list_media(self, max_items: int | None = None) -> list[Media]:
         """Feed posts and reels, newest first. Stories are not listed by this endpoint."""
@@ -200,7 +227,7 @@ class InstagramClient:
                 f"/{self._user_id}/media",
                 {"fields": MEDIA_FIELDS, "limit": PAGE_SIZE, "after": after},
             )
-            items.extend(_media(item) for item in page.get("data", []))
+            items.extend(m for m in map(_media, page.get("data", [])) if m is not None)
             paging = page.get("paging") or {}
             after = (paging.get("cursors") or {}).get("after")
             if "next" not in paging or not after:

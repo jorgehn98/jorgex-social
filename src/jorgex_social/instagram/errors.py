@@ -10,7 +10,11 @@ class InstagramError(Exception):
 
 
 class Refused(InstagramError):
-    """Instagram answered and said no (4xx). A write did not happen."""
+    """Instagram answered and said no (4xx), so a write should not have happened.
+
+    Before retrying a publish after any error, still check the container status: only
+    PUBLISHED proves it went live, and that check is cheap.
+    """
 
     def __init__(self, message: str, *, transient: bool = False, **kwargs) -> None:
         super().__init__(message, **kwargs)
@@ -22,7 +26,7 @@ class RateLimited(Refused):
 
 
 class AuthError(Refused):
-    """The credential is invalid, expired or lacks a permission (code 190)."""
+    """The credential is invalid or expired (code 190). Missing permissions arrive as Refused."""
 
 
 class Unavailable(InstagramError):

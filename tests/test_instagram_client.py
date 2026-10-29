@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from http.client import IncompleteRead
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -213,3 +214,35 @@ def test_publishing_limit():
     limit = ig.publishing_limit()
 
     assert (limit.quota_usage, limit.quota_total, limit.quota_duration_seconds) == (3, 100, 86400)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        IncompleteRead(b"partial"),
+        (503, {"error": "upstream"}),
+        (200, {"unexpected": True}),
+    ],
+)
+def test_publish_without_a_usable_answer_is_unavailable(response):
+    ig, _ = client(response)
+
+    with pytest.raises(Unavailable):
+        ig.publish("1")
+
+
+def test_list_media_skips_unknown_product_types():
+    base = {"timestamp": "2026-10-01T10:00:00+0000"}
+    ig, _ = client(
+        (
+            200,
+            {
+                "data": [
+                    {**base, "id": "1", "media_product_type": "AD"},
+                    {**base, "id": "2", "media_product_type": "FEED"},
+                ]
+            },
+        )
+    )
+
+    assert [m.id for m in ig.list_media()] == ["2"]

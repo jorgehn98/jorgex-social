@@ -163,3 +163,20 @@ def test_account_insights_window(ig, clock):
     assert ig.account_insights(now - timedelta(days=7), now)["reach"] > 0
     with pytest.raises(ValueError):
         ig.account_insights(now - timedelta(days=31), now)
+
+
+def test_video_container_outside_a_carousel_is_refused(ig):
+    with pytest.raises(Refused):
+        ig.create_container(ContainerRequest(ContainerKind.VIDEO, url="v"))
+
+
+def test_insights_must_match_the_product_type(ig):
+    image = publish(ig, IMAGE)
+
+    with pytest.raises(Refused):
+        ig.media_insights(image, ProductType.REELS)
+
+
+def test_fail_next_rejects_unknown_operations(ig):
+    with pytest.raises(ValueError):
+        ig.fail_next("pubilsh", Unavailable("typo"))
