@@ -59,6 +59,8 @@ class FakeInstagram:
     `fail_next` injects errors, including the ones that leave a write's outcome unknown.
     """
 
+    network = "simulation"
+
     def __init__(
         self,
         clock: Clock,

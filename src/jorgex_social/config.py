@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ENV_PREFIX = "JORGEX_SOCIAL_"
@@ -16,10 +16,13 @@ def _flag(value: str) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    database_path: Path = Path("data/jorgex_social.db")
+    database_path: Path = Path("data/jorgex-social.db")
     # A fresh install never calls the real network; going live is an explicit choice.
     simulation: bool = True
     worker_interval_seconds: float = 10.0
+    # Until the in-app connection exists (build step 5), the real adapter reads these.
+    instagram_access_token: str | None = field(default=None, repr=False)
+    instagram_user_id: str | None = None
 
     @property
     def database_url(self) -> str:
@@ -35,4 +38,6 @@ class Settings:
             worker_interval_seconds=float(
                 env.get(f"{ENV_PREFIX}WORKER_INTERVAL_SECONDS", defaults.worker_interval_seconds)
             ),
+            instagram_access_token=env.get(f"{ENV_PREFIX}INSTAGRAM_ACCESS_TOKEN") or None,
+            instagram_user_id=env.get(f"{ENV_PREFIX}INSTAGRAM_USER_ID") or None,
         )

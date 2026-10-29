@@ -2,12 +2,14 @@ import logging
 import threading
 from collections.abc import Callable, Sequence
 
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
 log = logging.getLogger(__name__)
 
-# A task reads its due work from the domain tables (decision 09: no generic jobs table).
-Task = Callable[[Session], None]
+# A task reads its due work from the domain tables (decision 09: no generic jobs table). It gets
+# the sessionmaker, not a session, because it must commit before each call to Meta and never
+# hold the database lock while waiting on the network.
+Task = Callable[[sessionmaker], None]
 
 TASKS: Sequence[Task] = ()
 
@@ -15,11 +17,10 @@ TASKS: Sequence[Task] = ()
 def run_once(sessions: sessionmaker, tasks: Sequence[Task]) -> None:
     for task in tasks:
         try:
-            with sessions() as session, session.begin():
-                task(session)
+            task(sessions)
         except Exception:
             # One failing task must not stop the others or the loop.
-            log.exception("task failed", extra={"task": task.__name__})
+            log.exception("task failed", extra={"task": getattr(task, "__name__", repr(task))})
 
 
 def run(

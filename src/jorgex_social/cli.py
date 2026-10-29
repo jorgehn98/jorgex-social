@@ -13,8 +13,11 @@ from sqlalchemy import select
 from jorgex_social import logs, worker
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
+from jorgex_social.clock import SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
+from jorgex_social.instagram import make_instagram
+from jorgex_social.stats.snapshots import SnapshotTask
 
 
 def alembic_config(settings: Settings) -> Config:
@@ -87,13 +90,17 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
     logs.configure()
     stop = threading.Event()
     sessions = make_sessionmaker(make_engine(settings))
+    clock = SystemClock()
+    tasks = [SnapshotTask(make_instagram(settings, clock), clock)]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the
     # signal synchronously. `docker stop` sends SIGTERM.
     signals = {signal.SIGINT, signal.SIGTERM}
     signal.pthread_sigmask(signal.SIG_BLOCK, signals)
     loop = threading.Thread(
-        target=worker.run, args=(sessions, settings.worker_interval_seconds, stop), name="worker"
+        target=worker.run,
+        args=(sessions, settings.worker_interval_seconds, stop, tasks),
+        name="worker",
     )
     loop.start()
     signal.sigwait(signals)

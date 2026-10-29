@@ -134,6 +134,8 @@ def _media(item: dict[str, Any]) -> Media | None:
 class InstagramClient:
     """Instagram API with Instagram Login (graph.instagram.com), standard library only."""
 
+    network = "instagram"
+
     def __init__(
         self,
         access_token: str,
