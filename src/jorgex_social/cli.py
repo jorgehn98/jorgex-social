@@ -165,7 +165,13 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
     stop = threading.Event()
     sessions = make_sessionmaker(make_engine(settings))
     clock = SystemClock()
-    instagram = make_instagram(settings, clock)
+    # One key for the client and the renewals, so a renewed credential is always readable.
+    key = (
+        None
+        if settings.simulation and not settings.secret_key_file.exists()
+        else load_key(settings.secret_key_file)
+    )
+    instagram = make_instagram(settings, clock, key)
     public_url = settings.public_url or (SIMULATED_PUBLIC_URL if settings.simulation else None)
     tasks = [
         PublishTask(
@@ -176,7 +182,7 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
             grace=timedelta(minutes=settings.publish_grace_minutes),
         ),
         SnapshotTask(instagram, clock),
-        ConnectionTask(instagram, clock, settings.secret_key_file),
+        ConnectionTask(instagram, clock, key),
     ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the

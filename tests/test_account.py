@@ -17,8 +17,9 @@ from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
 from jorgex_social.instagram import make_instagram
 from jorgex_social.instagram.client import InstagramClient
-from jorgex_social.instagram.errors import AuthError, Unavailable
+from jorgex_social.instagram.errors import AuthError, CredentialUnavailable, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
+from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 PASTED = "pasted-token-not-real"
@@ -52,8 +53,8 @@ def key(settings):
 
 
 @pytest.fixture
-def task(ig, clock, settings):
-    return ConnectionTask(ig, clock, settings.secret_key_file)
+def task(ig, clock, key):
+    return ConnectionTask(ig, clock, key)
 
 
 def headers_for(app, **grants):
@@ -70,8 +71,9 @@ def headers(app):
 class StubTransport:
     """Answers by URL, like Meta would, and keeps what was sent."""
 
-    def __init__(self, renewed=RENEWED):
+    def __init__(self, renewed=RENEWED, user_id="1784"):
         self.renewed = renewed
+        self.user_id = user_id
         self.calls = []
 
     def __call__(self, method, url, headers, body):
@@ -81,7 +83,12 @@ class StubTransport:
         elif "content_publishing_limit" in url:
             payload = {"data": [{"quota_usage": 1, "config": {"quota_total": 100}}]}
         else:
-            payload = {"user_id": "1784", "username": "test_account", "account_type": "BUSINESS"}
+            payload = {
+                "id": "17900000000000001",  # what media_publish answers; /me ignores it
+                "user_id": self.user_id,
+                "username": f"account_{self.user_id}",
+                "account_type": "BUSINESS",
+            }
         return 200, json.dumps(payload).encode()
 
 
@@ -164,7 +171,7 @@ def test_credential_is_stored_only_encrypted_and_never_shown(
     for secret in (PASTED, RENEWED):
         assert all(secret not in text for text in shown)
         assert secret.encode() not in on_disk
-    assert json.loads(shown[0])["account"]["username"] == "test_account"
+    assert json.loads(shown[0])["account"]["username"] == "account_1784"
     assert crypto.decrypt(key, stored.credential_encrypted, credential_context("instagram")) == (
         RENEWED
     )
@@ -183,10 +190,10 @@ def test_worker_client_uses_the_renewed_token_at_once(real, key, clock, settings
         sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
     )
     transport = StubTransport(renewed="second-renewal-not-real")
-    worker_client = InstagramClient(
-        StoredCredential(sessions, key, "instagram"), "1784", transport=transport
+    worker_client = InstagramClient.from_source(
+        StoredCredential(sessions, key, "instagram"), transport=transport
     )
-    task = ConnectionTask(worker_client, clock, settings.secret_key_file)
+    task = ConnectionTask(worker_client, clock, key)
 
     clock.advance(days=11)
     task(sessions)
@@ -236,7 +243,7 @@ def test_a_token_too_young_to_renew_is_stored_with_an_estimated_expiry(
     assert PASTED not in caplog.text
 
     # The worker renews it once Meta accepts, well before the estimate runs out.
-    task = ConnectionTask(young, clock, settings.secret_key_file)
+    task = ConnectionTask(young, clock, key)
     clock.advance(days=10)
     task(sessions)
     assert len(refreshes) == 2  # the refused one at connect time, then the real renewal
@@ -306,7 +313,7 @@ def test_never_renews_a_credential_younger_than_24_hours(sessions, clock, key, s
     short = FakeInstagram(clock, credential_lifetime=timedelta(days=40))
     connect(sessions, short, PASTED, key, clock.now())
     refreshes = count_calls(short, "refresh_token")
-    task = ConnectionTask(short, clock, settings.secret_key_file)
+    task = ConnectionTask(short, clock, key)
 
     for _ in range(23):
         clock.advance(hours=1)
@@ -331,16 +338,119 @@ def test_never_renews_an_expired_credential(sessions, ig, key, clock, task, clie
     assert client.get("/v1/account", headers=headers).json()["status"] == "expired"
 
 
-def test_renewal_needs_the_key_before_asking_meta(sessions, ig, key, clock, task, settings):
+def test_never_renews_with_a_key_that_cannot_read_the_credential(sessions, ig, key, clock):
     connect(sessions, ig, PASTED, key, clock.now())
     refreshes = count_calls(ig, "refresh_token")
-    settings.secret_key_file.unlink()
+    task = ConnectionTask(ig, clock, crypto.secrets.token_bytes(32))
 
     clock.advance(days=11)
-    with pytest.raises(crypto.SecretKeyError):
-        task(sessions)
+    task(sessions)
 
-    assert refreshes == []  # a new token that could not be stored would be lost
+    assert refreshes == []  # a token stored under the wrong key would be unreadable
+    assert connection(sessions).status == "unreadable"
+    assert open_incidents(sessions) == ["credential_unreadable"]
+
+
+def other_key_file(settings):
+    settings.secret_key_file.unlink()
+    crypto.ensure_key(settings.secret_key_file)
+
+
+def test_real_mode_refuses_to_start_with_a_key_that_does_not_decrypt(real, settings, key, clock):
+    connect(
+        real.state.sessionmaker,
+        InstagramClient(PASTED, "me", transport=StubTransport()),
+        PASTED,
+        key,
+        clock.now(),
+    )
+    other_key_file(settings)  # restored the wrong key, or migrate ran from another directory
+
+    with pytest.raises(CredentialUnavailable, match="does not decrypt"):
+        make_instagram(real.state.settings, clock)
+
+
+def test_unreadable_credential_is_reported_and_nothing_is_sent(real, key, clock):
+    from fastapi.testclient import TestClient
+
+    sessions = real.state.sessionmaker
+    connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
+    )
+    transport = StubTransport()
+
+    def client_with(worker_key):
+        return InstagramClient.from_source(
+            StoredCredential(sessions, worker_key, "instagram"), transport=transport
+        )
+
+    wrong = crypto.secrets.token_bytes(32)
+    with pytest.raises(CredentialUnavailable):
+        client_with(wrong).create_container(ContainerRequest(ContainerKind.IMAGE, url="u"))
+    ConnectionTask(client_with(wrong), clock, wrong)(sessions)
+
+    assert transport.calls == []
+    assert open_incidents(sessions) == ["credential_unreadable"]
+    account = TestClient(real).get("/v1/account", headers=headers_for(real, account="read"))
+    assert account.json()["status"] == "unreadable"
+
+    ConnectionTask(client_with(key), clock, key)(sessions)  # the right key is back
+    assert connection(sessions, "instagram").status == "ok"
+    assert open_incidents(sessions) == []
+
+
+def test_replacing_the_account_applies_at_once_to_token_and_id(real, key, clock):
+    sessions = real.state.sessionmaker
+    connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
+    )
+    transport = StubTransport()
+    worker_client = InstagramClient.from_source(
+        StoredCredential(sessions, key, "instagram"), transport=transport
+    )
+    worker_client.publish("1")
+    connect(
+        sessions,
+        InstagramClient("b-pasted", "me", transport=StubTransport("b-renewed", user_id="2048")),
+        "b-pasted",
+        key,
+        clock.now(),
+        replace=True,
+    )
+    worker_client.publish("1")
+
+    (_, before, before_headers), (_, after, after_headers) = transport.calls
+    assert (
+        "/1784/media_publish" in before and before_headers["Authorization"] == f"Bearer {RENEWED}"
+    )
+    assert "/2048/media_publish" in after and after_headers["Authorization"] == "Bearer b-renewed"
+
+
+def test_a_reconnect_during_renewal_wins(sessions, ig, key, clock, task):
+    connect(sessions, ig, PASTED, key, clock.now())
+    other = other_account(clock)
+    original = ig.refresh_token
+
+    def refresh_while_reconnecting():
+        renewal = original()
+        connect(sessions, other, "other-pasted", key, clock.now(), replace=True)
+        return renewal
+
+    ig.refresh_token = refresh_while_reconnecting
+    clock.advance(days=11)
+    reconnected_at = clock.now()
+    task.check(sessions, clock.now())
+
+    stored = connection(sessions)
+    token = crypto.decrypt(key, stored.credential_encrypted, credential_context("simulation"))
+    assert token == "simulated-token-1"  # the reconnect's renewal, not the worker's
+    assert stored.external_account_id == "999"
+    assert stored.credential_expires_at == reconnected_at + timedelta(days=60)
+    with sessions() as session:
+        details = session.scalars(
+            select(AuditEntry.detail).where(AuditEntry.action == "credential.renewed")
+        ).all()
+    assert details == [{"discarded": "connection_changed"}]
 
 
 # Status and incidents

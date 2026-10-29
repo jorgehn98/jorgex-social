@@ -286,17 +286,15 @@ def test_refresh_errors_never_carry_the_token_or_the_url(response, error):
     assert "refresh_access_token" not in str(caught.value)
 
 
-def test_a_token_source_is_asked_on_every_call():
-    tokens = iter(["first-not-real", "second-not-real"])
-    transport = StubTransport(
-        (200, {"status_code": "FINISHED"}), (200, {"status_code": "FINISHED"})
-    )
-    ig = InstagramClient(lambda: next(tokens), "1784", transport=transport)
+def test_a_credential_source_is_asked_on_every_call():
+    credentials = iter([("first-not-real", "1784"), ("second-not-real", "2048")])
+    transport = StubTransport((200, {"id": "1"}), (200, {"id": "2"}))
+    ig = InstagramClient.from_source(lambda: next(credentials), transport=transport)
 
-    ig.container_status("1")
-    ig.container_status("1")
+    ig.publish("9")
+    ig.publish("9")
 
-    assert [call[2]["Authorization"] for call in transport.calls] == [
-        "Bearer first-not-real",
-        "Bearer second-not-real",
+    assert [(call[1].split("/")[-2], call[2]["Authorization"]) for call in transport.calls] == [
+        ("1784", "Bearer first-not-real"),
+        ("2048", "Bearer second-not-real"),
     ]

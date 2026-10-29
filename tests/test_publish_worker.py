@@ -821,7 +821,7 @@ def test_unresolved_outcome_opens_an_incident_after_an_hour_and_closes(
     from jorgex_social.account.connection import ConnectionTask
     from jorgex_social.account.models import ChannelIncident
 
-    watcher = ConnectionTask(ig, clock, settings.secret_key_file)
+    watcher = ConnectionTask(ig, clock, None)
     post_id = api.post()
     api.publish_now(post_id)
     ig.fail_next("publish", Unavailable("502"), after=True)
@@ -869,3 +869,36 @@ def test_worker_transitions_are_audited_as_system(api, task, sessions, ig):
         ("post.published", published_id, "ok", None),
         ("post.failed", refused_id, "error", {"failure": "refused"}),
     ]
+
+
+def test_unreadable_credential_starts_no_attempt(api, task, sessions, ig, requests):
+    from jorgex_social.instagram.errors import CredentialUnavailable
+
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("check_credential", CredentialUnavailable("does not decrypt"))
+
+    task(sessions)
+
+    post = api.get(post_id)
+    assert (post["status"], post["attempts"], requests) == ("scheduled", [], [])
+
+    task(sessions)  # the right key is back
+    assert api.get(post_id)["status"] == "published"
+
+
+def test_credential_lost_mid_attempt_fails_the_post_without_leaving_it_stuck(
+    api, task, sessions, ig, publishes
+):
+    from jorgex_social.instagram.errors import CredentialUnavailable
+
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("create_container", CredentialUnavailable("does not decrypt"))
+
+    task(sessions)
+
+    post = api.get(post_id)
+    assert (post["status"], post["failure"]) == ("failed", "credential_unavailable")
+    assert post["attempts"][0]["result"] == "rejected"
+    assert publishes == []

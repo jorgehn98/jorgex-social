@@ -18,6 +18,7 @@ class ConnectionStatus(StrEnum):
     EXPIRING = "expiring"  # the credential expires in less than ten days
     EXPIRED = "expired"
     REVOKED = "revoked"  # the network rejects a credential that has not expired
+    UNREADABLE = "unreadable"  # the stored credential does not decrypt with the secret key
     MISSING = "missing"  # no connection; reported by the API, never stored
 
 
@@ -25,6 +26,7 @@ class IncidentType(StrEnum):
     CREDENTIAL_EXPIRING = "credential_expiring"
     CREDENTIAL_EXPIRED = "credential_expired"
     PERMISSION_REVOKED = "permission_revoked"
+    CREDENTIAL_UNREADABLE = "credential_unreadable"
     PERSISTENT_API_ERROR = "persistent_api_error"
     PUBLISH_UNRESOLVED = "publish_unresolved"
 

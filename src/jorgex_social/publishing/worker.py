@@ -18,7 +18,7 @@ from jorgex_social.account import audit, kill_switch
 from jorgex_social.account.models import Outcome
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.client import TIMEOUT_SECONDS
-from jorgex_social.instagram.errors import InstagramError, Refused
+from jorgex_social.instagram.errors import CredentialUnavailable, InstagramError, Refused
 from jorgex_social.instagram.types import (
     ContainerKind,
     ContainerRequest,
@@ -178,8 +178,19 @@ class PublishTask:
                     session, now, "post.failed", post, Outcome.ERROR, {"failure": post.failure}
                 )
                 log.warning("missed schedule", extra={"post_id": post.id})
-        while (plan := self._start(sessions, now)) is not None:
+        while self._credential_readable() and (plan := self._start(sessions, now)) is not None:
             self._attempt(sessions, plan)
+
+    def _credential_readable(self) -> bool:
+        """Checked before an attempt is committed: with a credential that cannot be read (wrong
+        secret key, no connection) posts stay scheduled instead of starting attempts that cannot
+        reach Instagram. The connection task reports it as an incident."""
+        try:
+            self.instagram.check_credential()
+        except CredentialUnavailable as exc:
+            log.error("credential unavailable; not publishing", extra={"error": str(exc)})
+            return False
+        return True
 
     def _start(self, sessions: sessionmaker, now: datetime) -> _Plan | None:
         """Marks the next due post publishing, with an attempt and public URLs, in one commit."""
@@ -242,6 +253,11 @@ class PublishTask:
             container = self._create_containers(plan)
         except ContainerFailed as exc:
             self._end(sessions, plan.attempt_id, AttemptResult.REJECTED, failure=exc.failure)
+            return
+        except CredentialUnavailable:
+            self._end(
+                sessions, plan.attempt_id, AttemptResult.REJECTED, failure="credential_unavailable"
+            )
             return
         except Refused as exc:
             self._end(
@@ -323,6 +339,12 @@ class PublishTask:
     def _publish(self, sessions: sessionmaker, attempt_id: str, container: str) -> None:
         try:
             media_ref = self.instagram.publish(container)
+        except CredentialUnavailable:
+            # Raised before the request is sent, so nothing went live.
+            self._end(
+                sessions, attempt_id, AttemptResult.REJECTED, failure="credential_unavailable"
+            )
+            return
         except Refused as exc:
             # A 4xx should mean nothing went live, but only PUBLISHED proves it either way.
             try:

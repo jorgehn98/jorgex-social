@@ -280,6 +280,12 @@ class FakeInstagram:
             lambda: {"reach": 300 * days, "views": 500 * days, "accounts_engaged": 20 * days},
         )
 
+    def check_credential(self) -> None:
+        # Nothing to read in simulation; `fail_next` can still inject a CredentialUnavailable.
+        failure = self._failure("check_credential")
+        if failure:
+            raise failure.error
+
     def refresh_token(self) -> Renewal:
         return self._run("refresh_token", self._refresh)
 

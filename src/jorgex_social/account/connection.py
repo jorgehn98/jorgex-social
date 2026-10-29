@@ -2,14 +2,12 @@
 
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from jorgex_social.account import audit, incidents
-from jorgex_social.account.credential import connection_of, seal
-from jorgex_social.account.crypto import load_key
+from jorgex_social.account import audit, crypto, incidents
+from jorgex_social.account.credential import connection_of, credential_context, seal
 from jorgex_social.account.models import (
     ActorType,
     Connection,
@@ -18,7 +16,12 @@ from jorgex_social.account.models import (
     Outcome,
 )
 from jorgex_social.clock import Clock
-from jorgex_social.instagram.errors import AuthError, InstagramError, Refused
+from jorgex_social.instagram.errors import (
+    AuthError,
+    CredentialUnavailable,
+    InstagramError,
+    Refused,
+)
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import Account, Instagram, PublishingLimit
 from jorgex_social.publishing.models import AttemptResult, Post, PostStatus, PublishAttempt
@@ -47,8 +50,8 @@ def status_at(connection: Connection, now: datetime) -> ConnectionStatus:
     expires_at = connection.credential_expires_at
     if expires_at is not None and expires_at <= now:
         return ConnectionStatus.EXPIRED
-    if connection.status == ConnectionStatus.REVOKED:
-        return ConnectionStatus.REVOKED
+    if connection.status in {ConnectionStatus.REVOKED, ConnectionStatus.UNREADABLE}:
+        return ConnectionStatus(connection.status)
     if expires_at is not None and expires_at - now < EXPIRING_WITHIN:
         return ConnectionStatus.EXPIRING
     return ConnectionStatus.OK
@@ -142,10 +145,12 @@ class ConnectionTask:
 
     __name__ = "connection"
 
-    def __init__(self, instagram: Instagram, clock: Clock, secret_key_file: Path) -> None:
+    def __init__(self, instagram: Instagram, clock: Clock, key: bytes | None) -> None:
+        """`key` is the one the worker's client decrypts with: renewing with any other would
+        store a credential the client cannot read. None only in simulation without a key."""
         self.instagram = instagram
         self.clock = clock
-        self.secret_key_file = secret_key_file
+        self.key = key
         self._last_check: datetime | None = None
         self._consecutive_errors = 0
 
@@ -163,8 +168,9 @@ class ConnectionTask:
             connection = connection_of(session, network)
         if connection is None and network != FakeInstagram.network:
             return  # nothing connected; the API reports it as missing
+        unreadable = False
         if connection is not None and should_renew(connection, now):
-            self._renew(sessions, now)
+            unreadable = not self._renew(sessions, connection, now)
 
         account: Account | None = None
         limits: dict | None = None
@@ -173,6 +179,9 @@ class ConnectionTask:
             answered = self.instagram.account()
             limits = _limits(self.instagram.publishing_limit())
             account = answered
+        except CredentialUnavailable as exc:
+            unreadable = True
+            log.error("stored credential unreadable", extra={"error": str(exc)})
         except AuthError:
             auth_failed = True
         except InstagramError as exc:
@@ -180,7 +189,7 @@ class ConnectionTask:
 
         if account is not None:
             self._consecutive_errors = 0
-        elif not auth_failed:
+        elif not (auth_failed or unreadable):
             self._consecutive_errors += 1
         with sessions() as session, session.begin():
             connection = connection_of(session, network)
@@ -189,7 +198,9 @@ class ConnectionTask:
                 connection = Connection(network=network, external_account_id=account.id)
                 session.add(connection)
             if connection is not None:
-                if account is not None:
+                if unreadable:
+                    connection.status = ConnectionStatus.UNREADABLE
+                elif account is not None:
                     connection.username = account.username
                     connection.account_type = account.account_type
                     connection.limits = limits
@@ -205,6 +216,7 @@ class ConnectionTask:
                 (IncidentType.CREDENTIAL_EXPIRING, status == ConnectionStatus.EXPIRING),
                 (IncidentType.CREDENTIAL_EXPIRED, status == ConnectionStatus.EXPIRED),
                 (IncidentType.PERMISSION_REVOKED, status == ConnectionStatus.REVOKED),
+                (IncidentType.CREDENTIAL_UNREADABLE, status == ConnectionStatus.UNREADABLE),
             ):
                 incidents.sync(session, network, type_, active, now)
             incidents.sync(
@@ -216,10 +228,18 @@ class ConnectionTask:
                 {"consecutive_failures": self._consecutive_errors},
             )
 
-    def _renew(self, sessions: sessionmaker, now: datetime) -> None:
-        # Loaded first: a renewed token that cannot be stored would be lost.
-        key = load_key(self.secret_key_file)
+    def _renew(self, sessions: sessionmaker, before: Connection, now: datetime) -> bool:
+        """Returns False when the stored credential does not decrypt with the worker's key; then
+        Meta is not asked, since a renewed token could not be stored readably."""
         network = self.instagram.network
+        context = credential_context(network)
+        if self.key is None:
+            log.error("no secret key: the credential cannot be renewed")
+            return False
+        try:
+            crypto.decrypt(self.key, before.credential_encrypted, context)
+        except crypto.SecretKeyError:
+            return False
         try:
             renewal = self.instagram.refresh_token()
         except InstagramError as exc:
@@ -233,13 +253,27 @@ class ConnectionTask:
                     "credential.renewed",
                     Outcome.ERROR,
                     object_type="connection",
-                    object_id=connection_of(session, network).id,
+                    object_id=before.id,
                     detail={"error_code": exc.code},
                 )
-            return
+            return True
         with sessions() as session, session.begin():
             connection = connection_of(session, network)
-            connection.credential_encrypted = seal(key, network, renewal.access_token)
+            if connection is None or connection.credential_encrypted != before.credential_encrypted:
+                # Reconnected (maybe to another account) while Meta answered: the stored
+                # credential is newer than the one renewed, so the renewal is dropped.
+                log.warning("connection changed during renewal; renewal discarded")
+                audit.record(
+                    session,
+                    now,
+                    "credential.renewed",
+                    Outcome.ERROR,
+                    object_type="connection",
+                    object_id=before.id,
+                    detail={"discarded": "connection_changed"},
+                )
+                return True
+            connection.credential_encrypted = seal(self.key, network, renewal.access_token)
             connection.credential_expires_at = now + renewal.expires_in
             connection.credential_refreshed_at = now
             audit.record(
@@ -250,6 +284,7 @@ class ConnectionTask:
                 object_id=connection.id,
             )
         log.info("credential renewed", extra={"expires_at": now + renewal.expires_in})
+        return True
 
     def watch_unresolved(self, sessions: sessionmaker, now: datetime) -> None:
         """Posts whose outcome the resolver has not settled for over an hour need a human."""

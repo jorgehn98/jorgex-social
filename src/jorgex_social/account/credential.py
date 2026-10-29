@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from jorgex_social.account import crypto
 from jorgex_social.account.models import Connection
+from jorgex_social.instagram.errors import CredentialUnavailable
 
 
 def credential_context(network: str) -> str:
@@ -17,14 +18,15 @@ def connection_of(session: Session, network: str) -> Connection | None:
     return session.scalar(select(Connection).where(Connection.network == network))
 
 
-class NotConnected(RuntimeError):
+class NotConnected(CredentialUnavailable):
     pass
 
 
 class StoredCredential:
-    """The access token of the connected account, read and decrypted on every call: a renewal by
-    the worker or a reconnection from the command line is used at once, and the plaintext never
-    lives longer than one request."""
+    """The access token and account id of the connected account, read together from one row and
+    decrypted on every call: a renewal by the worker or a reconnection (even to another account)
+    from the command line is used at once, and the plaintext never lives longer than one request.
+    Any failure to read it is a CredentialUnavailable, raised before anything is sent."""
 
     def __init__(self, sessions: sessionmaker, key: bytes, network: str) -> None:
         self._sessions = sessions
@@ -43,9 +45,12 @@ class StoredCredential:
             )
         return connection
 
-    def account_id(self) -> str:
-        return self._connection().external_account_id
-
-    def __call__(self) -> str:
-        blob = self._connection().credential_encrypted
-        return crypto.decrypt(self._key, blob, credential_context(self.network))
+    def __call__(self) -> tuple[str, str]:
+        connection = self._connection()
+        try:
+            token = crypto.decrypt(
+                self._key, connection.credential_encrypted, credential_context(self.network)
+            )
+        except crypto.SecretKeyError as exc:
+            raise CredentialUnavailable(str(exc)) from None
+        return token, connection.external_account_id
