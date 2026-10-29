@@ -8,10 +8,10 @@ def test_a_failing_task_does_not_stop_the_others(settings):
     sessions = make_sessionmaker(make_engine(settings))
     calls = []
 
-    def broken(session):
+    def broken(sessions):
         raise RuntimeError("boom")
 
-    def healthy(session):
+    def healthy(sessions):
         calls.append("healthy")
 
     run_once(sessions, [broken, healthy])
@@ -23,7 +23,7 @@ def test_stops_when_asked(settings):
     sessions = make_sessionmaker(make_engine(settings))
     stop = threading.Event()
 
-    def stop_after_first(session):
+    def stop_after_first(sessions):
         stop.set()
 
     run(sessions, interval_seconds=60, stop=stop, tasks=[stop_after_first])

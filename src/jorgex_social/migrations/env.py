@@ -2,6 +2,7 @@ from alembic import context
 from sqlalchemy import create_engine, pool
 
 import jorgex_social.access.models  # noqa: F401  (registers tables on the metadata)
+import jorgex_social.stats.models  # noqa: F401
 from jorgex_social.db import Base
 
 config = context.config
