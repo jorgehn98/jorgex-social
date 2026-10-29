@@ -246,3 +246,55 @@ def test_list_media_skips_unknown_product_types():
     )
 
     assert [m.id for m in ig.list_media()] == ["2"]
+
+
+# Token renewal: the one call where Meta wants the token in the URL
+
+
+def test_refresh_sends_the_token_as_documented_and_returns_the_new_one():
+    ig, transport = client((200, {"access_token": "renewed-not-real", "expires_in": 5184000}))
+
+    renewal = ig.refresh_token()
+
+    method, url, headers, body = transport.calls[0]
+    assert method == "GET"
+    assert url.startswith("https://graph.instagram.com/refresh_access_token?")
+    assert query(url) == {"grant_type": "ig_refresh_token", "access_token": TOKEN}
+    assert renewal.access_token == "renewed-not-real"
+    assert renewal.expires_in == timedelta(days=60)
+    assert "renewed-not-real" not in repr(renewal)
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        # Meta does not document echoing the token; if it ever did, it must not get through.
+        ((400, {"error": {"message": f"bad token {TOKEN}", "code": 190}}), AuthError),
+        ((400, f"<html>{TOKEN}</html>".encode()), Refused),
+        (OSError(f"cannot reach https://graph.instagram.com/?access_token={TOKEN}"), Unavailable),
+        ((200, f'{{"access_token": "{TOKEN}"}}'.encode()), Unavailable),  # no expires_in
+        ((200, b"not json"), Unavailable),
+    ],
+)
+def test_refresh_errors_never_carry_the_token_or_the_url(response, error):
+    ig, _ = client(response)
+
+    with pytest.raises(error) as caught:
+        ig.refresh_token()
+
+    assert TOKEN not in str(caught.value)
+    assert "refresh_access_token" not in str(caught.value)
+
+
+def test_a_credential_source_is_asked_on_every_call():
+    credentials = iter([("first-not-real", "1784"), ("second-not-real", "2048")])
+    transport = StubTransport((200, {"id": "1"}), (200, {"id": "2"}))
+    ig = InstagramClient.from_source(lambda: next(credentials), transport=transport)
+
+    ig.publish("9")
+    ig.publish("9")
+
+    assert [(call[1].split("/")[-2], call[2]["Authorization"]) for call in transport.calls] == [
+        ("1784", "Bearer first-not-real"),
+        ("2048", "Bearer second-not-real"),
+    ]

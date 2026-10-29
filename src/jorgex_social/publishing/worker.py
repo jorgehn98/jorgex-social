@@ -14,9 +14,11 @@ from pathlib import Path
 from sqlalchemy import func, or_, select, union
 from sqlalchemy.orm import Session, sessionmaker
 
+from jorgex_social.account import audit, kill_switch
+from jorgex_social.account.models import Outcome
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.client import TIMEOUT_SECONDS
-from jorgex_social.instagram.errors import InstagramError, Refused
+from jorgex_social.instagram.errors import CredentialUnavailable, InstagramError, Refused
 from jorgex_social.instagram.types import (
     ContainerKind,
     ContainerRequest,
@@ -77,6 +79,19 @@ ACTIVE = (
     PostStatus.OUTCOME_UNKNOWN,
     PostStatus.FAILED,
 )
+
+
+def _audit_post(
+    session: Session,
+    now: datetime,
+    action: str,
+    post: Post,
+    outcome: Outcome = Outcome.OK,
+    detail: dict | None = None,
+) -> None:
+    audit.record(
+        session, now, action, outcome, object_type="post", object_id=post.id, detail=detail
+    )
 
 
 class ContainerFailed(Exception):
@@ -146,6 +161,9 @@ class PublishTask:
         now = self.clock.now()
         network = self.instagram.network
         with sessions() as session, session.begin():
+            if kill_switch.is_on(session):
+                # Posts stay scheduled; once it is off, those past the grace window fail below.
+                return
             missed = session.scalars(
                 select(Post).where(
                     Post.network == network,
@@ -156,13 +174,29 @@ class PublishTask:
             for post in missed:
                 post.status = PostStatus.FAILED
                 post.failure = "missed_schedule"
+                _audit_post(
+                    session, now, "post.failed", post, Outcome.ERROR, {"failure": post.failure}
+                )
                 log.warning("missed schedule", extra={"post_id": post.id})
-        while (plan := self._start(sessions, now)) is not None:
+        while self._credential_readable() and (plan := self._start(sessions, now)) is not None:
             self._attempt(sessions, plan)
+
+    def _credential_readable(self) -> bool:
+        """Checked before an attempt is committed: with a credential that cannot be read (wrong
+        secret key, no connection) posts stay scheduled instead of starting attempts that cannot
+        reach Instagram. The connection task reports it as an incident."""
+        try:
+            self.instagram.check_credential()
+        except CredentialUnavailable as exc:
+            log.error("credential unavailable; not publishing", extra={"error": str(exc)})
+            return False
+        return True
 
     def _start(self, sessions: sessionmaker, now: datetime) -> _Plan | None:
         """Marks the next due post publishing, with an attempt and public URLs, in one commit."""
         with sessions() as session, session.begin():
+            if kill_switch.is_on(session):
+                return None
             post = session.scalar(
                 select(Post)
                 .where(
@@ -220,6 +254,11 @@ class PublishTask:
         except ContainerFailed as exc:
             self._end(sessions, plan.attempt_id, AttemptResult.REJECTED, failure=exc.failure)
             return
+        except CredentialUnavailable:
+            self._end(
+                sessions, plan.attempt_id, AttemptResult.REJECTED, failure="credential_unavailable"
+            )
+            return
         except Refused as exc:
             self._end(
                 sessions, plan.attempt_id, AttemptResult.REJECTED, failure="refused", error=exc
@@ -244,6 +283,12 @@ class PublishTask:
                 )
                 return
             attempt.container_ref = container
+            stopped = kill_switch.is_on(session)
+        if stopped:
+            # Turned on while the containers were being made: media_publish is the step that
+            # cannot be undone, so it is not called. Nothing went live.
+            self._end(sessions, plan.attempt_id, AttemptResult.REJECTED, failure="kill_switch")
+            return
         self._publish(sessions, plan.attempt_id, container)
 
     def _create_containers(self, plan: _Plan) -> str:
@@ -294,6 +339,12 @@ class PublishTask:
     def _publish(self, sessions: sessionmaker, attempt_id: str, container: str) -> None:
         try:
             media_ref = self.instagram.publish(container)
+        except CredentialUnavailable:
+            # Raised before the request is sent, so nothing went live.
+            self._end(
+                sessions, attempt_id, AttemptResult.REJECTED, failure="credential_unavailable"
+            )
+            return
         except Refused as exc:
             # A 4xx should mean nothing went live, but only PUBLISHED proves it either way.
             try:
@@ -357,11 +408,16 @@ class PublishTask:
             match result:
                 case AttemptResult.OK:
                     self._mark_published(session, post, media_ref, now)
+                    _audit_post(session, now, "post.published", post)
                 case AttemptResult.UNKNOWN:
                     post.status = PostStatus.OUTCOME_UNKNOWN
+                    _audit_post(session, now, "post.outcome_unknown", post, Outcome.ERROR)
                 case _:
                     post.status = PostStatus.FAILED
                     post.failure = failure
+                    _audit_post(
+                        session, now, "post.failed", post, Outcome.ERROR, {"failure": failure}
+                    )
         log.info(
             "publish attempt ended",
             extra={"post_id": post.id, "result": str(result), "failure": failure},
@@ -392,6 +448,7 @@ class PublishTask:
                 post = session.get_one(Post, attempt.post_id)
                 post.status = PostStatus.OUTCOME_UNKNOWN
                 self._revoke_urls(session, post)
+                _audit_post(session, now, "post.outcome_unknown", post, Outcome.ERROR)
             session.flush()
             pending = [
                 _Pending(a.id, a.container_ref, a.started_at, PostType(p.type), p.caption)
@@ -495,6 +552,8 @@ class PublishTask:
             post = session.get_one(Post, attempt.post_id)
             if attempt.resolved_at is not None or post.status != PostStatus.OUTCOME_UNKNOWN:
                 return None  # settled by hand in the meantime
+            if retry_container is not None and kill_switch.is_on(session):
+                return None  # retrying would publish; it waits, unresolved, until it is off
             attempt.resolved_at = now
             attempt.resolved_as = resolution
             retrying = post_status == PostStatus.SCHEDULED or retry_container is not None
@@ -510,6 +569,17 @@ class PublishTask:
                 self._mark_published(
                     session, post, found and found.id, found.timestamp if found else now
                 )
+            _audit_post(
+                session,
+                now,
+                "post.resolved",
+                post,
+                detail={
+                    "resolved_as": str(resolution),
+                    "status": str(post_status),
+                    "failure": failure,
+                },
+            )
             log.info(
                 "publish attempt resolved",
                 extra={"post_id": post.id, "resolved_as": str(resolution)},

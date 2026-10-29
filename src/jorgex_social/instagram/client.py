@@ -15,10 +15,13 @@ from jorgex_social.instagram.types import (
     Media,
     ProductType,
     PublishingLimit,
+    Renewal,
 )
 
 # The API version is pinned; moving to a newer one is an explicit decision (decision 07).
 GRAPH_URL = "https://graph.instagram.com/v26.0"
+# Unversioned, and the only call where Meta wants the token in the URL.
+REFRESH_URL = "https://graph.instagram.com/refresh_access_token"
 TIMEOUT_SECONDS = 60
 PAGE_SIZE = 50
 
@@ -54,6 +57,9 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 _opener = build_opener(_NoRedirect)
+
+# () -> (access token, account id). Raises CredentialUnavailable when it cannot be read.
+CredentialSource = Callable[[], tuple[str, str]]
 
 # (method, url, headers, body) -> (status, body). Swapped in tests; the default is urllib.
 Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
@@ -143,25 +149,45 @@ class InstagramClient:
         *,
         transport: Transport = urllib_transport,
         base_url: str = GRAPH_URL,
+        refresh_url: str = REFRESH_URL,
     ) -> None:
-        self._token = access_token
-        self._user_id = user_id
+        self._credentials: CredentialSource = lambda: (access_token, user_id)
+        self._label = f"user_id={user_id!r}"
         self._transport = transport
         self._base_url = base_url
+        self._refresh_url = refresh_url
+
+    @classmethod
+    def from_source(cls, source: CredentialSource, **kwargs) -> InstagramClient:
+        """A client that asks `source` for the token and account id on every call, together, so
+        a renewal or a switch to another account made elsewhere applies at once and the two never
+        come from different connections (account.credential.StoredCredential)."""
+        client = cls("", "", **kwargs)
+        client._credentials = source
+        client._label = repr(source)
+        return client
 
     def __repr__(self) -> str:
-        return f"InstagramClient(user_id={self._user_id!r})"
+        return f"InstagramClient({self._label})"
 
-    def _call(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _call(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        credentials: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """`path` may hold the literal `{user_id}`, filled from the same credential read."""
+        token, user_id = credentials or self._credentials()
         params = {k: v for k, v in (params or {}).items() if v is not None}
-        url = self._base_url + path
+        url = self._base_url + path.replace("{user_id}", user_id)
         body = None
         if method == "GET" and params:
             url += "?" + urlencode(params)
         elif params:
             body = urlencode(params).encode()
         # The token goes in a header, never in the URL, so it cannot leak into errors or logs.
-        headers = {"Authorization": f"Bearer {self._token}"}
+        headers = {"Authorization": f"Bearer {token}"}
         try:
             status, raw = self._transport(method, url, headers, body)
         except (URLError, TimeoutError, OSError, HTTPException) as exc:
@@ -174,13 +200,15 @@ class InstagramClient:
             raise Unavailable(f"Instagram API returned invalid JSON ({status})") from None
 
     def account(self) -> Account:
+        credentials = self._credentials()
         data = self._call(
             "GET",
             "/me",
             {"fields": "user_id,username,account_type,followers_count,media_count"},
+            credentials,
         )
         return Account(
-            id=str(data.get("user_id") or self._user_id),
+            id=str(data.get("user_id") or credentials[1]),
             username=data.get("username", ""),
             account_type=data.get("account_type"),
             followers_count=data.get("followers_count"),
@@ -190,7 +218,7 @@ class InstagramClient:
     def publishing_limit(self) -> PublishingLimit:
         data = self._call(
             "GET",
-            f"/{self._user_id}/content_publishing_limit",
+            "/{user_id}/content_publishing_limit",
             {"fields": "config,quota_usage"},
         )
         row = (data.get("data") or [{}])[0]
@@ -202,14 +230,14 @@ class InstagramClient:
         )
 
     def create_container(self, request: ContainerRequest) -> str:
-        return _field(self._call("POST", f"/{self._user_id}/media", request.to_params()), "id")
+        return _field(self._call("POST", "/{user_id}/media", request.to_params()), "id")
 
     def container_status(self, container_id: str) -> ContainerStatus:
         data = self._call("GET", f"/{container_id}", {"fields": "status_code"})
         return ContainerStatus(_field(data, "status_code"))
 
     def publish(self, container_id: str) -> str:
-        data = self._call("POST", f"/{self._user_id}/media_publish", {"creation_id": container_id})
+        data = self._call("POST", "/{user_id}/media_publish", {"creation_id": container_id})
         return _field(data, "id")
 
     def media(self, media_id: str) -> Media:
@@ -226,7 +254,7 @@ class InstagramClient:
             # Paged with the cursor, not paging.next, whose URL would carry the token.
             page = self._call(
                 "GET",
-                f"/{self._user_id}/media",
+                "/{user_id}/media",
                 {"fields": MEDIA_FIELDS, "limit": PAGE_SIZE, "after": after},
             )
             items.extend(m for m in map(_media, page.get("data", [])) if m is not None)
@@ -244,7 +272,7 @@ class InstagramClient:
         check_insights_window(since, until)
         data = self._call(
             "GET",
-            f"/{self._user_id}/insights",
+            "/{user_id}/insights",
             {
                 "metric": ACCOUNT_METRICS,
                 "period": "day",
@@ -254,3 +282,31 @@ class InstagramClient:
             },
         )
         return _metrics(data.get("data", []))
+
+    def check_credential(self) -> None:
+        self._credentials()
+
+    def refresh_token(self) -> Renewal:
+        token, _ = self._credentials()
+        query = urlencode({"grant_type": "ig_refresh_token", "access_token": token})
+        try:
+            status, raw = self._transport("GET", f"{self._refresh_url}?{query}", {}, None)
+        except URLError, TimeoutError, OSError, HTTPException:
+            # Not quoting the exception: it may carry the URL, and here the URL carries the token.
+            raise Unavailable("Instagram token refresh: connection error") from None
+        if status >= 400:
+            error = _error(status, raw)
+            error.args = (str(error).replace(token, "[redacted]"),)
+            raise error
+        try:
+            data = json.loads(raw)
+            renewal = Renewal(
+                access_token=data["access_token"],
+                expires_in=timedelta(seconds=int(data["expires_in"])),
+            )
+        except ValueError, KeyError, TypeError:
+            # Never quote the body: on success it holds the new token.
+            raise Unavailable(f"Instagram token refresh: unusable answer ({status})") from None
+        if not isinstance(renewal.access_token, str) or not renewal.access_token:
+            raise Unavailable(f"Instagram token refresh: unusable answer ({status})")
+        return renewal

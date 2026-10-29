@@ -19,7 +19,9 @@ def test_create_token_prints_secret_once(settings, monkeypatch, capsys):
 
 def test_migrate_creates_schema_from_scratch(tmp_path, monkeypatch):
     path = tmp_path / "fresh" / "jorgex_social.db"
+    key = tmp_path / "keys" / "secret.key"
     monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(path))
+    monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(key))
 
     main(["migrate"])
 
@@ -27,6 +29,12 @@ def test_migrate_creates_schema_from_scratch(tmp_path, monkeypatch):
 
     tables = inspect(make_engine(Settings(database_path=path))).get_table_names()
     assert "api_tokens" in tables
+    assert len(key.read_bytes()) == 32
+    assert key.stat().st_mode & 0o777 == 0o600
+
+    before = key.read_bytes()
+    main(["migrate"])
+    assert key.read_bytes() == before  # never replaced: it would orphan the stored credential
 
 
 def test_worker_stops_on_sigterm(settings):
@@ -78,3 +86,62 @@ def test_a_second_worker_on_the_same_database_refuses_to_start(settings, monkeyp
         first.close()
 
     acquire_worker_lock(settings).close()  # free again once the first one is gone
+
+
+def env_for(monkeypatch, settings, **extra):
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+    monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(settings.secret_key_file))
+    for name, value in extra.items():
+        monkeypatch.setenv(f"JORGEX_SOCIAL_{name}", value)
+
+
+def test_connect_instagram_reads_the_token_from_stdin(settings, monkeypatch, capsys):
+    import io
+
+    from sqlalchemy import select
+
+    from jorgex_social.account.models import Connection
+    from jorgex_social.db import make_sessionmaker
+
+    env_for(monkeypatch, settings)
+    monkeypatch.setattr("sys.stdin", io.StringIO("pasted-token-not-real\n"))
+
+    main(["connect-instagram"])
+
+    out = capsys.readouterr()
+    shown = json.loads(out.out)
+    assert (shown["network"], shown["username"]) == ("simulation", "simulated_account")
+    assert shown["credential_expires_at"]
+    assert "pasted-token-not-real" not in out.out + out.err
+    with make_sessionmaker(make_engine(settings))() as session:
+        assert session.scalar(select(Connection)).credential_encrypted
+
+
+def test_connect_instagram_needs_the_key(settings, monkeypatch):
+    import io
+
+    env_for(monkeypatch, settings)
+    settings.secret_key_file.unlink()
+    monkeypatch.setattr("sys.stdin", io.StringIO("pasted-token-not-real\n"))
+
+    with pytest.raises(SystemExit, match="secret key file .* is missing"):
+        main(["connect-instagram"])
+
+
+def test_connect_instagram_accepts_replace(settings, monkeypatch, capsys):
+    import io
+
+    env_for(monkeypatch, settings)
+    monkeypatch.setattr("sys.stdin", io.StringIO("pasted-token-not-real\n"))
+
+    main(["connect-instagram", "--replace"])
+
+    assert json.loads(capsys.readouterr().out)["username"] == "simulated_account"
+
+
+def test_worker_in_real_mode_refuses_to_start_without_the_key(settings, monkeypatch):
+    env_for(monkeypatch, settings, SIMULATION="false")
+    settings.secret_key_file.unlink()
+
+    with pytest.raises(SystemExit, match="secret key file .* is missing"):
+        main(["worker"])
