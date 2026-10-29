@@ -5,7 +5,7 @@ from typing import Any
 
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.client import check_insights_window
-from jorgex_social.instagram.errors import InstagramError, Refused
+from jorgex_social.instagram.errors import AuthError, InstagramError, Refused
 from jorgex_social.instagram.types import (
     Account,
     ContainerKind,
@@ -15,6 +15,7 @@ from jorgex_social.instagram.types import (
     Media,
     ProductType,
     PublishingLimit,
+    Renewal,
 )
 
 # Documented limits (docs/research/references/instagram.md); the fake enforces them so the
@@ -23,6 +24,8 @@ CONTAINER_LIFETIME = timedelta(hours=24)
 STORY_INSIGHTS_LIFETIME = timedelta(hours=24)
 MAX_CAROUSEL_ITEMS = 20
 PUBLISHING_WINDOW = timedelta(hours=24)
+CREDENTIAL_LIFETIME = timedelta(days=60)
+MIN_CREDENTIAL_AGE_TO_RENEW = timedelta(hours=24)
 
 _PRODUCT = {
     ContainerKind.IMAGE: ProductType.FEED,
@@ -57,6 +60,10 @@ class FakeInstagram:
 
     Video containers take `video_processing` to become FINISHED; images are ready at once.
     `fail_next` injects errors, including the ones that leave a write's outcome unknown.
+
+    The credential is untracked (never expires) until it is first renewed or a
+    `credential_issued_at` is given; from then on it expires after `credential_lifetime` unless
+    renewed, renewal follows Meta's rules, and `revoke()` makes every call fail as Meta does.
     """
 
     network = "simulation"
@@ -67,10 +74,16 @@ class FakeInstagram:
         *,
         video_processing: timedelta = timedelta(seconds=30),
         quota_total: int = 100,
+        credential_issued_at: datetime | None = None,
+        credential_lifetime: timedelta = CREDENTIAL_LIFETIME,
     ) -> None:
         self.clock = clock
         self.video_processing = video_processing
         self.quota_total = quota_total
+        self.credential_issued_at = credential_issued_at
+        self.credential_lifetime = credential_lifetime
+        self.revoked = False
+        self._renewals = count(1)
         self._ids = count(17_000_000_000_000_001)
         self._containers: dict[str, _Container] = {}
         self._media: dict[str, tuple[Media, ContainerKind]] = {}
@@ -83,6 +96,22 @@ class FakeInstagram:
             raise ValueError(f"unknown operation {operation!r}")
         self._failures.setdefault(operation, []).append(_Failure(error, after))
 
+    def revoke(self) -> None:
+        self.revoked = True
+
+    @property
+    def credential_expires_at(self) -> datetime | None:
+        if self.credential_issued_at is None:
+            return None
+        return self.credential_issued_at + self.credential_lifetime
+
+    def _check_credential(self) -> None:
+        if self.revoked:
+            raise AuthError("Instagram API 400: the access token was revoked", code=190)
+        expires_at = self.credential_expires_at
+        if expires_at is not None and self.clock.now() >= expires_at:
+            raise AuthError("Instagram API 400: the access token has expired", code=190)
+
     def mark_error(self, container_id: str) -> None:
         self._containers[container_id].error = True
 
@@ -94,6 +123,7 @@ class FakeInstagram:
         failure = self._failure(operation)
         if failure and not failure.after:
             raise failure.error
+        self._check_credential()
         result = action()
         if failure:
             raise failure.error
@@ -249,3 +279,14 @@ class FakeInstagram:
             "account_insights",
             lambda: {"reach": 300 * days, "views": 500 * days, "accounts_engaged": 20 * days},
         )
+
+    def refresh_token(self) -> Renewal:
+        return self._run("refresh_token", self._refresh)
+
+    def _refresh(self) -> Renewal:
+        now = self.clock.now()
+        issued_at = self.credential_issued_at
+        if issued_at is not None and now - issued_at < MIN_CREDENTIAL_AGE_TO_RENEW:
+            raise Refused("Instagram API 400: the token must be at least 24 hours old to renew")
+        self.credential_issued_at = now
+        return Renewal(f"simulated-token-{next(self._renewals)}", self.credential_lifetime)

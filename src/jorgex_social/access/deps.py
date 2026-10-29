@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, allows, authenticate
+from jorgex_social.account.audit import set_actor
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -29,7 +30,9 @@ def get_read_session(request: Request) -> Iterator[Session]:
 ReadSessionDep = Annotated[Session, Depends(get_read_session, scope="function")]
 
 
-def _authenticate(session: Session, credentials: HTTPAuthorizationCredentials | None) -> ApiToken:
+def _authenticate(
+    request: Request, session: Session, credentials: HTTPAuthorizationCredentials | None
+) -> ApiToken:
     token = authenticate(session, credentials.credentials) if credentials else None
     if token is None:
         raise HTTPException(
@@ -37,6 +40,7 @@ def _authenticate(session: Session, credentials: HTTPAuthorizationCredentials | 
             detail={"code": "invalid_token", "message": "Missing, unknown or revoked token."},
             headers={"WWW-Authenticate": "Bearer"},
         )
+    set_actor(request, token.prefix)  # before authorizing, so a denied call names its token
     return token
 
 
@@ -57,8 +61,8 @@ def _authorize(token: ApiToken, group: Group, level: Level) -> ApiToken:
 Credentials = Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]
 
 
-def current_token(session: SessionDep, credentials: Credentials) -> ApiToken:
-    return _authenticate(session, credentials)
+def current_token(request: Request, session: SessionDep, credentials: Credentials) -> ApiToken:
+    return _authenticate(request, session, credentials)
 
 
 TokenDep = Annotated[ApiToken, Depends(current_token)]
@@ -79,7 +83,7 @@ def require_outside_transaction(group: Group, level: Level) -> Callable[..., Api
 
     def dependency(request: Request, credentials: Credentials) -> ApiToken:
         with request.app.state.sessionmaker() as session, session.begin():
-            token = _authenticate(session, credentials)
+            token = _authenticate(request, session, credentials)
         return _authorize(token, group, level)
 
     return dependency

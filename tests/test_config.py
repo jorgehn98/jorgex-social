@@ -21,20 +21,6 @@ def test_rejects_ambiguous_flag():
         Settings.from_env({"JORGEX_SOCIAL_SIMULATION": "maybe"})
 
 
-def test_token_is_not_in_the_repr():
-    settings = Settings.from_env({"JORGEX_SOCIAL_INSTAGRAM_ACCESS_TOKEN": "secret-value"})
-
-    assert "secret-value" not in repr(settings)
-
-
-def test_real_adapter_needs_credentials():
-    from jorgex_social.clock import SystemClock
-    from jorgex_social.instagram import make_instagram
-
-    with pytest.raises(RuntimeError):
-        make_instagram(Settings(simulation=False), SystemClock())
-
-
 def test_reads_publishing_settings():
     settings = Settings.from_env(
         {

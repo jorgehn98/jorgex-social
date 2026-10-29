@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 ENV_PREFIX = "JORGEX_SOCIAL_"
@@ -27,9 +27,9 @@ class Settings:
     public_url: str | None = None
     # A scheduled post found later than this (the worker was down) fails instead of going out late.
     publish_grace_minutes: int = 30
-    # Until the in-app connection exists (build step 5), the real adapter reads these.
-    instagram_access_token: str | None = field(default=None, repr=False)
-    instagram_user_id: str | None = None
+    # 32 random bytes that encrypt the stored Instagram credential. `migrate` creates it; keep it
+    # out of the database backups, or a stolen backup carries everything needed to read the token.
+    secret_key_file: Path = Path("data/secret.key")
 
     @property
     def database_url(self) -> str:
@@ -50,6 +50,5 @@ class Settings:
             publish_grace_minutes=int(
                 env.get(f"{ENV_PREFIX}PUBLISH_GRACE_MINUTES", defaults.publish_grace_minutes)
             ),
-            instagram_access_token=env.get(f"{ENV_PREFIX}INSTAGRAM_ACCESS_TOKEN") or None,
-            instagram_user_id=env.get(f"{ENV_PREFIX}INSTAGRAM_USER_ID") or None,
+            secret_key_file=Path(env.get(f"{ENV_PREFIX}SECRET_KEY_FILE", defaults.secret_key_file)),
         )

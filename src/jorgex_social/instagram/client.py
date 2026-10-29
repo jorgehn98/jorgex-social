@@ -15,10 +15,13 @@ from jorgex_social.instagram.types import (
     Media,
     ProductType,
     PublishingLimit,
+    Renewal,
 )
 
 # The API version is pinned; moving to a newer one is an explicit decision (decision 07).
 GRAPH_URL = "https://graph.instagram.com/v26.0"
+# Unversioned, and the only call where Meta wants the token in the URL.
+REFRESH_URL = "https://graph.instagram.com/refresh_access_token"
 TIMEOUT_SECONDS = 60
 PAGE_SIZE = 50
 
@@ -138,16 +141,20 @@ class InstagramClient:
 
     def __init__(
         self,
-        access_token: str,
+        access_token: str | Callable[[], str],
         user_id: str,
         *,
         transport: Transport = urllib_transport,
         base_url: str = GRAPH_URL,
+        refresh_url: str = REFRESH_URL,
     ) -> None:
-        self._token = access_token
+        # A callable is asked on every call, so a token renewed or replaced elsewhere is used at
+        # once (account.credential.StoredCredential reads it from the database).
+        self._token = access_token if callable(access_token) else lambda: access_token
         self._user_id = user_id
         self._transport = transport
         self._base_url = base_url
+        self._refresh_url = refresh_url
 
     def __repr__(self) -> str:
         return f"InstagramClient(user_id={self._user_id!r})"
@@ -161,7 +168,7 @@ class InstagramClient:
         elif params:
             body = urlencode(params).encode()
         # The token goes in a header, never in the URL, so it cannot leak into errors or logs.
-        headers = {"Authorization": f"Bearer {self._token}"}
+        headers = {"Authorization": f"Bearer {self._token()}"}
         try:
             status, raw = self._transport(method, url, headers, body)
         except (URLError, TimeoutError, OSError, HTTPException) as exc:
@@ -254,3 +261,28 @@ class InstagramClient:
             },
         )
         return _metrics(data.get("data", []))
+
+    def refresh_token(self) -> Renewal:
+        token = self._token()
+        query = urlencode({"grant_type": "ig_refresh_token", "access_token": token})
+        try:
+            status, raw = self._transport("GET", f"{self._refresh_url}?{query}", {}, None)
+        except URLError, TimeoutError, OSError, HTTPException:
+            # Not quoting the exception: it may carry the URL, and here the URL carries the token.
+            raise Unavailable("Instagram token refresh: connection error") from None
+        if status >= 400:
+            error = _error(status, raw)
+            error.args = (str(error).replace(token, "[redacted]"),)
+            raise error
+        try:
+            data = json.loads(raw)
+            renewal = Renewal(
+                access_token=data["access_token"],
+                expires_in=timedelta(seconds=int(data["expires_in"])),
+            )
+        except ValueError, KeyError, TypeError:
+            # Never quote the body: on success it holds the new token.
+            raise Unavailable(f"Instagram token refresh: unusable answer ({status})") from None
+        if not isinstance(renewal.access_token, str) or not renewal.access_token:
+            raise Unavailable(f"Instagram token refresh: unusable answer ({status})")
+        return renewal

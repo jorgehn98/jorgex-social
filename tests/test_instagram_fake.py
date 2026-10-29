@@ -180,3 +180,42 @@ def test_insights_must_match_the_product_type(ig):
 def test_fail_next_rejects_unknown_operations(ig):
     with pytest.raises(ValueError):
         ig.fail_next("pubilsh", Unavailable("typo"))
+
+
+# Credential
+
+
+def test_untracked_credential_never_expires(ig, clock):
+    clock.advance(days=400)
+
+    assert ig.account().username
+
+
+def test_renewal_follows_metas_rules(clock):
+    from jorgex_social.instagram.errors import AuthError
+
+    ig = FakeInstagram(clock, credential_issued_at=clock.now())
+
+    with pytest.raises(Refused, match="24 hours"):
+        ig.refresh_token()
+
+    clock.advance(hours=25)
+    renewal = ig.refresh_token()
+    assert renewal.expires_in == timedelta(days=60)
+
+    clock.advance(days=60)
+    with pytest.raises(AuthError):
+        ig.refresh_token()
+    with pytest.raises(AuthError):
+        ig.account()
+
+
+def test_revoked_credential_fails_every_call(ig):
+    from jorgex_social.instagram.errors import AuthError
+
+    ig.revoke()
+
+    with pytest.raises(AuthError):
+        ig.account()
+    with pytest.raises(AuthError):
+        ig.create_container(IMAGE)

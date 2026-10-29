@@ -5,6 +5,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from jorgex_social.access.deps import TokenDep
+from jorgex_social.account.api import router as account_router
+from jorgex_social.account.audit import AuditMiddleware
 from jorgex_social.clock import Clock, SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
@@ -40,6 +42,8 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
         """What the calling token is allowed to do, so an agent can check before acting."""
         return {"name": token.name, "prefix": token.prefix, "permissions": token.permissions}
 
+    app.add_middleware(AuditMiddleware)
+    app.include_router(account_router)
     app.include_router(stats_router)
     app.include_router(publishing_router)
     app.include_router(media_files_router)

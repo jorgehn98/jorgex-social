@@ -1,6 +1,8 @@
 import argparse
 import fcntl
+import getpass
 import json
+import logging
 import signal
 import sys
 import threading
@@ -15,12 +17,20 @@ from sqlalchemy import select
 from jorgex_social import logs, worker
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
+from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
+from jorgex_social.account.credential import NotConnected
+from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
 from jorgex_social.clock import SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
 from jorgex_social.instagram import make_instagram
+from jorgex_social.instagram.client import InstagramClient
+from jorgex_social.instagram.errors import InstagramError
+from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask
 from jorgex_social.stats.snapshots import SnapshotTask
+
+log = logging.getLogger(__name__)
 
 
 def alembic_config(settings: Settings) -> Config:
@@ -33,6 +43,12 @@ def alembic_config(settings: Settings) -> Config:
 def migrate(settings: Settings) -> None:
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
     command.upgrade(alembic_config(settings), "head")
+    if ensure_key(settings.secret_key_file):
+        log.warning(
+            "created the secret key that encrypts the stored credential; back it up separately "
+            "from the database backups",
+            extra={"path": str(settings.secret_key_file)},
+        )
 
 
 def parse_grants(values: list[str]) -> dict[str, str]:
@@ -76,6 +92,43 @@ def cmd_list_tokens(_: argparse.Namespace, settings: Settings) -> None:
             for t in session.scalars(select(ApiToken).order_by(ApiToken.created_at))
         ]
     print(json.dumps(tokens, indent=2))
+
+
+def read_secret(prompt: str) -> str:
+    """From the terminal without echo, or from a pipe. Never from an argument, which would stay
+    in the shell history and in the process list."""
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    return sys.stdin.readline()
+
+
+def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
+    key = load_key(settings.secret_key_file)
+    token = read_secret("Instagram access token (not shown): ").strip()
+    if not token:
+        raise SystemExit("error: no token given on standard input")
+    clock = SystemClock()
+    # "me" until the account is known: connecting only reads /me and renews the token.
+    instagram = FakeInstagram(clock) if settings.simulation else InstagramClient(token, "me")
+    connection = connect(
+        make_sessionmaker(make_engine(settings)),
+        instagram,
+        token,
+        key,
+        clock.now(),
+        replace=args.replace,
+    )
+    print(
+        json.dumps(
+            {
+                "network": connection.network,
+                "username": connection.username,
+                "account_type": connection.account_type,
+                "credential_expires_at": connection.credential_expires_at.isoformat(),
+            },
+            indent=2,
+        )
+    )
 
 
 def cmd_serve(args: argparse.Namespace, settings: Settings) -> None:
@@ -123,6 +176,7 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
             grace=timedelta(minutes=settings.publish_grace_minutes),
         ),
         SnapshotTask(instagram, clock),
+        ConnectionTask(instagram, clock, settings.secret_key_file),
     ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the
@@ -164,6 +218,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list-tokens", help="list API tokens without their secrets")
 
+    connect_ig = sub.add_parser(
+        "connect-instagram",
+        help="store an Instagram access token, read from standard input, encrypted",
+    )
+    connect_ig.add_argument(
+        "--replace",
+        action="store_true",
+        help="switch this installation to a different account than the one connected",
+    )
+
     serve = sub.add_parser("serve", help="run the API server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -178,6 +242,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         match args.command:
             case "migrate":
+                logs.configure()
                 migrate(settings)
             case "create-token":
                 cmd_create_token(args, settings)
@@ -185,9 +250,12 @@ def main(argv: list[str] | None = None) -> None:
                 cmd_revoke_token(args, settings)
             case "list-tokens":
                 cmd_list_tokens(args, settings)
+            case "connect-instagram":
+                cmd_connect_instagram(args, settings)
             case "serve":
                 cmd_serve(args, settings)
             case "worker":
                 cmd_worker(args, settings)
-    except TokenError as exc:
+    # Messages of these errors never carry the token (instagram/client.py, account/crypto.py).
+    except (TokenError, SecretKeyError, NotConnected, ConnectError, InstagramError) as exc:
         raise SystemExit(f"error: {exc}") from None

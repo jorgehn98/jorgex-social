@@ -23,6 +23,14 @@ uv run ruff check . && uv run ruff format --check .
 Configuration comes from `JORGEX_SOCIAL_*` environment variables; see `.env.example`. A fresh install runs
 in simulation mode and never calls Meta.
 
+To go live, set `JORGEX_SOCIAL_SIMULATION=false` and connect your account once with
+`uv run jorgex-social connect-instagram`, which reads a long-lived Instagram token from standard input
+without echoing it (`--token` arguments would end up in the shell history, so there is none). The token
+is stored encrypted with AES-GCM under the key in `JORGEX_SOCIAL_SECRET_KEY_FILE`, which `migrate`
+creates with mode 600. Back that key up separately from the database. The worker renews the token
+before it expires, and `GET /v1/account` reports the connection status, open incidents and the kill
+switch.
+
 ## License
 
 MIT. See `LICENSE`.

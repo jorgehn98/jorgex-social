@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -93,6 +93,14 @@ class Media:
     caption: str | None  # our own text; third-party text never passes through this type
 
 
+@dataclass(frozen=True)
+class Renewal:
+    """A renewed access token. The token never shows in repr, so it cannot leak into logs."""
+
+    access_token: str = field(repr=False)
+    expires_in: timedelta
+
+
 class Instagram(Protocol):
     """What the service needs from Instagram so far. It grows with each build step."""
 
@@ -108,3 +116,5 @@ class Instagram(Protocol):
     def list_media(self, max_items: int | None = None) -> list[Media]: ...
     def media_insights(self, media_id: str, product_type: ProductType) -> dict[str, Any]: ...
     def account_insights(self, since: datetime, until: datetime) -> dict[str, Any]: ...
+    # Meta renews a long-lived token that is at least 24 hours old and has not expired.
+    def refresh_token(self) -> Renewal: ...

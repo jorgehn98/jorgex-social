@@ -724,3 +724,148 @@ def test_a_restarted_worker_resolves_the_dead_attempt_at_once(api, task, session
         ("unknown", "not_published"),
         ("ok", None),
     ]
+
+
+# Kill switch, incidents and audit (build step 5)
+
+
+@pytest.fixture
+def switch(app, client):
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "operator", {"account": "write"})
+    account_headers = {"Authorization": f"Bearer {secret}"}
+
+    def set_switch(enabled):
+        response = client.put(
+            "/v1/account/kill-switch", json={"enabled": enabled}, headers=account_headers
+        )
+        assert response.status_code == 200, response.text
+
+    return set_switch
+
+
+@pytest.fixture
+def publishes(ig):
+    calls = []
+    original = ig.publish
+
+    def publish(container):
+        calls.append(container)
+        return original(container)
+
+    ig.publish = publish
+    return calls
+
+
+def test_kill_switch_stops_containers_and_publishing(
+    api, client, headers, task, sessions, clock, switch, requests, publishes
+):
+    late, on_time = api.post(), api.post()
+    switch(True)
+    for post_id, at in ((late, "2026-10-29T12:10:00Z"), (on_time, "2026-10-29T12:50:00Z")):
+        client.post(f"/v1/posts/{post_id}/schedule", json={"scheduled_for": at}, headers=headers)
+
+    clock.advance(hours=1)  # both due, the first beyond the 30-minute grace
+    task(sessions)
+    assert (requests, publishes) == ([], [])
+    assert {api.get(late)["status"], api.get(on_time)["status"]} == {"scheduled"}
+
+    switch(False)
+    task(sessions)
+
+    assert (api.get(late)["status"], api.get(late)["failure"]) == ("failed", "missed_schedule")
+    assert api.get(on_time)["status"] == "published"
+
+
+def test_kill_switch_turned_on_mid_attempt_stops_before_media_publish(
+    api, sessions, ig, clock, settings, switch, publishes
+):
+    post_id, next_id = api.post(), api.post()
+    api.publish_now(post_id)
+    api.publish_now(next_id)
+
+    def sleep(seconds):
+        switch(True)  # while the video container processes
+        clock.advance(seconds=seconds)
+
+    PublishTask(ig, clock, settings.media_dir, BASE_URL, sleep=sleep)(sessions)
+
+    post = api.get(post_id)
+    assert publishes == []
+    assert (post["status"], post["failure"]) == ("failed", "kill_switch")
+    assert post["attempts"][0]["result"] == "rejected"
+    assert api.get(next_id)["status"] == "scheduled"  # the next due post is not even started
+
+
+def test_kill_switch_holds_the_resolvers_retry(api, task, sessions, ig, switch, publishes):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("publish", Unavailable("lost before Meta acted"))
+    task.publish_due(sessions)
+    publishes.clear()
+
+    switch(True)
+    task(sessions)
+    assert publishes == []
+    assert api.get(post_id)["status"] == "outcome_unknown"
+
+    switch(False)
+    task(sessions)
+    assert api.get(post_id)["status"] == "published"
+    assert len(published(ig)) == 1
+
+
+def test_unresolved_outcome_opens_an_incident_after_an_hour_and_closes(
+    api, task, sessions, ig, clock, settings
+):
+    from jorgex_social.account.connection import ConnectionTask
+    from jorgex_social.account.models import ChannelIncident
+
+    watcher = ConnectionTask(ig, clock, settings.secret_key_file)
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("publish", Unavailable("502"), after=True)
+    task.publish_due(sessions)
+
+    def incidents():
+        with sessions() as session:
+            return [
+                (i.type, i.closed_at is None, i.detail)
+                for i in session.scalars(
+                    select(ChannelIncident).where(ChannelIncident.type == "publish_unresolved")
+                )
+            ]
+
+    clock.advance(minutes=59)
+    watcher.watch_unresolved(sessions, clock.now())
+    assert incidents() == []
+
+    clock.advance(minutes=2)
+    watcher.watch_unresolved(sessions, clock.now())
+    watcher.watch_unresolved(sessions, clock.now())
+    assert incidents() == [("publish_unresolved", True, {"post_ids": [post_id]})]
+
+    task(sessions)  # the resolver settles it
+    watcher.watch_unresolved(sessions, clock.now())
+    assert api.get(post_id)["status"] == "published"
+    assert incidents() == [("publish_unresolved", False, {"post_ids": [post_id]})]
+
+
+def test_worker_transitions_are_audited_as_system(api, task, sessions, ig):
+    from jorgex_social.account.models import AuditEntry
+
+    published_id, refused_id = api.post(), api.post()
+    api.publish_now(published_id)
+    task(sessions)
+    api.publish_now(refused_id)
+    ig.fail_next("publish", Refused("bad", code=100))
+    task(sessions)
+
+    with sessions() as session:
+        entries = session.scalars(
+            select(AuditEntry).where(AuditEntry.actor_type == "system").order_by(AuditEntry.id)
+        ).all()
+    assert [(e.action, e.object_id, e.outcome, e.detail) for e in entries] == [
+        ("post.published", published_id, "ok", None),
+        ("post.failed", refused_id, "error", {"failure": "refused"}),
+    ]
