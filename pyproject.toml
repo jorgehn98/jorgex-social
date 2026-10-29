@@ -15,6 +15,12 @@ dependencies = [
 
 [project.scripts]
 jorgex-social = "jorgex_social.cli:main"
+jorgex-social-mcp = "jorgex_social_mcp.server:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp==2.3.0",
+]
 
 [dependency-groups]
 dev = [
@@ -26,6 +32,10 @@ dev = [
 [build-system]
 requires = ["uv_build>=0.12,<0.13"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The MCP client ships in the same distribution; its `mcp` dependency is the `mcp` extra.
+module-name = ["jorgex_social", "jorgex_social_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
