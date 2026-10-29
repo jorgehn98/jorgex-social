@@ -1,0 +1,25 @@
+# Internal working notes of this installation; not part of the project.
+docs/
+work/
+AGENTS.md
+.engram/
+.claude/settings.local.json
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime data, media and backups
+*.db
+*.db-wal
+*.db-shm
+data/
+media/
+backups/
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
