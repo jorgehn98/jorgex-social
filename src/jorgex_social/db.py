@@ -32,7 +32,10 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def make_engine(settings: Settings) -> Engine:
+def make_engine(settings: Settings, *, write: bool = True) -> Engine:
+    """`write=False` gives an engine whose transactions only read: a plain deferred BEGIN, which
+    in WAL mode never waits for the write lock. Use it for endpoints that must answer while the
+    worker writes, such as the public media URL Instagram downloads from."""
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
     # The API server and the worker are separate processes sharing one file.
     # hide_parameters: bound values (which may one day hold third-party data) stay out of errors.
@@ -55,7 +58,7 @@ def make_engine(settings: Settings) -> Engine:
         # IMMEDIATE takes the write lock up front: a read-then-write (pick a due post, mark it
         # publishing) cannot interleave with the other process. Keep transactions short and never
         # hold one across a call to Meta.
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        connection.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
 
     return engine
 

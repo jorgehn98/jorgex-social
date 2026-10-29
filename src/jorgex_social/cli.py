@@ -1,8 +1,10 @@
 import argparse
+import fcntl
 import json
 import signal
 import sys
 import threading
+from datetime import timedelta
 from importlib import resources
 
 import uvicorn
@@ -17,6 +19,7 @@ from jorgex_social.clock import SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
 from jorgex_social.instagram import make_instagram
+from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask
 from jorgex_social.stats.snapshots import SnapshotTask
 
 
@@ -86,12 +89,41 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> None:
     )
 
 
+def acquire_worker_lock(settings: Settings):
+    """Only one worker per database: two would both publish what is due, and a live attempt of
+    one could look dead to the other. The lock is released when the process exits, even on a
+    crash; keep the returned file open while the worker runs."""
+    settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+    path = settings.database_path.with_name(settings.database_path.name + ".worker.lock")
+    lock = path.open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit(
+            f"error: another worker is already running on this database ({path})"
+        ) from None
+    return lock
+
+
 def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
+    lock = acquire_worker_lock(settings)  # noqa: F841  (held until the process exits)
     logs.configure()
     stop = threading.Event()
     sessions = make_sessionmaker(make_engine(settings))
     clock = SystemClock()
-    tasks = [SnapshotTask(make_instagram(settings, clock), clock)]
+    instagram = make_instagram(settings, clock)
+    public_url = settings.public_url or (SIMULATED_PUBLIC_URL if settings.simulation else None)
+    tasks = [
+        PublishTask(
+            instagram,
+            clock,
+            settings.media_dir,
+            public_url,
+            grace=timedelta(minutes=settings.publish_grace_minutes),
+        ),
+        SnapshotTask(instagram, clock),
+    ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the
     # signal synchronously. `docker stop` sends SIGTERM.
