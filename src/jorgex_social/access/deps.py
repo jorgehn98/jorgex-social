@@ -20,6 +20,15 @@ def get_session(request: Request) -> Iterator[Session]:
 SessionDep = Annotated[Session, Depends(get_session, scope="function")]
 
 
+def get_read_session(request: Request) -> Iterator[Session]:
+    with request.app.state.read_sessionmaker() as session, session.begin():
+        yield session
+
+
+# Read-only endpoints that must not wait for the write lock; never write through it.
+ReadSessionDep = Annotated[Session, Depends(get_read_session, scope="function")]
+
+
 def _authenticate(session: Session, credentials: HTTPAuthorizationCredentials | None) -> ApiToken:
     token = authenticate(session, credentials.credentials) if credentials else None
     if token is None:

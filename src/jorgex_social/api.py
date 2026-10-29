@@ -23,11 +23,12 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.state.clock = clock or SystemClock()
     app.state.network = network_for(settings)
     app.state.sessionmaker = make_sessionmaker(make_engine(settings))
+    app.state.read_sessionmaker = make_sessionmaker(make_engine(settings, write=False))
 
     @app.get("/health", tags=["system"])
     def health(request: Request) -> JSONResponse:
         try:
-            with request.app.state.sessionmaker() as session:
+            with request.app.state.read_sessionmaker() as session:
                 session.execute(text("SELECT 1"))
         except Exception:
             log.exception("health check failed")

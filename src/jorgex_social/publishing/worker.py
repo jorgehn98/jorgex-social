@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select, union
+from sqlalchemy import func, or_, select, union
 from sqlalchemy.orm import Session, sessionmaker
 
 from jorgex_social.clock import Clock
+from jorgex_social.instagram.client import TIMEOUT_SECONDS
 from jorgex_social.instagram.errors import InstagramError, Refused
 from jorgex_social.instagram.types import (
     ContainerKind,
@@ -24,6 +25,7 @@ from jorgex_social.instagram.types import (
     ProductType,
 )
 from jorgex_social.instagram.types import Media as PublishedMedia
+from jorgex_social.publishing.catalog import MAX_CAROUSEL_ITEMS
 from jorgex_social.publishing.media import (
     KEEP_AFTER_PUBLISH,
     issue_url,
@@ -49,20 +51,31 @@ log = logging.getLogger(__name__)
 # video can take longer.
 POLL_INTERVAL = timedelta(seconds=15)
 POLL_TIMEOUT = timedelta(minutes=10)
-# An attempt still in progress after this long belongs to a worker that died mid-way.
-STALE_ATTEMPT = timedelta(minutes=15)
+# The longest an attempt can legitimately take: every carousel child and the parent each create a
+# container and wait for it (two calls that can each hang until the HTTP timeout, plus the polling
+# window and one interval of overshoot), then media_publish and the status check after a refusal.
+_CALL = timedelta(seconds=TIMEOUT_SECONDS)
+_PER_CONTAINER = 2 * _CALL + POLL_TIMEOUT + POLL_INTERVAL
+LONGEST_ATTEMPT = (MAX_CAROUSEL_ITEMS + 1) * _PER_CONTAINER + 2 * _CALL
+# An attempt still in progress after this long belongs to a worker that died mid-way. It must
+# exceed LONGEST_ATTEMPT, or a live attempt could be taken for dead and published twice.
+STALE_ATTEMPT = LONGEST_ATTEMPT + timedelta(minutes=15)
+# Attempts that did not publish after which a post stops being retried on its own: an unexpected
+# exception that kills the worker every time must not loop forever.
+MAX_ATTEMPTS = 3
 # Instagram timestamps have whole seconds, so a post can look slightly older than its attempt.
 TIMESTAMP_SLACK = timedelta(minutes=1)
 RECENT_MEDIA_TO_SEARCH = 50
 # The fake never downloads anything, so simulation needs no real public URL.
 SIMULATED_PUBLIC_URL = "https://simulation.invalid"
 
-# Posts whose media must stay on disk.
+# Posts whose media must stay on disk. Failed posts can be rescheduled.
 ACTIVE = (
     PostStatus.DRAFT,
     PostStatus.SCHEDULED,
     PostStatus.PUBLISHING,
     PostStatus.OUTCOME_UNKNOWN,
+    PostStatus.FAILED,
 )
 
 
@@ -112,12 +125,17 @@ class PublishTask:
         self.public_base_url = public_base_url
         self.grace = grace
         self.sleep = sleep
+        # Set on the first call. The worker runs under an exclusive lock (cli.acquire_worker_lock),
+        # so an attempt in progress that started before then belongs to a dead process.
+        self._started_at: datetime | None = None
 
     def __call__(self, sessions: sessionmaker) -> None:
         if not self.public_base_url:
             raise RuntimeError(
                 "cannot publish: set JORGEX_SOCIAL_PUBLIC_URL, Instagram downloads media from it"
             )
+        if self._started_at is None:
+            self._started_at = self.clock.now()
         self.publish_due(sessions)
         self.resolve(sessions)
         self.purge(sessions)
@@ -218,7 +236,14 @@ class PublishTask:
             )
             return
         with sessions() as session, session.begin():
-            session.get_one(PublishAttempt, plan.attempt_id).container_ref = container
+            attempt = session.get_one(PublishAttempt, plan.attempt_id)
+            if attempt.result != AttemptResult.IN_PROGRESS:
+                log.error(
+                    "attempt was closed by someone else; not publishing",
+                    extra={"attempt_id": attempt.id, "result": attempt.result},
+                )
+                return
+            attempt.container_ref = container
         self._publish(sessions, plan.attempt_id, container)
 
     def _create_containers(self, plan: _Plan) -> str:
@@ -287,6 +312,8 @@ class PublishTask:
             self._end(sessions, attempt_id, AttemptResult.UNKNOWN, error=exc)
             return
         post_id = self._end(sessions, attempt_id, AttemptResult.OK, media_ref=media_ref)
+        if post_id is None:
+            return
         try:
             permalink = self.instagram.media(media_ref).permalink
         except InstagramError as exc:
@@ -304,10 +331,23 @@ class PublishTask:
         failure: str | None = None,
         error: InstagramError | None = None,
         media_ref: str | None = None,
-    ) -> str:
+    ) -> str | None:
+        """Closes an attempt in progress; returns its post id, or None if it was not in progress
+        any more (another worker took it for dead), in which case nothing changes."""
         now = self.clock.now()
         with sessions() as session, session.begin():
             attempt = session.get_one(PublishAttempt, attempt_id)
+            if attempt.result != AttemptResult.IN_PROGRESS:
+                log.error(
+                    "attempt already closed; outcome not recorded",
+                    extra={
+                        "attempt_id": attempt.id,
+                        "result": attempt.result,
+                        "outcome": str(result),
+                        "media_ref": media_ref,
+                    },
+                )
+                return None
             post = session.get_one(Post, attempt.post_id)
             attempt.result = result
             attempt.ended_at = now
@@ -332,6 +372,9 @@ class PublishTask:
 
     def resolve(self, sessions: sessionmaker) -> None:
         now = self.clock.now()
+        # Dead: started before this worker did, or older than any live attempt can be (the
+        # safety net if the lock is ever bypassed).
+        cutoff = max(now - STALE_ATTEMPT, self._started_at or now - STALE_ATTEMPT)
         with sessions() as session, session.begin():
             stale = session.scalars(
                 select(PublishAttempt)
@@ -339,14 +382,16 @@ class PublishTask:
                 .where(
                     Post.network == self.instagram.network,
                     PublishAttempt.result == AttemptResult.IN_PROGRESS,
-                    PublishAttempt.started_at < now - STALE_ATTEMPT,
+                    PublishAttempt.started_at < cutoff,
                 )
             ).all()
             for attempt in stale:
                 # The worker died mid-attempt: from here on it is an unknown outcome like any other.
                 attempt.result = AttemptResult.UNKNOWN
                 attempt.ended_at = now
-                session.get_one(Post, attempt.post_id).status = PostStatus.OUTCOME_UNKNOWN
+                post = session.get_one(Post, attempt.post_id)
+                post.status = PostStatus.OUTCOME_UNKNOWN
+                self._revoke_urls(session, post)
             session.flush()
             pending = [
                 _Pending(a.id, a.container_ref, a.started_at, PostType(p.type), p.caption)
@@ -452,6 +497,9 @@ class PublishTask:
                 return None  # settled by hand in the meantime
             attempt.resolved_at = now
             attempt.resolved_as = resolution
+            retrying = post_status == PostStatus.SCHEDULED or retry_container is not None
+            if retrying and self._failed_attempts(session, post) >= MAX_ATTEMPTS:
+                post_status, failure, retry_container = PostStatus.FAILED, "too_many_attempts", None
             post.status = post_status
             post.failure = failure
             if post_status == PostStatus.SCHEDULED:
@@ -472,6 +520,13 @@ class PublishTask:
 
     # Shared
 
+    def _failed_attempts(self, session: Session, post: Post) -> int:
+        return session.scalar(
+            select(func.count()).where(
+                PublishAttempt.post_id == post.id, PublishAttempt.result != AttemptResult.OK
+            )
+        )
+
     def _media_of(self, session: Session, post: Post) -> list[Media]:
         return list(session.scalars(select(Media).where(Media.id.in_(post.media_ids))))
 
@@ -489,7 +544,8 @@ class PublishTask:
             media.delete_at = self.clock.now() + KEEP_AFTER_PUBLISH
 
     def purge(self, sessions: sessionmaker) -> None:
-        """Deletes files past their delete_at, unless a post still in play uses them."""
+        """Deletes files no post still in play uses: seven days after publishing, or seven days
+        after upload when never published (unused, or only in cancelled posts)."""
         now = self.clock.now()
         in_use = union(
             select(PostItem.media_id).join(Post).where(Post.status.in_(ACTIVE)),
@@ -500,7 +556,10 @@ class PublishTask:
         with sessions() as session, session.begin():
             expired = session.scalars(
                 select(Media).where(
-                    Media.delete_at <= now,
+                    or_(
+                        Media.delete_at <= now,
+                        Media.delete_at.is_(None) & (Media.created_at <= now - KEEP_AFTER_PUBLISH),
+                    ),
                     Media.deleted_at.is_(None),
                     Media.id.not_in(in_use),
                 )

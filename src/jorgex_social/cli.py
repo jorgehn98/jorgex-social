@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import json
 import signal
 import sys
@@ -88,7 +89,25 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> None:
     )
 
 
+def acquire_worker_lock(settings: Settings):
+    """Only one worker per database: two would both publish what is due, and a live attempt of
+    one could look dead to the other. The lock is released when the process exits, even on a
+    crash; keep the returned file open while the worker runs."""
+    settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+    path = settings.database_path.with_name(settings.database_path.name + ".worker.lock")
+    lock = path.open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit(
+            f"error: another worker is already running on this database ({path})"
+        ) from None
+    return lock
+
+
 def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
+    lock = acquire_worker_lock(settings)  # noqa: F841  (held until the process exits)
     logs.configure()
     stop = threading.Event()
     sessions = make_sessionmaker(make_engine(settings))

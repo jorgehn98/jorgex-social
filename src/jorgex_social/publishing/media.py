@@ -20,6 +20,17 @@ CONTENT_TYPE = {
 }
 # Enough to read the JPEG marker or the MP4/MOV `ftyp` box with its major brand.
 SNIFF_BYTES = 12
+# ISO-BMFF major brands of MP4 and MOV video. HEIC, AVIF and other formats share the `ftyp` box
+# and must not pass for video.
+VIDEO_BRANDS = {
+    b"isom": MediaType.MP4,
+    b"iso2": MediaType.MP4,
+    b"mp41": MediaType.MP4,
+    b"mp42": MediaType.MP4,
+    b"avc1": MediaType.MP4,
+    b"M4V ": MediaType.MP4,
+    b"qt  ": MediaType.MOV,
+}
 
 
 def sniff(head: bytes) -> MediaType | None:
@@ -27,7 +38,7 @@ def sniff(head: bytes) -> MediaType | None:
     if head[:3] == b"\xff\xd8\xff":
         return MediaType.JPEG
     if head[4:8] == b"ftyp":
-        return MediaType.MOV if head[8:12] == b"qt  " else MediaType.MP4
+        return VIDEO_BRANDS.get(head[8:12])
     return None
 
 

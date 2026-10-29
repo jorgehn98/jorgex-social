@@ -18,6 +18,8 @@ JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
 MP4 = b"\x00\x00\x00\x18ftypisom" + b"v" * 64
 MOV = b"\x00\x00\x00\x14ftypqt  " + b"q" * 64
 PNG = b"\x89PNG\r\n\x1a\n" + b"p" * 64
+HEIC = b"\x00\x00\x00\x18ftypheic" + b"h" * 64
+AVIF = b"\x00\x00\x00\x1cftypavif" + b"a" * 64
 
 
 @pytest.fixture
@@ -85,7 +87,14 @@ def test_upload_takes_the_type_from_the_signature(client, headers, app):
 
 
 @pytest.mark.parametrize(
-    ("body", "content_type"), [(PNG, "image/jpeg"), (JPEG, "image/png"), (b"", "image/jpeg")]
+    ("body", "content_type"),
+    [
+        (PNG, "image/jpeg"),
+        (JPEG, "image/png"),
+        (b"", "image/jpeg"),
+        (HEIC, "video/mp4"),
+        (AVIF, "video/quicktime"),
+    ],
 )
 def test_upload_rejects_other_files(client, headers, app, body, content_type):
     response = client.post(
@@ -394,3 +403,18 @@ def test_public_media_url_needs_no_token_and_only_works_while_valid(app, client,
     assert served.headers["content-type"] == "image/jpeg"
     assert expired.status_code == 404
     assert client.get("/m/unknown").status_code == 404
+
+
+def test_public_media_url_answers_while_the_database_is_being_written(app, client, headers, clock):
+    media_id = upload(client, headers)
+    with app.state.sessionmaker() as session, session.begin():
+        item = session.get(Media, media_id)
+        storage.issue_url(item, clock.now())
+        token = item.url_token
+
+    # The worker holds the write lock (BEGIN IMMEDIATE) while Instagram downloads.
+    with app.state.sessionmaker() as writer, writer.begin():
+        writer.execute(select(Media.id)).all()
+        response = client.get(f"/m/{token}")
+
+    assert response.status_code == 200

@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from sqlalchemy import inspect
 
 from jorgex_social.cli import main
@@ -63,3 +64,17 @@ def test_revoked_token_is_listed_without_secret(settings, monkeypatch, capsys):
 
     assert secret not in listing
     assert json.loads(listing)[0]["revoked_at"] is not None
+
+
+def test_a_second_worker_on_the_same_database_refuses_to_start(settings, monkeypatch):
+    from jorgex_social.cli import acquire_worker_lock
+
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+    first = acquire_worker_lock(settings)
+    try:
+        with pytest.raises(SystemExit, match="another worker"):
+            main(["worker"])
+    finally:
+        first.close()
+
+    acquire_worker_lock(settings).close()  # free again once the first one is gone

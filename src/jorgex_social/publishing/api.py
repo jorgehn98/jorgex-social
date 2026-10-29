@@ -1,7 +1,7 @@
 import hashlib
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, BinaryIO, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
@@ -10,7 +10,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
-from jorgex_social.access.deps import SessionDep, require, require_outside_transaction
+from jorgex_social.access.deps import (
+    ReadSessionDep,
+    SessionDep,
+    require,
+    require_outside_transaction,
+)
 from jorgex_social.access.tokens import Group, Level
 from jorgex_social.publishing import catalog
 from jorgex_social.publishing import media as storage
@@ -51,6 +56,11 @@ class MediaOut(BaseModel):
     sha256: str
     bytes: int
     created_at: datetime
+
+
+def _write_chunk(fh: BinaryIO, digest, chunk: bytes) -> None:
+    digest.update(chunk)
+    fh.write(chunk)
 
 
 def _save_media(sessions: sessionmaker, media: Media) -> None:
@@ -94,8 +104,9 @@ async def upload_media(request: Request):
                     raise _error(413, "too_large", f"Uploads are limited to {limit} bytes.")
                 if len(head) < storage.SNIFF_BYTES:
                     head += chunk[: storage.SNIFF_BYTES - len(head)]
-                digest.update(chunk)
-                fh.write(chunk)
+                # In a thread: hashing and writing 300 MB must not stall the event loop, which
+                # also serves the media Instagram is downloading.
+                await run_in_threadpool(_write_chunk, fh, digest, chunk)
         media_type = storage.sniff(head)
         if media_type is None:
             raise _error(415, "unsupported_media_type", "The file is not a JPEG, MP4 or MOV.")
@@ -110,6 +121,7 @@ async def upload_media(request: Request):
         sha256=digest.hexdigest(),
         type=media_type.value,
         bytes=size,
+        created_at=request.app.state.clock.now(),  # unused media are purged by age
     )
     try:
         await run_in_threadpool(_save_media, request.app.state.sessionmaker, media)
@@ -120,7 +132,7 @@ async def upload_media(request: Request):
 
 
 @public_router.api_route("/m/{url_token}", methods=["GET", "HEAD"], include_in_schema=False)
-def media_file(url_token: str, request: Request, session: SessionDep):
+def media_file(url_token: str, request: Request, session: ReadSessionDep):
     media = session.scalar(select(Media).where(Media.url_token == url_token))
     now = request.app.state.clock.now()
     if media is None or media.deleted_at or not media.url_expires_at or media.url_expires_at <= now:
@@ -490,6 +502,8 @@ def resolve_post(
         post.published_at = now
         for media in _media(session, post.media_ids).values():
             media.delete_at = now + storage.KEEP_AFTER_PUBLISH
+    for media in _media(session, post.media_ids).values():
+        storage.revoke_url(media)
     for attempt in post.attempts:
         if attempt.result == AttemptResult.UNKNOWN and attempt.resolved_at is None:
             attempt.resolved_at = now

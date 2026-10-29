@@ -10,7 +10,7 @@ from jorgex_social.instagram.errors import Refused, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ProductType
 from jorgex_social.publishing.models import Media
-from jorgex_social.publishing.worker import PublishTask
+from jorgex_social.publishing.worker import LONGEST_ATTEMPT, STALE_ATTEMPT, PublishTask
 from jorgex_social.stats.models import PostSnapshot
 from jorgex_social.stats.snapshots import SnapshotTask
 
@@ -396,11 +396,11 @@ def test_crash_before_any_container_is_retried(api, task, sessions, ig, clock):
         task(sessions)
     assert api.get(post_id)["status"] == "publishing"
 
-    clock.advance(minutes=5)
+    clock.advance(seconds=STALE_ATTEMPT.total_seconds() - 60)
     task(sessions)
     assert api.get(post_id)["status"] == "publishing"  # not stale yet
 
-    clock.advance(minutes=11)
+    clock.advance(minutes=2)
     task(sessions)
     task(sessions)
 
@@ -419,7 +419,7 @@ def test_crash_after_going_live_is_resolved_as_published(api, task, sessions, ig
 
     with pytest.raises(RuntimeError):
         task(sessions)
-    clock.advance(minutes=16)
+    clock.advance(seconds=STALE_ATTEMPT.total_seconds() + 60)
     task(sessions)
 
     post = api.get(post_id)
@@ -552,8 +552,175 @@ def test_crash_noticed_after_the_grace_window_still_publishes(api, task, session
     with pytest.raises(RuntimeError):
         task(sessions)
 
-    clock.advance(minutes=40)
+    clock.advance(seconds=STALE_ATTEMPT.total_seconds() + 60)
     task(sessions)
     task(sessions)
 
     assert api.get(post_id)["status"] == "published"
+
+
+def stale():
+    return STALE_ATTEMPT.total_seconds() + 60
+
+
+def test_a_post_that_keeps_crashing_the_worker_stops_after_three_attempts(
+    api, task, sessions, ig, clock
+):
+    post_id = api.post()
+    api.publish_now(post_id)
+    for _ in range(3):
+        ig.fail_next("create_container", RuntimeError("worker killed"))
+        with pytest.raises(RuntimeError):
+            task(sessions)
+        clock.advance(seconds=stale())
+        task.resolve(sessions)
+
+    post = api.get(post_id)
+    assert (post["status"], post["failure"]) == ("failed", "too_many_attempts")
+    assert len(post["attempts"]) == 3
+    task(sessions)
+    assert published(ig) == []
+
+
+def test_stale_threshold_outlasts_the_longest_legitimate_attempt():
+    assert STALE_ATTEMPT > LONGEST_ATTEMPT > timedelta(minutes=11 * 10)
+
+
+def test_a_second_worker_does_not_republish_a_long_carousel_in_progress(
+    api, sessions, ig, clock, settings
+):
+    """Slow carousel children keep worker A busy far beyond the old 15-minute threshold while
+    worker B runs on the same database: B must not take A's attempt for dead."""
+    slow = timedelta(minutes=9)
+    ig.video_processing = slow
+    items = [api.upload(MP4 + bytes([i]), "video/mp4") for i in range(4)]
+    post_id = api.post("carousel", "Long carousel", items)
+    api.publish_now(post_id)
+    second = PublishTask(
+        ig, clock, settings.media_dir, BASE_URL, sleep=lambda s: clock.advance(seconds=s)
+    )
+
+    # B was already running before A's attempt started (the lock prevents this in production;
+    # the long threshold is the safety net), so only the threshold can protect A's attempt.
+    second(sessions)
+
+    def sleep(seconds):
+        clock.advance(seconds=seconds)
+        second(sessions)  # B runs on every pass while A waits on Instagram
+
+    PublishTask(ig, clock, settings.media_dir, BASE_URL, sleep=sleep)(sessions)
+
+    post = api.get(post_id)
+    assert clock.now() - START > timedelta(minutes=30)  # A really ran that long
+    assert post["status"] == "published"
+    assert [a["result"] for a in post["attempts"]] == ["ok"]
+    assert len(published(ig)) == 1
+
+
+def test_an_attempt_closed_by_someone_else_is_left_alone(api, task, sessions, ig, clock):
+    from jorgex_social.publishing.models import AttemptResult, PublishAttempt
+
+    post_id = api.post()
+    api.publish_now(post_id)
+    original = ig.publish
+
+    def publish_after_takeover(container):
+        # Another process declared this attempt dead while the call was in flight.
+        with sessions() as session, session.begin():
+            session.scalar(select(PublishAttempt)).result = AttemptResult.UNKNOWN
+        return original(container)
+
+    ig.publish = publish_after_takeover
+    task.publish_due(sessions)
+
+    post = api.get(post_id)
+    assert post["status"] == "publishing"  # untouched by the late answer
+    assert post["attempts"][0]["result"] == "unknown"
+
+
+def test_purge_keeps_failed_posts_and_drops_unused_files_after_a_week(
+    api, client, headers, task, sessions, ig, clock, settings
+):
+    unused = api.upload(JPEG + b"unused")
+    cancelled = api.upload(JPEG + b"cancelled")
+    failed = api.upload(JPEG + b"failed")
+    cancelled_post = api.post("image", "Cancelled", [cancelled])
+    client.post(f"/v1/posts/{cancelled_post}/cancel", headers=headers)
+    failed_post = api.post("image", "Refused", [failed])
+    api.publish_now(failed_post)
+    ig.fail_next("publish", Refused("bad", code=100))
+    task(sessions)
+    assert api.get(failed_post)["status"] == "failed"
+
+    clock.advance(days=6, hours=23)
+    task.purge(sessions)
+    assert len(list(settings.media_dir.iterdir())) == 3
+
+    clock.advance(hours=2)
+    task.purge(sessions)
+
+    assert [p.stem for p in settings.media_dir.iterdir()] == [failed]
+    with sessions() as session:
+        assert session.get(Media, unused).deleted_at is not None
+        assert session.get(Media, cancelled).deleted_at is not None
+
+
+def test_stale_attempt_and_manual_resolution_revoke_public_urls(
+    api, client, headers, task, sessions, ig, clock
+):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("create_container", RuntimeError("worker killed"))
+    with pytest.raises(RuntimeError):
+        task(sessions)
+    with sessions() as session:
+        assert session.scalar(select(Media)).url_token is not None
+
+    clock.advance(seconds=stale())
+    task.resolve(sessions)
+    with sessions() as session:
+        assert session.scalar(select(Media)).url_token is None
+
+    task(sessions)  # the first post goes out again and is done
+    assert api.get(post_id)["status"] == "published"
+
+    # Manual resolution of an attempt whose URL is still live.
+    other = api.post(caption="Second")
+    api.publish_now(other)
+    ig.fail_next("publish", Unavailable("502"))
+    task.publish_due(sessions)
+    with sessions() as session, session.begin():
+        from jorgex_social.publishing.media import issue_url
+
+        for media in session.scalars(select(Media)):
+            issue_url(media, clock.now())
+    resolved = client.post(
+        f"/v1/posts/{other}/resolve", json={"outcome": "not_published"}, headers=headers
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    item = api.get(other)["items"][0]
+    with sessions() as session:
+        assert session.get(Media, item).url_token is None
+
+
+def test_a_restarted_worker_resolves_the_dead_attempt_at_once(api, task, sessions, ig, clock):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("create_container", RuntimeError("worker killed"))
+    with pytest.raises(RuntimeError):
+        task(sessions)
+
+    clock.advance(minutes=1)  # the process restarts with a fresh task
+    restarted = PublishTask(
+        ig, clock, task.media_dir, BASE_URL, sleep=lambda s: clock.advance(seconds=s)
+    )
+    restarted(sessions)
+    restarted(sessions)
+
+    post = api.get(post_id)
+    assert post["status"] == "published"
+    assert [(a["result"], a["resolved_as"]) for a in post["attempts"]] == [
+        ("unknown", "not_published"),
+        ("ok", None),
+    ]
