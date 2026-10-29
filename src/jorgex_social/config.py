@@ -20,6 +20,13 @@ class Settings:
     # A fresh install never calls the real network; going live is an explicit choice.
     simulation: bool = True
     worker_interval_seconds: float = 10.0
+    # Uploaded media live here until seven days after they are published.
+    media_dir: Path = Path("data/media")
+    # Public HTTPS base URL of this service. Instagram downloads media from it, so publishing for
+    # real needs it; simulation does not.
+    public_url: str | None = None
+    # A scheduled post found later than this (the worker was down) fails instead of going out late.
+    publish_grace_minutes: int = 30
     # Until the in-app connection exists (build step 5), the real adapter reads these.
     instagram_access_token: str | None = field(default=None, repr=False)
     instagram_user_id: str | None = None
@@ -37,6 +44,11 @@ class Settings:
             simulation=_flag(env.get(f"{ENV_PREFIX}SIMULATION", str(defaults.simulation))),
             worker_interval_seconds=float(
                 env.get(f"{ENV_PREFIX}WORKER_INTERVAL_SECONDS", defaults.worker_interval_seconds)
+            ),
+            media_dir=Path(env.get(f"{ENV_PREFIX}MEDIA_DIR", defaults.media_dir)),
+            public_url=(env.get(f"{ENV_PREFIX}PUBLIC_URL") or "").rstrip("/") or None,
+            publish_grace_minutes=int(
+                env.get(f"{ENV_PREFIX}PUBLISH_GRACE_MINUTES", defaults.publish_grace_minutes)
             ),
             instagram_access_token=env.get(f"{ENV_PREFIX}INSTAGRAM_ACCESS_TOKEN") or None,
             instagram_user_id=env.get(f"{ENV_PREFIX}INSTAGRAM_USER_ID") or None,

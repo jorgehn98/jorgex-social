@@ -6,7 +6,8 @@ from sqlalchemy.orm import sessionmaker
 
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.errors import AuthError, InstagramError, RateLimited
-from jorgex_social.instagram.types import Instagram, Media
+from jorgex_social.instagram.types import Instagram, Media, ProductType
+from jorgex_social.publishing.models import Post, PostStatus, PostType
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
 
 log = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ FAILURE_BACKOFF = timedelta(days=1)
 RECENT_MEDIA = timedelta(days=30)
 RECENT_INTERVAL = timedelta(days=1)
 OLD_INTERVAL = timedelta(days=7)
+# Stories are not listed by /media and their metrics vanish after 24 hours, so the ones this
+# service published are sampled from its own posts table while they last.
+STORY_LIFETIME = timedelta(hours=24)
+STORY_INTERVAL = timedelta(hours=6)
 
 # The sweep stops on these: retrying item by item would only repeat the failure.
 _STOP_SWEEP = (AuthError, RateLimited)
@@ -94,7 +99,7 @@ def snapshot_media(
     now: datetime,
     failed_at: dict[str, datetime] | None = None,
 ) -> int:
-    """Feed posts and reels, including the ones published by hand. Stories come with step 4."""
+    """Feed posts and reels, including the ones published by hand."""
     items = instagram.list_media()
     with sessions() as session:
         last_taken = dict(
@@ -139,6 +144,57 @@ def snapshot_media(
     return taken
 
 
+def snapshot_stories(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
+    """Stories published by this service, every 6 hours during their first 24. A failed one is
+    retried on the next hourly sweep: a day of backoff would outlive the story."""
+    with sessions() as session:
+        stories = session.execute(
+            select(Post.external_ref, Post.published_at, Post.permalink).where(
+                Post.network == instagram.network,
+                Post.type == PostType.STORY,
+                Post.status == PostStatus.PUBLISHED,
+                Post.external_ref.is_not(None),
+                Post.published_at > now - STORY_LIFETIME,
+            )
+        ).all()
+        last_taken = dict(
+            session.execute(
+                select(PostSnapshot.media_ref, func.max(PostSnapshot.taken_at))
+                .where(
+                    PostSnapshot.network == instagram.network,
+                    PostSnapshot.media_ref.in_([ref for ref, _, _ in stories]),
+                )
+                .group_by(PostSnapshot.media_ref)
+            ).all()
+        )
+    taken = 0
+    for media_ref, published_at, permalink in stories:
+        last = last_taken.get(media_ref)
+        if last is not None and now - last < STORY_INTERVAL:
+            continue
+        try:
+            metrics = instagram.media_insights(media_ref, ProductType.STORY)
+        except _STOP_SWEEP:
+            raise
+        except InstagramError as exc:
+            log.warning("story insights failed", extra={"media_ref": media_ref, "error": str(exc)})
+            continue
+        with sessions() as session, session.begin():
+            session.add(
+                PostSnapshot(
+                    network=instagram.network,
+                    media_ref=media_ref,
+                    taken_at=now,
+                    product_type=ProductType.STORY.value,
+                    published_at=published_at,
+                    permalink=permalink,
+                    metrics=metrics,
+                )
+            )
+        taken += 1
+    return taken
+
+
 class SnapshotTask:
     """Worker task: at most one sweep per hour; each sweep only fetches what is due."""
 
@@ -158,6 +214,7 @@ class SnapshotTask:
         steps = (
             ("account", lambda: snapshot_account(sessions, self.instagram, now)),
             ("media", lambda: snapshot_media(sessions, self.instagram, now, self._failed_at)),
+            ("stories", lambda: snapshot_stories(sessions, self.instagram, now)),
         )
         for name, step in steps:
             try:

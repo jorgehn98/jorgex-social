@@ -8,7 +8,7 @@ from jorgex_social.config import Settings
 
 @pytest.fixture
 def settings(tmp_path) -> Settings:
-    settings = Settings(database_path=tmp_path / "jorgex_social.db")
+    settings = Settings(database_path=tmp_path / "jorgex_social.db", media_dir=tmp_path / "media")
     migrate(settings)
     return settings
 

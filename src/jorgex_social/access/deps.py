@@ -20,10 +20,7 @@ def get_session(request: Request) -> Iterator[Session]:
 SessionDep = Annotated[Session, Depends(get_session, scope="function")]
 
 
-def current_token(
-    session: SessionDep,
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
-) -> ApiToken:
+def _authenticate(session: Session, credentials: HTTPAuthorizationCredentials | None) -> ApiToken:
     token = authenticate(session, credentials.credentials) if credentials else None
     if token is None:
         raise HTTPException(
@@ -34,6 +31,27 @@ def current_token(
     return token
 
 
+def _authorize(token: ApiToken, group: Group, level: Level) -> ApiToken:
+    if not allows(token, group, level):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "forbidden",
+                "message": f"This token cannot {level.value} the {group.value} group.",
+                "group": group.value,
+                "required": level.value,
+            },
+        )
+    return token
+
+
+Credentials = Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]
+
+
+def current_token(session: SessionDep, credentials: Credentials) -> ApiToken:
+    return _authenticate(session, credentials)
+
+
 TokenDep = Annotated[ApiToken, Depends(current_token)]
 
 
@@ -41,16 +59,18 @@ def require(group: Group, level: Level) -> Callable[[ApiToken], ApiToken]:
     """Authorizes each call on the server, per tool group, as decision 04 requires."""
 
     def dependency(token: TokenDep) -> ApiToken:
-        if not allows(token, group, level):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                detail={
-                    "code": "forbidden",
-                    "message": f"This token cannot {level.value} the {group.value} group.",
-                    "group": group.value,
-                    "required": level.value,
-                },
-            )
-        return token
+        return _authorize(token, group, level)
+
+    return dependency
+
+
+def require_outside_transaction(group: Group, level: Level) -> Callable[..., ApiToken]:
+    """Like `require`, for long requests such as uploads: the token is checked in its own short
+    transaction, so the database write lock is not held while the body streams in."""
+
+    def dependency(request: Request, credentials: Credentials) -> ApiToken:
+        with request.app.state.sessionmaker() as session, session.begin():
+            token = _authenticate(session, credentials)
+        return _authorize(token, group, level)
 
     return dependency

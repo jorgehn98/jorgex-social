@@ -3,6 +3,7 @@ import json
 import signal
 import sys
 import threading
+from datetime import timedelta
 from importlib import resources
 
 import uvicorn
@@ -17,6 +18,7 @@ from jorgex_social.clock import SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
 from jorgex_social.instagram import make_instagram
+from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask
 from jorgex_social.stats.snapshots import SnapshotTask
 
 
@@ -91,7 +93,18 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
     stop = threading.Event()
     sessions = make_sessionmaker(make_engine(settings))
     clock = SystemClock()
-    tasks = [SnapshotTask(make_instagram(settings, clock), clock)]
+    instagram = make_instagram(settings, clock)
+    public_url = settings.public_url or (SIMULATED_PUBLIC_URL if settings.simulation else None)
+    tasks = [
+        PublishTask(
+            instagram,
+            clock,
+            settings.media_dir,
+            public_url,
+            grace=timedelta(minutes=settings.publish_grace_minutes),
+        ),
+        SnapshotTask(instagram, clock),
+    ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the
     # signal synchronously. `docker stop` sends SIGTERM.

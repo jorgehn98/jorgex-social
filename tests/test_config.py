@@ -33,3 +33,18 @@ def test_real_adapter_needs_credentials():
 
     with pytest.raises(RuntimeError):
         make_instagram(Settings(simulation=False), SystemClock())
+
+
+def test_reads_publishing_settings():
+    settings = Settings.from_env(
+        {
+            "JORGEX_SOCIAL_MEDIA_DIR": "/data/media",
+            "JORGEX_SOCIAL_PUBLIC_URL": "https://social.example.com/",
+            "JORGEX_SOCIAL_PUBLISH_GRACE_MINUTES": "45",
+        }
+    )
+
+    assert str(settings.media_dir) == "/data/media"
+    assert settings.public_url == "https://social.example.com"
+    assert settings.publish_grace_minutes == 45
+    assert Settings.from_env({}).public_url is None
