@@ -578,6 +578,32 @@ def test_pages_render_sample_data_without_writing_or_showing_secrets(app, client
     assert "credential_expiring" in bodies["/ui/incidents"]
 
 
+def test_the_rules_page_shows_a_rule_waiting_for_its_post(app, client, clock, enrolled):
+    with app.state.sessionmaker() as session, session.begin():
+        post = Post(network=app.state.network, type="image", content_hash="hash")
+        session.add(post)
+        session.flush()
+        post_id = post.id
+        session.add(
+            Rule(
+                network=app.state.network,
+                name="Waiting",
+                channel="comment",
+                post_id=post_id,
+                priority=1,
+                content={"keywords": ["price"], "private_replies": ["Hi"]},
+                created_at=clock.now(),
+                updated_at=clock.now(),
+            )
+        )
+    log_in(client, clock)
+
+    page = client.get("/ui/rules").text
+
+    assert f"waiting for post {post_id}" in page
+    assert "every post" not in page
+
+
 def test_pages_only_write_the_session_activity(app, client, clock, sample):
     log_in(client, clock)
     clock.advance(minutes=5)

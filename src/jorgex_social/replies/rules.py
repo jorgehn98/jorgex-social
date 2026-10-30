@@ -18,10 +18,12 @@ from pydantic import (
     StringConstraints,
     model_validator,
 )
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from jorgex_social.replies.models import Channel, Rule
+from jorgex_social.account import audit
+from jorgex_social.publishing.models import Post
+from jorgex_social.replies.models import Channel, Event, Rule
 
 # instagram.md, «Límites»: 1,000 bytes per message with Instagram Login; 2,200 characters is
 # the caption limit, used for public replies.
@@ -29,6 +31,9 @@ MAX_MESSAGE_BYTES = 1000
 MAX_PUBLIC_CHARS = 2200
 MAX_VARIANTS = 20
 MAX_KEYWORDS = 50
+# Our own floor, not a Meta rule: an automation tool's interface asks for 3 and users of these
+# tools suggest 3 to 5, with no number from Meta. Checked in `check`, not in `RuleContent`, so
+# content stored with fewer still loads.
 MIN_PUBLIC_VARIANTS = 3
 LINK_MARKS = ("http://", "https://", "www.")
 # The evidence behind every warning is community reports, so none of them blocks a rule.
@@ -83,16 +88,32 @@ class RuleContent(BaseModel):
         return self
 
 
-def check(channel: Channel, media_ref: str | None, content: RuleContent) -> None:
-    """What depends on the channel. Raises ValueError with a message for the caller."""
+def check(
+    channel: Channel, media_ref: str | None, content: RuleContent, post_id: str | None = None
+) -> None:
+    """What a rule needs on top of its content's own shape, the channel first. Raises ValueError
+    with a message for the caller."""
     if channel == Channel.MESSAGE:
         if media_ref is not None:
             raise ValueError("media_ref only applies to comment rules")
+        if post_id is not None:
+            raise ValueError("post_id only applies to comment rules")
         if content.public_replies:
             raise ValueError("message rules cannot have public_replies")
+    if media_ref is not None and post_id is not None:
+        raise ValueError("give media_ref or post_id, not both")
+    distinct = {normalize(text) for text in content.public_replies}
+    if content.public_replies and len(distinct) < MIN_PUBLIC_VARIANTS:
+        raise ValueError(
+            f"public_replies needs at least {MIN_PUBLIC_VARIANTS} variants that differ in more "
+            f"than case, accents or spacing, or none at all (found {len(distinct)}); this is "
+            "this service's own floor, not a Meta rule"
+        )
 
 
-def rule_warnings(channel: str, media_ref: str | None, content: dict) -> list[dict[str, str]]:
+def rule_warnings(
+    channel: str, media_ref: str | None, content: dict, post_id: str | None = None
+) -> list[dict[str, str]]:
     """What automation users report as risky in a rule. A rule with warnings is still valid."""
     public = content.get("public_replies") or []
     private = content.get("private_replies") or []
@@ -101,13 +122,8 @@ def rule_warnings(channel: str, media_ref: str | None, content: dict) -> list[di
     def warn(code: str, message: str) -> None:
         found.append({"code": code, "message": _REPORTED + message})
 
-    if public and len(public) < MIN_PUBLIC_VARIANTS:
-        warn(
-            "few_public_variants",
-            f"fewer than {MIN_PUBLIC_VARIANTS} public reply variants repeat the same text often.",
-        )
     if channel == Channel.COMMENT:
-        if public and media_ref is None:
+        if public and media_ref is None and post_id is None:
             warn("public_on_every_post", "public replies on every post can look like spam.")
         if any(mark in text.casefold() for text in private for mark in LINK_MARKS):
             warn("link_in_first_message", "a link in the first private message can look like spam.")
@@ -177,6 +193,8 @@ def first_match(
 ) -> Rule | None:
     """The first rule `text` fires. With `occurred_at`, only rules active since before then."""
     for rule in rules:
+        if rule.waiting_for_post:
+            continue
         if rule.media_ref is not None and rule.media_ref != media_ref:
             continue
         if occurred_at is not None and (
@@ -186,3 +204,46 @@ def first_match(
         if matches(rule.content, text):
             return rule
     return None
+
+
+def bind_to_published(session: Session, post: Post, now: datetime) -> None:
+    """Points every rule waiting for `post` at its media. Call it in the transaction that marks
+    the post published. Without a media id the rules keep waiting."""
+    if post.external_ref is None:
+        return
+    waiting = session.scalars(
+        select(Rule).where(Rule.post_id == post.id, Rule.media_ref.is_(None))
+    ).all()
+    if not waiting:
+        return
+    for rule in waiting:
+        rule.media_ref = post.external_ref
+        rule.updated_at = now
+        audit.record(
+            session,
+            now,
+            "rule.bound_to_post",
+            object_type="rule",
+            object_id=rule.id,
+            detail={"post_id": post.id, "media_ref": post.external_ref},
+        )
+    # Only what a bound rule could answer: no active rule, or older than all their activations,
+    # and reading it again could only fire some other rule.
+    floors = [
+        r.activated_at for r in waiting if r.active and r.archived_at is None and r.activated_at
+    ]
+    if not floors:
+        return
+    # Comments seen while the rule waited cannot be evaluated again here: their text was never
+    # stored. Forgetting them makes the next poll read them as new. rule_id NULL means no
+    # deliveries (Intake._record), so no foreign key stops this and nothing answered is forgotten.
+    # Timestamps come back from Instagram, so no reply window moves.
+    session.execute(
+        delete(Event).where(
+            Event.network == post.network,
+            Event.type == Channel.COMMENT,
+            Event.media_ref == post.external_ref,
+            Event.rule_id.is_(None),
+            Event.occurred_at >= min(floors),
+        )
+    )

@@ -12,6 +12,7 @@ from mcp import Client
 
 from jorgex_social.access.tokens import create_token, revoke_token
 from jorgex_social.publishing import media as storage
+from jorgex_social.publishing.models import Post
 from jorgex_social_mcp import client as http_client
 from jorgex_social_mcp.client import Api, ApiError, check_url, urllib_transport
 from jorgex_social_mcp.server import build_server, main
@@ -309,6 +310,29 @@ async def test_reply_tools_reach_their_endpoints_end_to_end(app, transport):
     assert r["archived"][1]["archived_at"] is not None
     assert r["events"] == r["deliveries"] == r["conversations"] == ("ok", [])
     assert r["pause"][1]["code"] == r["resume"][1]["code"] == "not_found"
+
+
+async def test_rule_tools_tie_a_rule_to_a_post(app, transport):
+    with app.state.sessionmaker() as session, session.begin():
+        post = Post(network=app.state.network, type="image", content_hash="hash")
+        session.add(post)
+        session.flush()
+        post_id = post.id
+    server = server_for(app, transport, rules="write")
+    content = {"keywords": ["price"], "private_replies": ["See the website."]}
+
+    async with Client(server) as client:
+        _, rule = await call(
+            client, "create_rule", name="p", channel="comment", content=content, post_id=post_id
+        )
+        rid = rule["id"]
+        assert (rule["post_id"], rule["waiting_for_post"]) == (post_id, True)
+        _, cleared = await call(client, "update_rule", rule_id=rid, clear=["media_ref"])
+        assert (cleared["post_id"], cleared["media_ref"]) == (None, None)
+        _, linked = await call(client, "update_rule", rule_id=rid, post_id=post_id)
+        assert linked["waiting_for_post"] is True
+        _, named = await call(client, "update_rule", rule_id=rid, media_ref="m1")
+        assert (named["post_id"], named["media_ref"]) == (None, "m1")
 
 
 async def test_api_errors_come_back_as_they_are(app, transport):

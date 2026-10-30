@@ -24,6 +24,7 @@ from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.logs import JsonFormatter, hide_query_strings
+from jorgex_social.publishing.models import Post
 from jorgex_social.replies.models import Conversation, Delivery, Event
 from jorgex_social.replies.task import ReplyTask
 from jorgex_social.replies.webhook import parse
@@ -36,7 +37,7 @@ VERIFY_TOKEN = "verify-token-for-tests"
 APP_SECRET = "app-secret-for-tests"
 COMMENT_RULE = {
     "keywords": ["precio"],
-    "public_replies": ["Sent you a DM!"],
+    "public_replies": ["Sent you a DM!", "Check your inbox", "Just wrote to you"],
     "private_replies": ["The price is on the website."],
 }
 MESSAGE_RULE = {"keywords": ["precio"], "private_replies": ["DM answer"]}
@@ -313,6 +314,34 @@ def test_a_comment_notified_is_answered_on_the_next_pass_without_polling(
         ("private_reply", "sent"),
         ("public_reply", "sent"),
     }
+
+
+def test_a_notified_comment_does_not_fire_a_rule_waiting_for_its_post(
+    client, headers, ig, sessions, task, clock
+):
+    with sessions() as session, session.begin():
+        post = Post(network=ig.network, type="image", content_hash="hash")
+        session.add(post)
+        session.flush()
+        post_id = post.id
+    response = client.post(
+        "/v1/rules",
+        json={"name": "x", "channel": "comment", "content": COMMENT_RULE, "post_id": post_id},
+        headers=headers,
+    )
+    rule_id = response.json()["id"]
+    client.post(f"/v1/rules/{rule_id}/activate", headers=headers)
+    media = publish(ig)
+    comment_id = ig.add_comment(media, "precio")
+
+    assert notify(client, comment_payload(comment_id, media, "precio", at=clock.now())).text == "ok"
+    task(sessions)
+
+    assert ig.sent == []
+    with sessions() as session:
+        event = session.scalar(select(Event).where(Event.external_ref == comment_id))
+        assert event.rule_id is None
+        assert session.scalar(select(func.count()).select_from(Delivery)) == 0
 
 
 def test_a_comment_seen_by_webhook_and_by_poll_is_one_event_and_one_reply(

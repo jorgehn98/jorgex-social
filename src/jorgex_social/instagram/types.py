@@ -105,7 +105,8 @@ class Renewal:
 class Comment:
     """A top-level comment by anyone on one of the account's media. Its text is third-party
     data: it lives only in memory to evaluate rules, never in the database or the logs, and it
-    stays out of repr. The author's username is never read."""
+    stays out of repr. The author's username is never read; their id is, and is stored with the
+    event."""
 
     id: str
     author_id: str | None  # None when Instagram does not say who wrote it

@@ -11,6 +11,7 @@ from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.errors import AccountRestricted, Refused, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerStatus, ProductType
+from jorgex_social.publishing import worker
 from jorgex_social.publishing.models import Media, Post
 from jorgex_social.publishing.worker import LONGEST_ATTEMPT, STALE_ATTEMPT, PublishTask
 from jorgex_social.stats.models import PostSnapshot, RecentMedia
@@ -492,6 +493,54 @@ def test_crash_before_any_container_is_retried(api, task, sessions, ig, clock):
         ("unknown", "not_published"),
         ("ok", None),
     ]
+
+
+def test_a_failing_bind_does_not_publish_twice_and_the_post_ends_published(
+    api, task, sessions, ig, clock, monkeypatch
+):
+    post_id = api.post()
+    api.publish_now(post_id)
+    publishes = []
+    original_publish = ig.publish
+    ig.publish = lambda container: publishes.append(container) or original_publish(container)
+    original_bind = worker.bind_to_published
+    failures = [RuntimeError("bind failed")]
+
+    def bind_failing_once(session, post, now):
+        if failures:
+            raise failures.pop()
+        original_bind(session, post, now)
+
+    monkeypatch.setattr(worker, "bind_to_published", bind_failing_once)
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        task(sessions)
+    assert failures == []
+    assert api.get(post_id)["status"] == "publishing"
+
+    clock.advance(seconds=STALE_ATTEMPT.total_seconds() + 60)
+    task(sessions)
+
+    post = api.get(post_id)
+    [live] = published(ig)
+    assert len(publishes) == 1
+    assert (post["status"], post["external_ref"]) == ("published", live.id)
+
+
+def test_settling_a_post_refuses_an_empty_media_id(api, task, client, headers, sessions, ig):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("publish", Unavailable("502"))
+    task.publish_due(sessions)
+
+    response = client.post(
+        f"/v1/posts/{post_id}/resolve",
+        json={"outcome": "published", "media_ref": ""},
+        headers=headers,
+    )
+
+    assert response.status_code == 422, response.text
+    assert api.get(post_id)["status"] == "outcome_unknown"
 
 
 def test_crash_after_going_live_is_resolved_as_published(api, task, sessions, ig, clock):
