@@ -28,6 +28,7 @@ from jorgex_social.instagram import make_instagram
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import InstagramError
 from jorgex_social.instagram.fake import FakeInstagram
+from jorgex_social.oauth import store as oauth
 from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask
 from jorgex_social.replies.task import ReplyTask
 from jorgex_social.stats.snapshots import SnapshotTask
@@ -96,6 +97,25 @@ def cmd_list_tokens(_: argparse.Namespace, settings: Settings) -> None:
     print(json.dumps(tokens, indent=2))
 
 
+def cmd_list_grants(_: argparse.Namespace, settings: Settings) -> None:
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        print(json.dumps(oauth.list_grants(session), indent=2))
+
+
+def cmd_revoke_grant(args: argparse.Namespace, settings: Settings) -> None:
+    """Ends grants and their tokens. Clients stay registered: a client that still holds its id
+    would otherwise be stuck until it is logged out by hand (`claude mcp logout <name>`)."""
+    sessions = make_sessionmaker(make_engine(settings))
+    now = SystemClock().now()
+    with sessions() as session, session.begin():
+        if args.all:
+            print(json.dumps({"revoked": oauth.revoke_all(session, now, "operator")}))
+        else:
+            grant = oauth.revoke_grant(session, args.id, now)
+            print(json.dumps({"id": grant.id, "revoked_at": grant.revoked_at.isoformat()}))
+
+
 def read_secret(prompt: str) -> str:
     """From the terminal without echo, or from a pipe. Never from an argument, which would stay
     in the shell history and in the process list."""
@@ -124,7 +144,7 @@ def cmd_set_password(_: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
         operator.set_password(session, password, SystemClock().now())
-    print("Password changed; every browser was signed out.")
+    print("Password changed; every browser was signed out and every OAuth grant revoked.")
 
 
 def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
@@ -138,7 +158,7 @@ def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
         operator.enroll_totp(session, key, secret, code, SystemClock().now())
-    print("Second factor enrolled; every browser was signed out.")
+    print("Second factor enrolled; every browser was signed out and every OAuth grant revoked.")
 
 
 def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
@@ -276,6 +296,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list-tokens", help="list API tokens without their secrets")
 
+    sub.add_parser("list-grants", help="list what OAuth clients were allowed, without tokens")
+    revoke_grant = sub.add_parser(
+        "revoke-grant", help="end an OAuth grant and its tokens; the client stays registered"
+    )
+    which = revoke_grant.add_mutually_exclusive_group(required=True)
+    which.add_argument("--id", help="the grant's id, as list-grants shows it")
+    which.add_argument("--all", action="store_true", help="every grant still in force")
+
     connect_ig = sub.add_parser(
         "connect-instagram",
         help="store an Instagram access token, read from standard input, encrypted",
@@ -317,6 +345,10 @@ def main(argv: list[str] | None = None) -> None:
                 cmd_revoke_token(args, settings)
             case "list-tokens":
                 cmd_list_tokens(args, settings)
+            case "list-grants":
+                cmd_list_grants(args, settings)
+            case "revoke-grant":
+                cmd_revoke_grant(args, settings)
             case "connect-instagram":
                 cmd_connect_instagram(args, settings)
             case "create-operator":
@@ -332,6 +364,7 @@ def main(argv: list[str] | None = None) -> None:
     # Messages of these errors never carry the token (instagram/client.py, account/crypto.py).
     except (
         TokenError,
+        oauth.OAuthError,
         operator.OperatorError,
         SecretKeyError,
         NotConnected,

@@ -11,6 +11,8 @@ dependencies = [
     "cryptography>=50.0.2",
     "fastapi>=0.162.0",
     "jinja2>=3.1.6",
+    # The OAuth authorization server and the remote MCP endpoint; also the local stdio MCP server.
+    "mcp==2.3.0",
     "pyotp>=2.10.0",
     "sqlalchemy>=2.1.6",
     "uvicorn>=0.54.0",
@@ -19,11 +21,6 @@ dependencies = [
 [project.scripts]
 jorgex-social = "jorgex_social.cli:main"
 jorgex-social-mcp = "jorgex_social_mcp.server:main"
-
-[project.optional-dependencies]
-mcp = [
-    "mcp==2.3.0",
-]
 
 [dependency-groups]
 dev = [
@@ -37,7 +34,7 @@ requires = ["uv_build>=0.12,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-# The MCP client ships in the same distribution; its `mcp` dependency is the `mcp` extra.
+# The local stdio MCP server ships in the same distribution.
 module-name = ["jorgex_social", "jorgex_social_mcp"]
 
 [tool.pytest.ini_options]

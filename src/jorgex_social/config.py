@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import AnyUrl, ConfigDict, TypeAdapter
+
 ENV_PREFIX = "JORGEX_SOCIAL_"
 # Above the 7-day private-reply window plus the one-day margin the reply task keeps before
 # retention (replies/task.py), so nothing still answerable is ever purged.
@@ -22,6 +24,22 @@ def _positive(env, name: str, default: int) -> int:
     if value < 1:
         raise ValueError(f"{ENV_PREFIX}{name} must be at least 1")
     return value
+
+
+# The SDK's client metadata models parse URLs this way (url_preserve_empty_path).
+_URL = TypeAdapter(AnyUrl, config=ConfigDict(url_preserve_empty_path=True))
+
+
+def _https_uris(value: str) -> tuple[str, ...]:
+    """Normalised as the OAuth SDK parses the redirect URIs a client registers (lower-case scheme
+    and host, no default port; an empty path kept empty), so the exact comparison can match."""
+    uris = []
+    for entry in filter(None, (part.strip() for part in value.split(","))):
+        uri = _URL.validate_python(entry)
+        if uri.scheme != "https":
+            raise ValueError(f"{ENV_PREFIX}OAUTH_REDIRECT_URIS takes https URIs only")
+        uris.append(str(uri))
+    return tuple(uris)
 
 
 @dataclass(frozen=True)
@@ -66,6 +84,9 @@ class Settings:
     # Sign-in attempts allowed per client address (IPv6: per /64), per minute and per hour.
     login_limit_per_minute: int = 5
     login_limit_per_hour: int = 20
+    # https redirect URIs an OAuth client may register besides loopback ones (comma-separated,
+    # matched exactly). Loopback (http://127.0.0.1, localhost, [::1]) is always allowed.
+    oauth_redirect_uris: tuple[str, ...] = ()
 
     @property
     def webhook_enabled(self) -> bool:
@@ -119,4 +140,5 @@ class Settings:
             login_limit_per_hour=_positive(
                 env, "LOGIN_LIMIT_PER_HOUR", defaults.login_limit_per_hour
             ),
+            oauth_redirect_uris=_https_uris(env.get(f"{ENV_PREFIX}OAUTH_REDIRECT_URIS", "")),
         )

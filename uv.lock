@@ -354,14 +354,10 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "jinja2" },
+    { name = "mcp" },
     { name = "pyotp" },
     { name = "sqlalchemy" },
     { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-mcp = [
-    { name = "mcp" },
 ]
 
 [package.dev-dependencies]
@@ -378,12 +374,11 @@ requires-dist = [
     { name = "cryptography", specifier = ">=50.0.2" },
     { name = "fastapi", specifier = ">=0.162.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = "==2.3.0" },
+    { name = "mcp", specifier = "==2.3.0" },
     { name = "pyotp", specifier = ">=2.10.0" },
     { name = "sqlalchemy", specifier = ">=2.1.6" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]
-provides-extras = ["mcp"]
 
 [package.metadata.requires-dev]
 dev = [

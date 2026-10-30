@@ -3,7 +3,9 @@ from sqlalchemy import create_engine, pool
 
 import jorgex_social.access.models  # noqa: F401  (registers tables on the metadata)
 import jorgex_social.account.models  # noqa: F401
+import jorgex_social.oauth.models  # noqa: F401
 import jorgex_social.publishing.models  # noqa: F401
+import jorgex_social.remote_mcp.models  # noqa: F401
 import jorgex_social.replies.models  # noqa: F401
 import jorgex_social.stats.models  # noqa: F401
 from jorgex_social.db import Base

@@ -20,6 +20,7 @@ from jorgex_social.access.models import Operator, OperatorSession
 from jorgex_social.access.tokens import hash_token
 from jorgex_social.account import audit, crypto
 from jorgex_social.account.models import ActorType, Outcome
+from jorgex_social.oauth import store as oauth
 
 log = logging.getLogger(__name__)
 
@@ -57,8 +58,11 @@ def get_operator(session: Session) -> Operator | None:
     return session.scalar(select(Operator))
 
 
-def _end_sessions(session: Session) -> None:
+def _end_sessions(session: Session, now: datetime) -> None:
+    """Every browser signs out and every OAuth grant ends: they were all given on the strength of
+    the credentials that just changed."""
     session.execute(delete(OperatorSession))
+    oauth.revoke_all(session, now, "credentials_changed")
 
 
 def _hash_password(password: str) -> str:
@@ -90,12 +94,12 @@ def create_operator(session: Session, password: str, now: datetime) -> Operator:
 
 
 def set_password(session: Session, password: str, now: datetime) -> Operator:
-    """Also signs every browser out."""
+    """Also signs every browser out and ends every OAuth grant."""
     operator = get_operator(session)
     if operator is None:
         raise OperatorError("there is no operator yet; run create-operator first")
     operator.password_hash = _hash_password(password)
-    _end_sessions(session)
+    _end_sessions(session, now)
     _audit(session, now, "operator.password_set", operator)
     return operator
 
@@ -128,7 +132,7 @@ def totp_step(secret: str, code: str, now: datetime, after: int | None) -> int |
 
 def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datetime) -> None:
     """Stores `secret` only once `code` proves the authenticator app has it. Signs every browser
-    out, since the old second factor no longer applies."""
+    out and ends every OAuth grant, since the old second factor no longer applies."""
     operator = get_operator(session)
     if operator is None:
         raise OperatorError("there is no operator yet; run create-operator first")
@@ -137,7 +141,7 @@ def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datet
         raise OperatorError("the code does not match; check the device's clock and try again")
     operator.totp_secret_encrypted = crypto.encrypt(key, secret, TOTP_CONTEXT)
     operator.totp_last_step = step  # the confirmation code cannot then sign in
-    _end_sessions(session)
+    _end_sessions(session, now)
     _audit(session, now, "operator.totp_enrolled", operator)
 
 

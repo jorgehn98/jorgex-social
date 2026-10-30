@@ -72,9 +72,11 @@ same way. The API reference is at `/docs` in simulation; in real mode it answers
 ## Reverse proxy
 
 Only a few paths need to be public: `/ui`, the web interface (see [Web interface](#web-interface)),
-`/m/*`, the short-lived media URLs Instagram downloads from to publish, `/health`, and `/webhook`,
-where Meta notifies new comments and messages (see [Webhook](#webhook)). Everything else answers 404
-at the proxy. The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an SSH tunnel
+`/m/*`, the short-lived media URLs Instagram downloads from to publish, `/health`, `/webhook`,
+where Meta notifies new comments and messages (see [Webhook](#webhook)), and what remote agents use
+(see [Remote MCP](#remote-mcp)): `/mcp`, the OAuth endpoints (`/authorize`, `/token`, `/register`,
+`/revoke` and their `/.well-known/oauth-*` metadata) and `/upload/*`, the one-use upload URLs.
+Everything else answers 404 at the proxy. The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an SSH tunnel
 (below). A [Caddy](https://caddyserver.com/) site on the same host, which also obtains the HTTPS
 certificate; replace the domain with yours:
 
@@ -129,6 +131,35 @@ social.example.com {
 		}
 	}
 
+	@mcp {
+		path /mcp /authorize /token /register /revoke /.well-known/oauth-authorization-server /.well-known/oauth-protected-resource/*
+		method GET POST DELETE OPTIONS
+	}
+	handle @mcp {
+		# MCP messages and OAuth forms are small; the service refuses OAuth bodies over 16 KB.
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Forwarded-For {remote_host}
+			# /mcp answers with event streams; pass each event on at once.
+			flush_interval -1
+		}
+	}
+	@upload {
+		path /upload/*
+		method POST
+	}
+	handle @upload {
+		# One file per one-use URL; the service stops at 300 MB too.
+		request_body {
+			max_size 301MB
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
 	handle {
 		respond 404
 	}
@@ -159,7 +190,9 @@ the trusted address does not match the proxy and every visitor shares one sign-i
 included: fix `JORGEX_SOCIAL_FORWARDED_ALLOW_IPS` (or the two Docker variables) before going on.
 
 Caddy writes no access log unless you add a `log` directive; if you do, it already redacts the
-`Authorization` and `Cookie` headers, so leave `log_credentials` off.
+`Authorization` and `Cookie` headers, so leave `log_credentials` off. It does not redact paths: an
+upload URL's path is its credential (one use, ten minutes), so keep such a log private, or leave it
+off as above. The service's own access log shows `/upload/[redacted]`.
 
 To use the API from your machine, open a tunnel and talk to `localhost` as if the API ran there:
 
@@ -198,6 +231,60 @@ Each client address (IPv6: each `/64`) gets 5 sign-in attempts a minute and 20 a
 service answers 429 without checking anything. There is no account lockout, so nobody can keep you
 out by failing on purpose from elsewhere. Password checks are expensive by design; at most two run at
 once, and a sign-in that cannot get a turn within two seconds gets 503.
+
+## Remote MCP
+
+An agent connects to `https://social.example.com/mcp` with nothing but that URL: no token to copy,
+no tunnel. It needs `JORGEX_SOCIAL_PUBLIC_URL` set (it is the OAuth issuer; without it neither `/mcp`
+nor OAuth exist), the proxy above, and the operator with a password and a TOTP code (see
+[Web interface](#web-interface)). With Claude Code:
+
+```sh
+claude mcp add --transport http jorgex-social https://social.example.com/mcp
+```
+
+or, in a `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "jorgex-social": { "type": "http", "url": "https://social.example.com/mcp" }
+  }
+}
+```
+
+The first time, the client opens your browser on this service: sign in, and a consent page shows
+the name the client gives itself (unverified: anyone can claim any name), where the answer goes back
+to (the client's own machine, `localhost` or `127.0.0.1` with a port) and the six groups, each with
+write, read or deny. Approve only a connection you started yourself, and only the groups the agent
+needs. The client then keeps and renews its tokens on its own (access tokens last an hour; the
+renewal token thirty days and changes on every use).
+
+Every tool of the local MCP server is there, and each call is checked against what you granted: a
+denied group answers with a `forbidden` error. Files are not read from a path, which would be the
+server's: the `create_upload_url` tool gives a one-use URL, valid ten minutes, and the agent sends
+the file from its machine with `curl --data-binary @/path/to/photo.jpg '<url>'`. The URL is the only
+credential; it takes one file, up to 300 MB. A grant gets at most 5 unused URLs at once and 20 an
+hour.
+
+Grants are listed and ended from the server:
+
+```sh
+docker compose exec api jorgex-social list-grants
+docker compose exec api jorgex-social revoke-grant --id <id>   # or --all
+```
+
+Ending a grant ends its tokens and upload URLs; the client stays registered, so it can ask for your
+consent again. Changing the password (`set-password`) or the second factor (`enroll-totp`) ends every
+grant. If a client keeps failing to connect after that, clear what it stored and start again; with
+Claude Code, `claude mcp logout jorgex-social` (the name you gave it in `claude mcp add`).
+
+Clients may only register redirect URIs on the loopback address, so an approved code always goes
+back to the machine that asked. A client that needs an https redirect must be listed in
+`JORGEX_SOCIAL_OAUTH_REDIRECT_URIS`. The OAuth endpoints are limited per client address: `/register`
+to 10 a minute and 30 an hour, and `/authorize`, `/token`, `/revoke` and `/upload` to 30 a minute
+and 300 an hour between the four of them, one budget they share. Clients nobody approved are
+forgotten after an hour.
 
 ## Create your Meta app
 

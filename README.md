@@ -84,9 +84,13 @@ switch.
 
 ## MCP server
 
+With a public URL, the service itself is an MCP server at `/mcp`: an agent connects with only that
+URL and signs in through OAuth, with the operator's consent (see
+[Remote MCP](INSTALL.md#remote-mcp)). The rest of this section is the local alternative.
+
 `jorgex-social-mcp` is a thin MCP server (stdio) that runs on the agent's machine and turns each
-tool into one call to the REST API. It needs the `mcp` extra (`uv sync --extra mcp` in a clone of this
-repository; the package is not on PyPI) and two environment variables: `JORGEX_SOCIAL_URL`, the base URL
+tool into one call to the REST API. It runs from a clone of this repository (`uv sync`;
+the package is not on PyPI) and needs two environment variables: `JORGEX_SOCIAL_URL`, the base URL
 of the API, and `JORGEX_SOCIAL_TOKEN`, an API token created with `create-token`. At startup it reads
 the token's permissions from `GET /v1/token` and exposes only the tools that token can use; the API
 still checks every call. API errors reach the agent as they come, with their stable `code`.
@@ -98,7 +102,7 @@ Most agent clients take a JSON entry like this one (the exact file and key depen
   "mcpServers": {
     "jorgex-social": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/jorgex-social", "--extra", "mcp", "jorgex-social-mcp"],
+      "args": ["run", "--directory", "/path/to/jorgex-social", "jorgex-social-mcp"],
       "env": {
         "JORGEX_SOCIAL_URL": "http://localhost:8000",
         "JORGEX_SOCIAL_TOKEN": "jxs_your_token_here"

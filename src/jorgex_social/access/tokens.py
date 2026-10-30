@@ -109,6 +109,7 @@ def record_use(session: Session, token: ApiToken, now: datetime) -> None:
     token.last_used_at = now
 
 
-def allows(token: ApiToken, group: Group, level: Level) -> bool:
+def allows(token, group: Group, level: Level) -> bool:
+    """`token` is anything with `permissions`: an API token or an OAuth grant's access."""
     granted = Level(token.permissions.get(group.value, Level.DENY.value))
     return _RANK[granted] >= _RANK[level] > _RANK[Level.DENY]
