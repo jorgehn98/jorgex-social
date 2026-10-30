@@ -29,6 +29,8 @@ MAX_MESSAGE_BYTES = 1000
 MAX_PUBLIC_CHARS = 2200
 MAX_VARIANTS = 20
 MAX_KEYWORDS = 50
+# Our own floor, not a Meta rule: Meta publishes no number, and automation tools and their users
+# advise 3 to 5 so that public replies do not read as copies.
 MIN_PUBLIC_VARIANTS = 3
 LINK_MARKS = ("http://", "https://", "www.")
 # The evidence behind every warning is community reports, so none of them blocks a rule.
@@ -82,6 +84,17 @@ class RuleContent(BaseModel):
             raise ValueError("give at least one public_replies or private_replies variant")
         return self
 
+    @model_validator(mode="after")
+    def _has_varied_public_replies(self) -> RuleContent:
+        distinct = {normalize(text) for text in self.public_replies}
+        if self.public_replies and len(distinct) < MIN_PUBLIC_VARIANTS:
+            raise ValueError(
+                f"public_replies needs at least {MIN_PUBLIC_VARIANTS} variants that differ in more "
+                f"than case, accents or spacing, or none at all (found {len(distinct)}); this is "
+                "this service's own floor, not a Meta rule"
+            )
+        return self
+
 
 def check(channel: Channel, media_ref: str | None, content: RuleContent) -> None:
     """What depends on the channel. Raises ValueError with a message for the caller."""
@@ -101,11 +114,6 @@ def rule_warnings(channel: str, media_ref: str | None, content: dict) -> list[di
     def warn(code: str, message: str) -> None:
         found.append({"code": code, "message": _REPORTED + message})
 
-    if public and len(public) < MIN_PUBLIC_VARIANTS:
-        warn(
-            "few_public_variants",
-            f"fewer than {MIN_PUBLIC_VARIANTS} public reply variants repeat the same text often.",
-        )
     if channel == Channel.COMMENT:
         if public and media_ref is None:
             warn("public_on_every_post", "public replies on every post can look like spam.")

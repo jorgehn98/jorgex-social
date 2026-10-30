@@ -36,7 +36,7 @@ VERIFY_TOKEN = "verify-token-for-tests"
 APP_SECRET = "app-secret-for-tests"
 COMMENT_RULE = {
     "keywords": ["precio"],
-    "public_replies": ["Sent you a DM!"],
+    "public_replies": ["Sent you a DM!", "Check your inbox", "Just wrote to you"],
     "private_replies": ["The price is on the website."],
 }
 MESSAGE_RULE = {"keywords": ["precio"], "private_replies": ["DM answer"]}
