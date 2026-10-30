@@ -51,6 +51,7 @@ from jorgex_social.publishing.models import (
     PublishAttempt,
     Resolution,
 )
+from jorgex_social.replies.rules import bind_to_published
 from jorgex_social.stats.snapshots import store_recent_media
 
 log = logging.getLogger(__name__)
@@ -644,6 +645,7 @@ class PublishTask:
         post.published_at = published_at
         for media in self._media_of(session, post):
             media.delete_at = self.clock.now() + KEEP_AFTER_PUBLISH
+        bind_to_published(session, post, self.clock.now())
 
     def purge(self, sessions: sessionmaker) -> None:
         """Deletes files no post still in play uses: seven days after publishing, or seven days

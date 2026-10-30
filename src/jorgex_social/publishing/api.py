@@ -29,6 +29,7 @@ from jorgex_social.publishing.models import (
     PostType,
     Resolution,
 )
+from jorgex_social.replies.rules import bind_to_published
 
 router = APIRouter(prefix="/v1", tags=["publishing"])
 # Instagram downloads media from here, so it takes no token: the unguessable, expiring URL token
@@ -488,7 +489,7 @@ class ResolveIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outcome: Literal["published", "not_published"]
-    media_ref: str | None = Field(None, max_length=64)
+    media_ref: str | None = Field(None, min_length=1, max_length=64)
 
 
 @router.post("/posts/{post_id}/resolve", response_model=PostDetail, dependencies=SchedulingWrite)
@@ -519,6 +520,7 @@ def resolve_post(
         post.published_at = now
         for media in _media(session, post.media_ids).values():
             media.delete_at = now + storage.KEEP_AFTER_PUBLISH
+        bind_to_published(session, post, now)
     for media in _media(session, post.media_ids).values():
         storage.revoke_url(media)
     for attempt in post.attempts:

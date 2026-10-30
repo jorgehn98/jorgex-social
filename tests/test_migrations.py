@@ -48,3 +48,60 @@ def test_the_comment_author_column_keeps_existing_rows(settings):
     with sqlite3.connect(settings.database_path) as db:
         assert db.execute("SELECT id FROM events").fetchall() == [("e",)]
         assert db.execute("SELECT id FROM deliveries").fetchall() == [("d",)]
+
+
+def test_the_rule_post_column_keeps_existing_rows(settings):
+    config = alembic_config(settings)
+    command.downgrade(config, "0013")
+    with sqlite3.connect(settings.database_path) as db:
+        db.execute(
+            "INSERT INTO rules (id, network, name, channel, media_ref, priority, active, content,"
+            " created_at, updated_at)"
+            " VALUES ('r', 'n', 'x', 'comment', 'm1', 1, 0, '{}', 't', 't')"
+        )
+        db.execute(
+            "INSERT INTO events (id, network, type, external_ref, occurred_at, received_at,"
+            " rule_id) VALUES ('e', 'n', 'comment', 'c1', 't', 't', 'r')"
+        )
+        db.execute(
+            "INSERT INTO deliveries (id, event_id, rule_id, action, status, text, created_at)"
+            " VALUES ('d', 'e', 'r', 'public_reply', 'sent', 'hi', 't')"
+        )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert db.execute("SELECT id, media_ref, post_id FROM rules").fetchall() == [
+            ("r", "m1", None)
+        ]
+        references = db.execute("PRAGMA foreign_key_list(rules)").fetchall()
+        assert [(f[2], f[3], f[4]) for f in references] == [("posts", "post_id", "id")]
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        db.execute(
+            "INSERT INTO posts (id, network, type, status, caption, content_hash, created_at,"
+            " updated_at) VALUES ('p', 'n', 'image', 'draft', '', 'h', 't', 't')"
+        )
+        for rule_id, media_ref in (("waiting", None), ("bound", "m2")):
+            db.execute(
+                "INSERT INTO rules (id, network, name, channel, media_ref, post_id, priority,"
+                " active, activated_at, content, created_at, updated_at) VALUES"
+                " (?, 'n', 'x', 'comment', ?, 'p', 1, 1, 't', '{}', 't', 'edited')",
+                (rule_id, media_ref),
+            )
+
+    command.downgrade(config, "0013")
+
+    with sqlite3.connect(settings.database_path) as db:
+        found = db.execute(
+            "SELECT id, media_ref, active, archived_at FROM rules ORDER BY id"
+        ).fetchall()
+        # The waiting rule must not come back as a rule for every post.
+        assert found == [
+            ("bound", "m2", 1, None),
+            ("r", "m1", 0, None),
+            ("waiting", None, 0, "edited"),
+        ]
+        assert "post_id" not in [c[1] for c in db.execute("PRAGMA table_info(rules)")]
+        assert db.execute("PRAGMA foreign_key_list(rules)").fetchall() == []
+        assert db.execute("SELECT id FROM deliveries").fetchall() == [("d",)]
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []

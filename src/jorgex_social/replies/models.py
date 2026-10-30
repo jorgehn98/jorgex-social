@@ -8,9 +8,10 @@ from typing import Any
 
 from sqlalchemy import JSON, Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy import text as sql
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from jorgex_social.db import Base, UTCDateTime
+from jorgex_social.publishing.models import Post
 
 
 def _uuid() -> str:
@@ -62,7 +63,10 @@ class Rule(Base):
     network: Mapped[str] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(100))
     channel: Mapped[str] = mapped_column(String(16))
-    media_ref: Mapped[str | None] = mapped_column(String(64))  # null: every post
+    # null: every post, unless `post_id` says the rule is waiting for one.
+    media_ref: Mapped[str | None] = mapped_column(String(64))
+    # The post this rule is for. Kept once `media_ref` is set from it, as where it came from.
+    post_id: Mapped[str | None] = mapped_column(ForeignKey("posts.id"))
     priority: Mapped[int] = mapped_column(Integer)  # lower wins
     active: Mapped[bool] = mapped_column(Boolean, default=False)
     # Only events after this moment can fire the rule, so activating it never answers old ones.
@@ -72,6 +76,21 @@ class Rule(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
     archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+    post: Mapped[Post | None] = relationship(viewonly=True)
+
+    @property
+    def waiting_for_post(self) -> bool:
+        """Its post has no media id yet, so it matches nothing."""
+        return self.post_id is not None and self.media_ref is None
+
+    @property
+    def post_status(self) -> str | None:
+        return self.post.status if self.post else None
+
+    @property
+    def post_type(self) -> str | None:
+        return self.post.type if self.post else None
 
 
 class Conversation(Base):

@@ -4,10 +4,11 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from jorgex_social.access.deps import SessionDep, require
 from jorgex_social.access.tokens import Group, Level
+from jorgex_social.publishing.models import Post, PostStatus, PostType
 from jorgex_social.replies import rules
 from jorgex_social.replies.models import (
     Action,
@@ -30,6 +31,7 @@ EventsRead = [Depends(require(Group.EVENTS, Level.READ))]
 Limit = Annotated[int, Query(ge=1, le=1000)]
 Offset = Annotated[int, Query(ge=0)]
 MediaRef = Annotated[str | None, Field(None, min_length=1, max_length=64)]
+PostId = Annotated[str | None, Field(None, min_length=1, max_length=36)]
 
 
 def _error(status_code: int, code: str, message: str, **extra) -> HTTPException:
@@ -43,6 +45,9 @@ def _network(request: Request) -> str:
 
 Network = Annotated[str, Depends(_network)]
 
+# A post in one of these goes nowhere on its own. `failed` can still be scheduled again.
+NOT_GOING_OUT = {PostStatus.FAILED, PostStatus.CANCELLED}
+
 
 # Rules
 
@@ -53,6 +58,7 @@ class RuleIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     channel: Channel
     media_ref: MediaRef = None
+    post_id: PostId = None
     priority: int = Field(100, ge=0, le=1_000_000)
     content: RuleContent
 
@@ -62,6 +68,7 @@ class RulePatch(BaseModel):
 
     name: str | None = Field(None, min_length=1, max_length=100)
     media_ref: MediaRef = None
+    post_id: PostId = None
     priority: int | None = Field(None, ge=0, le=1_000_000)
     content: RuleContent | None = None
 
@@ -72,6 +79,11 @@ class RuleOut(BaseModel):
     name: str
     channel: str
     media_ref: str | None
+    post_id: str | None
+    waiting_for_post: bool
+    # Read from the rule's post to work out `warnings`; `GET /v1/posts/{id}` is where they show.
+    post_status: str | None = Field(exclude=True)
+    post_type: str | None = Field(exclude=True)
     priority: int
     active: bool
     activated_at: datetime | None
@@ -83,14 +95,59 @@ class RuleOut(BaseModel):
     @computed_field
     @property
     def warnings(self) -> list[dict[str, str]]:
-        return rules.rule_warnings(self.channel, self.media_ref, self.content)
+        found = rules.rule_warnings(self.channel, self.media_ref, self.content, self.post_id)
+        is_story = self.post_type == PostType.STORY
+        if is_story:
+            # A draft's type can change after the rule was linked; the link itself is refused.
+            found.append(
+                {
+                    "code": "post_is_a_story",
+                    "message": "The post is now a story and Instagram never lists stories: this "
+                    "rule answers nothing until the post's type or the rule is changed.",
+                }
+            )
+        if self.waiting_for_post and self.post_status in NOT_GOING_OUT:
+            found.append(
+                {
+                    "code": "post_not_going_out",
+                    "message": f"The post is {self.post_status}: this rule answers nothing until "
+                    "the post is published or the rule is changed.",
+                }
+            )
+        # Not for a story: setting media_ref could not help, and post_is_a_story already says so.
+        if self.waiting_for_post and self.post_status == PostStatus.PUBLISHED and not is_story:
+            found.append(
+                {
+                    "code": "post_without_media_id",
+                    "message": "The post is published but the service does not know its media id: "
+                    "this rule answers nothing until you set its media_ref.",
+                }
+            )
+        return found
 
 
-def _check(channel: Channel, media_ref: str | None, content: RuleContent) -> None:
+def _check(
+    channel: Channel, media_ref: str | None, content: RuleContent, post_id: str | None = None
+) -> None:
     try:
-        rules.check(channel, media_ref, content)
+        rules.check(channel, media_ref, content, post_id)
     except ValueError as exc:
         raise _error(422, "invalid_rule", str(exc)) from None
+
+
+def _media_of_post(session: Session, network: str, post_id: str) -> str | None:
+    """The media id a rule for this post starts with: none until the post has one, and the rule
+    waits. Refuses a post that can never give it comments to answer."""
+    post = session.get(Post, post_id)
+    if post is None or post.network != network:
+        raise _error(404, "not_found", "No such post.")
+    if post.type == PostType.STORY:
+        raise _error(
+            422, "invalid_rule", "Instagram never lists stories, so a rule cannot use one."
+        )
+    if post.status == PostStatus.CANCELLED:
+        raise _error(409, "invalid_state", "The post is cancelled, so it will never be published.")
+    return post.external_ref
 
 
 def _rule(session: Session, network: str, rule_id: str) -> Rule:
@@ -112,14 +169,20 @@ def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Ne
     """Create a rule, inactive. Activate it to make it answer; only what arrives after that
     is answered. `public_replies` needs at least 3 variants that differ in more than case, accents
     or spacing, or none at all: this service's own floor, not a Meta rule. `warnings` lists what
-    automation users report as risky; it blocks nothing."""
-    _check(body.channel, body.media_ref, body.content)
+    automation users report as risky; it blocks nothing. A comment rule can name a post of this
+    service instead of a `media_ref`: with `post_id` it waits, answering nothing, until the post
+    is published, and then answers on it alone."""
+    _check(body.channel, body.media_ref, body.content, body.post_id)
+    media_ref = body.media_ref
+    if body.post_id is not None:
+        media_ref = _media_of_post(session, network, body.post_id)
     now = request.app.state.clock.now()
     rule = Rule(
         network=network,
         name=body.name,
         channel=body.channel,
-        media_ref=body.media_ref,
+        media_ref=media_ref,
+        post_id=body.post_id,
         priority=body.priority,
         active=False,
         content=body.content.model_dump(),
@@ -150,6 +213,8 @@ def list_rules(
     if active is not None:
         query = query.where(Rule.active.is_(active))
     query = query.order_by(Rule.priority, Rule.created_at, Rule.id)
+    # `warnings` needs each rule's post; one more query for the page, not one per rule.
+    query = query.options(selectinload(Rule.post))
     return session.scalars(query.limit(limit).offset(offset)).all()
 
 
@@ -163,25 +228,32 @@ def update_rule(
     rule_id: str, body: RulePatch, request: Request, session: SessionDep, network: Network
 ):
     """Edit a rule; only the fields given change, and `media_ref: null` makes it apply to every
-    post. An active rule stays active and answers with the new content from now on.
-    `public_replies` needs at least 3 variants that differ in more than case, accents or spacing,
-    or none at all: this service's own floor, not a Meta rule. A rule stored with fewer keeps
-    answering, but any edit, even of its name alone, gets that same refusal until `content` fixes
-    it. `warnings` lists what automation users report as risky; it blocks nothing."""
+    post, ending any link to a post as well. `post_id` ties it to a post, replacing any
+    `media_ref`; a value in `media_ref` ends that link. An active rule stays active and answers
+    with the new content from now on. `public_replies` needs at least 3 variants that differ in
+    more than case, accents or spacing, or none at all: this service's own floor, not a Meta rule.
+    A rule stored with fewer keeps answering, but any edit, even of its name alone, gets that same
+    refusal until `content` fixes it. `warnings` lists what automation users report as risky; it
+    blocks nothing."""
     rule = _rule(session, network, rule_id)
     _not_archived(rule)
     fields = body.model_fields_set
-    for required in ("name", "priority", "content"):
+    for required in ("name", "priority", "content", "post_id"):
         if required in fields and getattr(body, required) is None:
             raise _error(422, "invalid_value", f"{required} cannot be null.")
-    media_ref = body.media_ref if "media_ref" in fields else rule.media_ref
+    # Either field replaces the rule's whole scope, so a rule never keeps a post it left.
+    rescoped = bool(fields & {"media_ref", "post_id"})
+    media_ref = body.media_ref if rescoped else rule.media_ref
     content = body.content if "content" in fields else RuleContent.model_validate(rule.content)
-    _check(Channel(rule.channel), media_ref, content)
+    _check(Channel(rule.channel), media_ref, content, body.post_id)
+    if body.post_id is not None:
+        media_ref = _media_of_post(session, network, body.post_id)
     if "name" in fields:
         rule.name = body.name
     if "priority" in fields:
         rule.priority = body.priority
-    rule.media_ref = media_ref
+    if rescoped:
+        rule.media_ref, rule.post_id = media_ref, body.post_id
     rule.content = content.model_dump()
     rule.updated_at = request.app.state.clock.now()
     return rule
@@ -190,7 +262,8 @@ def update_rule(
 @router.post("/rules/{rule_id}/activate", response_model=RuleOut, dependencies=RulesWrite)
 def activate_rule(rule_id: str, request: Request, session: SessionDep, network: Network):
     """Start answering. Only comments and messages written from now on fire the rule. A rule
-    with `warnings` activates all the same."""
+    with `warnings` activates all the same, and so does one waiting for its post, which starts
+    answering once the post is published."""
     rule = _rule(session, network, rule_id)
     _not_archived(rule)
     if not rule.active:
@@ -240,17 +313,27 @@ class RuleTestOut(BaseModel):
 def test_rules(body: RuleTestIn, session: SessionDep, network: Network):
     """Which rule a sample text would fire and what it could answer. Stores nothing and calls
     nothing on Instagram. Opt-out words are not applied: a direct message that is exactly one of
-    them fires no rule, whatever this says."""
+    them fires no rule, whatever this says. A rule named by `rule_id` that is waiting for its post
+    shows what it would match once bound, with a `note` saying it is waiting; without `rule_id`,
+    waiting rules fire nothing, as in the worker."""
     if body.rule_id is not None:
         candidates = [_rule(session, network, body.rule_id)]
         if candidates[0].channel != body.channel:
             raise _error(422, "invalid_value", "The rule is for another channel.")
     else:
         candidates = rules.active_rules(session, network, body.channel)
-    rule = rules.first_match(candidates, body.text, media_ref=body.media_ref)
-    content = rule.content if rule else {}
     note = None
-    if body.rule_id is not None and rule is None:
+    if body.rule_id is not None and candidates[0].waiting_for_post:
+        waiting = candidates[0]
+        rule = waiting if rules.matches(waiting.content, body.text) else None
+        note = (
+            f"The rule is waiting for post {waiting.post_id} and answers nothing yet; this is "
+            "what it would match once that post is published."
+        )
+    else:
+        rule = rules.first_match(candidates, body.text, media_ref=body.media_ref)
+    content = rule.content if rule else {}
+    if body.rule_id is not None and rule is None and note is None:
         needed = candidates[0].media_ref
         if needed is not None and needed != body.media_ref:
             note = f"The rule only applies to comments on media {needed}; pass that media_ref."
@@ -405,8 +488,9 @@ def pause_conversation(
     """Stop automatic messages to this person, until a time or for good, for example while a
     human answers. Messages already queued are skipped as `paused`. Replies to this person's
     comments are too, but only if Instagram uses the same id for a comment's author and a
-    message's sender, which is not verified. A conversation paused for good, as an opt-out is,
-    refuses `until` with `invalid_state`, so it cannot lift by itself: only resume ends it."""
+    message's sender: seen matching in one test, not documented by Meta. A conversation paused
+    for good, as an opt-out is, refuses `until` with `invalid_state`, so it cannot lift by itself:
+    only resume ends it."""
     if body.forever == (body.until is not None):
         raise _error(422, "invalid_value", "Give either until or forever=true.")
     now = request.app.state.clock.now()

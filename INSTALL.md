@@ -441,7 +441,32 @@ A direct message you send by hand from Instagram pauses automatic replies to tha
 from the Instagram app as webhook notifications, which is what triggers the pause; without the
 webhook, `POST /v1/conversations/{id}/pause` does the same by hand. A pause also holds back replies
 to that person's comments, but only when Instagram uses the same id for a comment's author and a
-message's sender, which has not been verified.
+message's sender: seen matching in one test on an account with Instagram login, not documented by
+Meta.
+
+## Preparing a post and its rule together
+
+A rule can be ready before its post has a media id, so a scheduled post needs nobody watching it:
+`POST /v1/posts`, `POST /v1/rules` with `post_id`, `POST /v1/rules/{id}/activate`, then
+`POST /v1/posts/{id}/schedule`.
+
+Until the post is published the rule shows `waiting_for_post` and answers nothing on any post. When
+the worker or `POST /v1/posts/{id}/resolve` marks the post published, the rule gets the post's
+`media_ref` by itself. A comment written in the moments before that is answered at the next poll, up
+to `JORGEX_SOCIAL_REPLY_POLL_SECONDS` (120) later, with the usual reply windows counted from the
+comment. After an `outcome_unknown` settled later, comments from hours or days earlier are answered
+too, within the 24-hour public and 7-day private windows.
+
+- It does not work for a post published by hand in the Instagram app: add `media_ref` to the rule
+  afterwards.
+- Comments from before the rule's activation are never answered.
+- `post_id` applies to comment rules only, and is refused for stories and cancelled posts. A rule whose
+  post is later cancelled, or fails, keeps waiting and gets the warning `post_not_going_out`. One whose
+  draft is later edited into a story gets `post_is_a_story`, and answers nothing on it.
+- A post the service marks as published without knowing its media id (`external_ref` stays empty)
+  leaves the rule waiting with the warning `post_without_media_id`; set `media_ref` by hand.
+- Setting `media_ref` on a rule ends the link to the post; `media_ref: null` makes the rule apply to
+  every post.
 
 ## Protecting the account
 
@@ -461,8 +486,8 @@ Too many automatic replies can get an Instagram account restricted, so they are 
   immediately. Case, accents and punctuation or symbols at either end are ignored, so "Stop!" counts,
   but the rest of the message must match exactly, so "stop it" and "please stop by the store" do not.
   Nothing is sent back, not even a confirmation, and no rule fires. Replies already pending end as `paused`; those to the
-  person's comments only if Instagram uses the same id for a comment's author and a message's sender,
-  which has not been verified. The person shows as `paused_forever` in `GET /v1/conversations`, with
+  person's comments only if Instagram uses the same id for a comment's author and a message's sender:
+  seen matching in one test on an account with Instagram login, not documented by Meta. The person shows as `paused_forever` in `GET /v1/conversations`, with
   `conversation.opted_out` in the audit log. Only `POST /v1/conversations/{id}/resume` undoes it: a
   pause with `until` is refused. An empty value turns this off.
 - A rule that replies publicly needs at least 3 public variants that differ in more than case, accents
