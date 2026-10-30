@@ -14,6 +14,7 @@ import pyotp
 import pytest
 from fastapi.testclient import TestClient
 from mcp.client.auth import OAuthClientProvider
+from mcp.server.auth.provider import TokenError
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
 from sqlalchemy import text
 
@@ -654,8 +655,92 @@ def test_a_retry_within_thirty_seconds_replaces_the_lost_pair(app, agent, browse
     assert retried.status_code == 200
     assert api(agent, retried.json()["access_token"]).status_code == 200
     assert api(agent, lost["access_token"]).status_code == 401
-    assert refresh(agent, client_id, lost["refresh_token"]).status_code == 400
     assert ("oauth.refresh_reused", "denied") not in audit_actions(app)
+
+
+def test_a_retry_cannot_silently_take_the_family_over(app, agent, browser, clock):
+    """If the retry came from a thief, the client's own refresh token, presented later, must end
+    the grant instead of having quietly vanished."""
+    client_id, first = connect(agent, browser, posts="read")
+    clients_pair = refresh(agent, client_id, first["refresh_token"]).json()
+    clock.advance(seconds=10)
+    thiefs_pair = refresh(agent, client_id, first["refresh_token"]).json()
+    clock.advance(seconds=31)
+
+    replay = refresh(agent, client_id, clients_pair["refresh_token"])
+
+    assert replay.json()["error"] == "invalid_grant"
+    assert api(agent, thiefs_pair["access_token"]).status_code == 401
+    assert ("oauth.refresh_reused", "denied") in audit_actions(app)
+
+
+def test_only_one_retry_is_tolerated(agent, browser, clock):
+    client_id, first = connect(agent, browser, posts="read")
+    refresh(agent, client_id, first["refresh_token"])
+    retried = refresh(agent, client_id, first["refresh_token"]).json()
+
+    again = refresh(agent, client_id, first["refresh_token"])
+
+    assert again.json()["error"] == "invalid_grant"
+    assert api(agent, retried["access_token"]).status_code == 401
+
+
+# A replay found in the exchange itself (two exchanges at once): both passed the SDK's lookup,
+# the second finds the token used. The grant must end, and stay ended.
+
+
+def provider_of(app):
+    return app.state.oauth_provider
+
+
+def grant_revoked(app) -> bool:
+    return rows(app, "SELECT revoked_at FROM oauth_grants")[0].revoked_at is not None
+
+
+@pytest.mark.anyio
+async def test_a_code_exchanged_twice_at_once_ends_the_grant(app, agent, browser):
+    client_id, verifier, code = code_for(agent, browser, posts="read")
+    provider = provider_of(app)
+    client = await provider.get_client(client_id)
+    loaded = await provider.load_authorization_code(client, code)
+    tokens = await provider.exchange_authorization_code(client, loaded)
+
+    with pytest.raises(TokenError):
+        await provider.exchange_authorization_code(client, loaded)
+
+    assert grant_revoked(app)
+    assert api(agent, tokens.access_token).status_code == 401
+
+
+@pytest.mark.anyio
+async def test_a_refresh_replayed_during_its_exchange_ends_the_grant(app, agent, browser, clock):
+    client_id, first = connect(agent, browser, posts="read")
+    provider = provider_of(app)
+    client = await provider.get_client(client_id)
+    loaded = await provider.load_refresh_token(client, first["refresh_token"])
+    await provider.exchange_refresh_token(client, loaded, [])
+    clock.advance(seconds=31)
+
+    with pytest.raises(TokenError):
+        await provider.exchange_refresh_token(client, loaded, [])
+
+    assert grant_revoked(app)
+
+
+def test_rows_past_their_lifetime_are_purged_on_refresh(app, agent, browser, clock):
+    client_id, tokens = connect(agent, browser, posts="read")
+    for _ in range(3):
+        clock.advance(minutes=50)
+        tokens = refresh(agent, client_id, tokens["refresh_token"]).json()
+    clock.advance(days=29)
+    sign_in(browser, clock)
+    other_id, other = connect(agent, browser, posts="read")  # the first grant's still live then
+    clock.advance(days=1, minutes=1)
+
+    assert refresh(agent, other_id, other["refresh_token"]).status_code == 200
+
+    # Only the new grant's tokens are left: its used refresh token and the new pair.
+    assert len(rows(app, "SELECT hash FROM oauth_tokens")) == 3
 
 
 def test_no_grace_once_the_new_pair_was_used(agent, browser, clock):

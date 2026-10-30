@@ -178,6 +178,9 @@ class Provider:
             issued = await self._write(
                 store.exchange_code, authorization_code.code, client.client_id
             )
+        except store.Replayed:
+            await self._write(store.code_replayed, authorization_code.code)
+            raise TokenError("invalid_grant", "authorization code does not exist") from None
         except store.Invalid:
             raise TokenError("invalid_grant", "authorization code does not exist") from None
         return self._token(issued)
@@ -207,6 +210,9 @@ class Provider:
     ) -> OAuthToken:
         try:
             issued = await self._write(store.rotate, refresh_token.token, client.client_id)
+        except store.Replayed:
+            await self._write(store.refresh_replayed, refresh_token.token, client.client_id)
+            raise TokenError("invalid_grant", "refresh token does not exist") from None
         except store.Invalid:
             raise TokenError("invalid_grant", "refresh token does not exist") from None
         return self._token(issued)

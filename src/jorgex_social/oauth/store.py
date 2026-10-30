@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from mcp.server.auth.provider import construct_redirect_uri
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from jorgex_social.access.tokens import hash_token
@@ -39,6 +39,11 @@ class OAuthError(ValueError):
 
 class Invalid(Exception):
     """A code or refresh token that cannot be used: unknown, expired, used or revoked."""
+
+
+class Replayed(Invalid):
+    """A used code, or a used refresh token past its grace, came back. The caller ends the grant
+    (code_replayed, refresh_replayed) in a transaction of its own: this one rolls back."""
 
 
 @dataclass(frozen=True)
@@ -273,12 +278,12 @@ def code_replayed(session: Session, code: str, now: datetime) -> None:
 
 
 def exchange_code(session: Session, code: str, client_id: str, now: datetime) -> Issued:
+    purge(session, now)
     found = find_code(session, code, client_id, now)
     if found is None:
         raise Invalid
     if found.used_at is not None:
-        code_replayed(session, code, now)
-        raise Invalid
+        raise Replayed
     found.used_at = now
     grant = OAuthGrant(
         id=secrets.token_hex(8),
@@ -312,7 +317,8 @@ def _live_refresh(
 
 def _retry(session: Session, token: OAuthToken, now: datetime) -> bool:
     """A used refresh token presented again within the grace period, while the pair it gave has
-    not been used either: the client most likely never received that answer."""
+    not been used either: the client most likely never received that answer. Once a retry is
+    answered, that pair counts as used (rotate), so only one retry is tolerated."""
     if token.used_at is None or now - token.used_at > REFRESH_GRACE:
         return False
     children = session.scalars(
@@ -346,16 +352,23 @@ def refresh_replayed(session: Session, secret: str, client_id: str, now: datetim
 
 def rotate(session: Session, secret: str, client_id: str, now: datetime) -> Issued:
     """Exchanges a refresh token for a new pair; the old access token stops working."""
+    purge(session, now)
     found = _live_refresh(session, secret, client_id, now)
     if found is None:
         raise Invalid
     token, grant = found
     if token.used_at is not None:
         if not _retry(session, token, now):
-            refresh_replayed(session, secret, client_id, now)
-            raise Invalid
-        # The pair issued on the first use never reached the client: it is replaced.
-        session.execute(delete(OAuthToken).where(OAuthToken.parent_hash == token.hash))
+            raise Replayed
+        # The pair issued on the first use most likely never reached the client. Its refresh
+        # token is not deleted but marked used: if it did reach someone, presenting it later
+        # than the grace period is a replay that ends the grant, instead of a silent takeover by
+        # whoever retried. (Its access token goes with every other below.)
+        session.execute(
+            update(OAuthToken)
+            .where(OAuthToken.parent_hash == token.hash, OAuthToken.used_at.is_(None))
+            .values(used_at=now)
+        )
     else:
         token.used_at = now
     session.execute(
