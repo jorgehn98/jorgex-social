@@ -84,6 +84,10 @@ switch.
 
 ## MCP server
 
+With a public URL, the service itself is an MCP server at `/mcp`: an agent connects with only that
+URL and signs in through OAuth, with the operator's consent (see
+[Remote MCP](INSTALL.md#remote-mcp)). The rest of this section is the local alternative.
+
 `jorgex-social-mcp` is a thin MCP server (stdio) that runs on the agent's machine and turns each
 tool into one call to the REST API. It runs from a clone of this repository (`uv sync`;
 the package is not on PyPI) and needs two environment variables: `JORGEX_SOCIAL_URL`, the base URL
