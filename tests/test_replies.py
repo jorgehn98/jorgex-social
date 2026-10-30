@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
@@ -178,6 +179,18 @@ def test_first_match_follows_priority_media_and_activation():
             "1 character",
         ),
         ({"channel": "comment", "content": {"keywords": ["x"], "public_replies": ["  "]}}, "blank"),
+        # Only a combining accent: nothing is left once accents are ignored.
+        (
+            {"channel": "comment", "content": {"keywords": ["\u0301"], "public_replies": ["a"]}},
+            "letters",
+        ),
+        (
+            {
+                "channel": "comment",
+                "content": {"keywords": ["x"], "exclude": ["\u0301"], "public_replies": ["a"]},
+            },
+            "letters",
+        ),
     ],
 )
 def test_invalid_rules_are_refused(client, headers, body, message):
@@ -232,7 +245,7 @@ def test_rule_test_endpoint_stores_nothing(client, headers, settings):
     assert (by_active["rule"]["name"], by_active["private_replies"]) == ("price", ["Hi!"])
     assert by_id["rule"]["id"] == inactive["id"]
     assert by_id["public_replies"] == PRICE_RULE["public_replies"]
-    assert none == {"rule": None, "public_replies": [], "private_replies": []}
+    assert none == {"rule": None, "public_replies": [], "private_replies": [], "note": None}
     assert "hola y precio" not in dump(settings)
     assert count_rows(settings, "events") == count_rows(settings, "deliveries") == 0
 
@@ -502,8 +515,7 @@ def test_a_send_interrupted_by_a_crash_is_never_repeated(
         raise RuntimeError("the worker died")
 
     ig.reply_private = crash_after_sending
-    with pytest.raises(RuntimeError):
-        task(sessions)
+    task(sessions)  # the failure is contained: the cycle goes on
     ig.reply_private = original
     ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
 
@@ -647,34 +659,6 @@ def by_status(sessions):
     return [(d.status, d.reason) for d in deliveries(sessions)]
 
 
-def test_a_second_delivery_of_the_same_action_is_a_duplicate(
-    client, headers, ig, sessions, task, clock
-):
-    first = make_rule(client, headers, content={"keywords": ["precio"], "public_replies": ["A"]})
-    second = make_rule(client, headers, content={"keywords": ["x"], "public_replies": ["B"]})
-    ig.add_comment(publish(ig), "precio")
-    task.poll_comments(sessions, ACCOUNT_ID, clock.now())
-    [delivery] = deliveries(sessions)
-    with sessions() as session, session.begin():
-        session.add(
-            Delivery(
-                event_id=delivery.event_id,
-                rule_id=second["id"],
-                action="public_reply",
-                text="B",
-                created_at=clock.now() + timedelta(seconds=1),
-            )
-        )
-
-    task.deliver(sessions)
-
-    assert ig.sent == [("reply_public", ig.sent[0][1], "A")]
-    assert {d.rule_id: (d.status, d.reason) for d in deliveries(sessions)} == {
-        first["id"]: ("sent", None),
-        second["id"]: ("skipped", "duplicate"),
-    }
-
-
 def test_an_unavailable_send_is_never_retried(client, headers, ig, sessions, task, clock):
     make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
     ig.add_comment(publish(ig), "precio")
@@ -802,3 +786,177 @@ def test_a_message_rule_answers_a_person_once_per_cooldown(
     assert [target for _, target, _ in ig.sent] == [PERSON, "17900000000000077", PERSON]
     skipped = client.get("/v1/deliveries?reason=cooldown", headers=headers).json()
     assert len(skipped) == 2
+
+
+def test_a_rule_test_says_when_the_rule_needs_another_media(client, headers):
+    rule = make_rule(client, headers, media_ref="m1", activate=False)
+
+    def tried(**extra):
+        body = {"channel": "comment", "text": "precio", "rule_id": rule["id"], **extra}
+        return client.post("/v1/rules/test", json=body, headers=headers).json()
+
+    assert tried()["rule"] is None and "m1" in tried()["note"]
+    assert "m1" in tried(media_ref="m2")["note"]
+    assert (tried(media_ref="m1")["rule"]["id"], tried(media_ref="m1")["note"]) == (
+        rule["id"],
+        None,
+    )
+
+
+# Retention and polling scope
+
+
+def test_activity_near_the_retention_limit_is_never_evaluated(client, headers, ig, sessions, clock):
+    """With retention of 8 days, a purged event is not seen as new and answered again."""
+    ConnectionTask(ig, clock, None)(sessions)
+    task = ReplyTask(ig, clock, poll_every=timedelta(0), retention=timedelta(days=8))
+    make_rule(client, headers)
+    media = publish(ig)
+    clock.advance(minutes=1)
+    ig.add_comment(media, "precio")
+    task(sessions)
+    assert len(ig.sent) == 2
+
+    clock.advance(days=8, minutes=1)
+    task(sessions)  # purges the event and its deliveries
+    assert (count(sessions, Event), count(sessions, Delivery)) == (0, 0)
+    clock.advance(minutes=5)
+    task(sessions)
+
+    assert len(ig.sent) == 2
+    assert count(sessions, Event) == 0
+
+
+def test_a_comment_older_than_the_horizon_records_nothing(client, headers, ig, sessions, clock):
+    ConnectionTask(ig, clock, None)(sessions)
+    task = ReplyTask(ig, clock, poll_every=timedelta(0), retention=timedelta(days=8))
+    make_rule(client, headers)
+    media = publish(ig)
+    ig.add_comment(media, "precio", at=clock.now())
+    clock.advance(days=9)
+
+    task(sessions)
+
+    assert ig.sent == []
+    assert count(sessions, Event) == 0
+
+
+def test_comments_are_polled_on_recent_media_and_on_media_a_rule_names(
+    client, headers, ig, sessions, task, clock
+):
+    old, unnamed = publish(ig), publish(ig)
+    clock.advance(days=15)
+    recent = publish(ig)
+    clock.advance(days=20)  # old and unnamed are 35 days old, recent 20
+    make_rule(client, headers, content={"keywords": ["precio"], "public_replies": ["A"]})
+    make_rule(
+        client, headers, media_ref=old, content={"keywords": ["info"], "public_replies": ["B"]}
+    )
+    on_old, on_recent = ig.add_comment(old, "precio"), ig.add_comment(recent, "precio")
+    ig.add_comment(unnamed, "precio")
+
+    task(sessions)
+
+    assert {target for _, target, _ in ig.sent} == {on_old, on_recent}
+    with sessions() as session:
+        assert set(session.scalars(select(Event.media_ref))) == {old, recent}
+
+
+# Robustness
+
+
+def test_one_failing_media_or_conversation_stops_nothing_else(
+    client, headers, ig, sessions, task, caplog
+):
+    make_rule(client, headers, content={"keywords": ["precio"], "public_replies": ["A"]})
+    make_rule(
+        client, headers, channel="message", content={"keywords": ["info"], "private_replies": ["B"]}
+    )
+    broken, fine = publish(ig), publish(ig)
+    ig.add_comment(broken, f"precio {MARKERS[0]}")
+    on_fine = ig.add_comment(fine, "precio")
+    ig.add_message(PERSON, f"info {MARKERS[1]}")
+    ig.add_message("17900000000000077", "info")
+    list_comments, list_messages = ig.list_comments, ig.list_messages
+    first_conversation = ig.list_conversations()[0].id
+
+    def odd_comments(media_id):
+        if media_id == broken:
+            raise ValueError(f"could not parse {MARKERS[0]}")
+        return list_comments(media_id)
+
+    def odd_messages(conversation_id):
+        if conversation_id == first_conversation:
+            raise ValueError(f"could not parse {MARKERS[1]}")
+        return list_messages(conversation_id)
+
+    ig.list_comments, ig.list_messages = odd_comments, odd_messages
+    task(sessions)
+
+    assert ("reply_public", on_fine, "A") in ig.sent
+    assert [op for op, _, _ in ig.sent].count("send_message") == 1
+    assert all(marker not in logged(caplog) for marker in MARKERS)
+
+
+def test_malformed_and_repeated_comments_from_meta_are_handled(sessions, clock):
+    now = clock.now()
+    meta = FakeMeta(now)
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    good = {"id": "c1", "text": "precio", "timestamp": stamp, "from": {"id": "u1"}}
+    meta.pages["/m1/comments"] = {
+        "data": [{"id": "c0", "text": "precio", "from": {"id": "u1"}}, good],
+        "paging": {"cursors": {"after": "A"}, "next": "https://graph.instagram.com/next"},
+    }
+    second_page = {"data": [good]}  # the same comment again on the next page
+    original = meta.__call__
+
+    def transport(method, url, headers, body):
+        if "after=A" in url:
+            return 200, json.dumps(second_page).encode()
+        return original(method, url, headers, body)
+
+    ig = InstagramClient("token-not-real", "1784", transport=transport)
+    with sessions() as session, session.begin():
+        session.add(Connection(network="instagram", external_account_id="1784", username="own"))
+        session.add(
+            Rule(
+                network="instagram",
+                name="price",
+                channel="comment",
+                priority=1,
+                active=True,
+                activated_at=now - timedelta(days=1),
+                content={"keywords": ["precio"], "public_replies": ["A"]},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
+
+    with sessions() as session:
+        assert session.scalars(select(Event.external_ref).where(Event.type == "comment")).all() == [
+            "c1"
+        ]
+    assert [url for method, url, _ in meta.calls if method == "POST"][0].endswith("/c1/replies")
+
+
+def test_a_message_that_is_one_of_our_sends_never_fires_a_rule(client, headers, ig, sessions, task):
+    """Even when Instagram names its sender with an id the connection does not hold."""
+    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["precio: 10"]})
+    make_rule(
+        client,
+        headers,
+        channel="message",
+        content={"keywords": ["precio"], "private_replies": ["B"]},
+    )
+    ig.add_comment(publish(ig), "precio", author_id=PERSON)
+    task(sessions)
+    [thread] = ig._threads.values()
+    thread.messages = [replace(m, sender_id="another-id-for-us") for m in thread.messages]
+
+    task(sessions)
+
+    assert [op for op, _, _ in ig.sent] == ["reply_private"]
+    with sessions() as session:
+        assert session.scalars(select(Event.type)).all() == ["comment"]

@@ -43,7 +43,18 @@ def _fits_a_message(value: str) -> str:
     return value
 
 
-Keyword = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+def _matchable(value: str) -> str:
+    # Only combining marks, for example: nothing would be left to compare.
+    if not normalize(value):
+        raise ValueError("must keep some letters once accents and case are ignored")
+    return value
+
+
+Keyword = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
+    AfterValidator(_matchable),
+]
 PublicText = Annotated[str, Field(max_length=MAX_PUBLIC_CHARS), AfterValidator(_not_blank)]
 PrivateText = Annotated[str, AfterValidator(_not_blank), AfterValidator(_fits_a_message)]
 

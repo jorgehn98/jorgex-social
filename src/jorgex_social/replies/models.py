@@ -42,7 +42,6 @@ class Reason(StrEnum):
     PAUSED = "paused"
     WINDOW_CLOSED = "window_closed"
     HOURLY_CAP = "hourly_cap"
-    DUPLICATE = "duplicate"
     COOLDOWN = "cooldown"  # the rule already answered this person a moment ago
     REFUSED = "refused"  # Instagram said no; nothing was sent
     UNKNOWN = "unknown"  # no usable answer: it may have been sent, so it is never retried

@@ -149,6 +149,23 @@ def _author(item: dict[str, Any]) -> str | None:
     return str(author["id"]) if isinstance(author, dict) and author.get("id") else None
 
 
+def _parse_one(build: Callable[[dict[str, Any]], Any], item: Any) -> Any:
+    """None for a malformed item, which is dropped rather than failing the whole listing (and
+    never quoted, since it may hold third-party text)."""
+    try:
+        return build(item)
+    except KeyError, TypeError, ValueError, AttributeError:
+        return None
+
+
+def _parsed(build: Callable[[dict[str, Any]], Any], items) -> list:
+    return [x for x in (_parse_one(build, item) for item in items) if x is not None]
+
+
+def _conversation(item: dict[str, Any]) -> Conversation:
+    return Conversation(id=str(item["id"]), updated_at=datetime.fromisoformat(item["updated_time"]))
+
+
 class InstagramClient:
     """Instagram API with Instagram Login (graph.instagram.com), standard library only."""
 
@@ -295,25 +312,26 @@ class InstagramClient:
                 return
 
     def list_comments(self, media_id: str) -> list[Comment]:
-        return [
-            Comment(
+        return _parsed(
+            lambda item: Comment(
                 id=str(item["id"]),
                 author_id=_author(item),
                 timestamp=datetime.fromisoformat(item["timestamp"]),
                 text=item.get("text") or "",
-            )
-            for item in self._pages(f"/{media_id}/comments", {"fields": COMMENT_FIELDS})
-        ]
+            ),
+            self._pages(f"/{media_id}/comments", {"fields": COMMENT_FIELDS}),
+        )
 
     def list_conversations(self, since: datetime | None = None) -> list[Conversation]:
         # Assumes Instagram lists the most recently updated first, as its inbox does.
         found = []
-        for item in self._pages(
+        pages = self._pages(
             "/{user_id}/conversations", {"platform": "instagram", "fields": "id,updated_time"}
-        ):
-            conversation = Conversation(
-                id=str(item["id"]), updated_at=datetime.fromisoformat(item["updated_time"])
-            )
+        )
+        for item in pages:
+            conversation = _parse_one(_conversation, item)
+            if conversation is None:
+                continue
             if since is not None and conversation.updated_at < since:
                 break
             found.append(conversation)
@@ -321,15 +339,15 @@ class InstagramClient:
 
     def list_messages(self, conversation_id: str) -> list[Message]:
         data = self._call("GET", f"/{conversation_id}", {"fields": MESSAGE_FIELDS})
-        return [
-            Message(
+        return _parsed(
+            lambda item: Message(
                 id=str(item["id"]),
                 sender_id=_author(item),
                 created_at=datetime.fromisoformat(item["created_time"]),
                 text=item.get("message") or "",  # absent for attachments
-            )
-            for item in (data.get("messages") or {}).get("data", [])
-        ]
+            ),
+            (data.get("messages") or {}).get("data", []),
+        )
 
     def reply_public(self, comment_id: str, text: str) -> str:
         return str(_field(self._call("POST", f"/{comment_id}/replies", {"message": text}), "id"))

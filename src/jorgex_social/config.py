@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ENV_PREFIX = "JORGEX_SOCIAL_"
+# Above the 7-day private-reply window plus the one-day margin the reply task keeps before
+# retention (replies/task.py), so nothing still answerable is ever purged.
+MIN_RETENTION_DAYS = 8
 
 
 def _flag(value: str) -> bool:
@@ -47,6 +50,9 @@ class Settings:
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
         env = os.environ if environ is None else environ
         defaults = cls()
+        retention_days = int(env.get(f"{ENV_PREFIX}RETENTION_DAYS", defaults.retention_days))
+        if retention_days < MIN_RETENTION_DAYS:
+            raise ValueError(f"{ENV_PREFIX}RETENTION_DAYS must be at least {MIN_RETENTION_DAYS}")
         return cls(
             database_path=Path(env.get(f"{ENV_PREFIX}DATABASE_PATH", defaults.database_path)),
             simulation=_flag(env.get(f"{ENV_PREFIX}SIMULATION", str(defaults.simulation))),
@@ -65,7 +71,7 @@ class Settings:
             hourly_reply_cap=int(
                 env.get(f"{ENV_PREFIX}HOURLY_REPLY_CAP", defaults.hourly_reply_cap)
             ),
-            retention_days=int(env.get(f"{ENV_PREFIX}RETENTION_DAYS", defaults.retention_days)),
+            retention_days=retention_days,
             reply_cooldown_minutes=int(
                 env.get(f"{ENV_PREFIX}REPLY_COOLDOWN_MINUTES", defaults.reply_cooldown_minutes)
             ),

@@ -220,6 +220,8 @@ class RuleTestOut(BaseModel):
     rule: RuleOut | None
     public_replies: list[str]
     private_replies: list[str]
+    # Why the given rule did not match although the text might, e.g. a media_ref it needs.
+    note: str | None = None
 
 
 @router.post("/rules/test", response_model=RuleTestOut, dependencies=RulesRead)
@@ -234,10 +236,16 @@ def test_rules(body: RuleTestIn, session: SessionDep, network: Network):
         candidates = rules.active_rules(session, network, body.channel)
     rule = rules.first_match(candidates, body.text, media_ref=body.media_ref)
     content = rule.content if rule else {}
+    note = None
+    if body.rule_id is not None and rule is None:
+        needed = candidates[0].media_ref
+        if needed is not None and needed != body.media_ref:
+            note = f"The rule only applies to comments on media {needed}; pass that media_ref."
     return RuleTestOut(
         rule=RuleOut.model_validate(rule, from_attributes=True) if rule else None,
         public_replies=content.get("public_replies", []),
         private_replies=content.get("private_replies", []),
+        note=note,
     )
 
 

@@ -50,11 +50,34 @@ log = logging.getLogger(__name__)
 PRIVATE_REPLY_WINDOW = timedelta(days=7)
 MESSAGING_WINDOW = timedelta(hours=24)
 HOUR = timedelta(hours=1)
-# Newest first; a week rarely holds more posts than this.
+# Comments are polled on media up to this old (newest first, at most this many), plus any media
+# an active rule names. The 7-day window for a private reply counts from the comment, not the post.
+RECENT_MEDIA = timedelta(days=30)
 RECENT_MEDIA_TO_POLL = 50
+# Activity older than retention minus this margin is never evaluated: its event may already be
+# purged, and seeing it again must not answer it again.
+RETENTION_MARGIN = timedelta(days=1)
 
 # Nothing was sent and the cause affects every send: stop and try again on the next poll.
 _RETRY_LATER = (CredentialUnavailable, AuthError, RateLimited)
+
+
+def _log_failure(what: str, exc: Exception, **extra) -> None:
+    """Only an InstagramError's message is logged (it never quotes a comment or a message); for
+    anything else, only its type, since a parsing or database error could quote the third-party
+    text being handled."""
+    if isinstance(exc, InstagramError):
+        log.warning(f"{what} failed", extra={**extra, "error": str(exc)})
+    else:
+        log.error(f"{what} failed", extra={**extra, "error_type": type(exc).__name__})
+
+
+def _isolated(what: str, step: Callable[..., None], *args) -> None:
+    """Runs one step of the cycle so that its failure stops none of the others."""
+    try:
+        step(*args)
+    except Exception as exc:
+        _log_failure(what, exc)
 
 
 @dataclass(frozen=True)
@@ -101,12 +124,9 @@ class ReplyTask:
             log.warning("no connected account yet; not polling comments or messages")
         else:
             for name, step in (("comments", self.poll_comments), ("messages", self.poll_messages)):
-                try:
-                    step(sessions, own, now)
-                except InstagramError as exc:
-                    log.warning("reply poll failed", extra={"step": name, "error": str(exc)})
-        self.deliver(sessions)
-        self.purge(sessions, now)
+                _isolated(f"{name} poll", step, sessions, own, now)
+        _isolated("delivery", self.deliver, sessions)
+        _isolated("purge", self.purge, sessions, now)
 
     def _own_account(self, sessions: sessionmaker) -> str | None:
         with sessions() as session:
@@ -126,87 +146,115 @@ class ReplyTask:
             )
         )
 
+    def _evaluable(self, occurred_at: datetime, now: datetime) -> bool:
+        return now - occurred_at < self.retention - RETENTION_MARGIN
+
     def poll_comments(self, sessions: sessionmaker, own: str, now: datetime) -> None:
-        network = self.instagram.network
-        media = [
-            m
+        recent = [
+            m.id
             for m in self.instagram.list_media(max_items=RECENT_MEDIA_TO_POLL)
-            if now - m.timestamp < PRIVATE_REPLY_WINDOW
+            if now - m.timestamp < RECENT_MEDIA
         ]
-        for item in media:
+        with sessions() as session:
+            named = {
+                r.media_ref for r in active_rules(session, self.instagram.network, Channel.COMMENT)
+            }
+        # One odd media never stops the others; a failure that affects every call stops the poll.
+        for media_ref in recent + sorted(named - {None} - set(recent)):
             try:
-                comments = self.instagram.list_comments(item.id)
+                self._poll_media(sessions, own, now, media_ref)
             except _RETRY_LATER:
                 raise
-            except InstagramError as exc:
-                log.warning("comments poll failed", extra={"media_ref": item.id, "error": str(exc)})
-                continue
-            # The account's own comments never fire a rule (no reply loops). Without an author
-            # it cannot be told apart from one, so it is dropped too.
-            others = [c for c in comments if c.author_id is not None and c.author_id != own]
-            with sessions() as session, session.begin():
-                known = self._known(session, Channel.COMMENT, [c.id for c in others])
-                rules = active_rules(session, network, Channel.COMMENT)
-                for comment in others:
-                    if comment.id in known:
-                        continue
-                    rule = first_match(
-                        rules, comment.text, media_ref=item.id, occurred_at=comment.timestamp
-                    )
-                    event = Event(
-                        network=network,
-                        type=Channel.COMMENT,
-                        external_ref=comment.id,
-                        media_ref=item.id,
-                        occurred_at=comment.timestamp,
-                        received_at=now,
-                        rule_id=rule.id if rule else None,
-                    )
-                    self._record(session, event, rule, now)
+            except Exception as exc:
+                _log_failure("comments poll", exc, media_ref=media_ref)
+
+    def _poll_media(self, sessions: sessionmaker, own: str, now: datetime, media_ref: str) -> None:
+        network = self.instagram.network
+        comments = self.instagram.list_comments(media_ref)
+        # The account's own comments never fire a rule (no reply loops). Without an author it
+        # cannot be told apart from one, so it is dropped too.
+        others = [
+            c
+            for c in comments
+            if c.author_id is not None and c.author_id != own and self._evaluable(c.timestamp, now)
+        ]
+        with sessions() as session, session.begin():
+            known = self._known(session, Channel.COMMENT, [c.id for c in others])
+            rules = active_rules(session, network, Channel.COMMENT)
+            for comment in others:
+                if comment.id in known:
+                    continue
+                known.add(comment.id)  # the same id twice in one listing is one event
+                rule = first_match(
+                    rules, comment.text, media_ref=media_ref, occurred_at=comment.timestamp
+                )
+                event = Event(
+                    network=network,
+                    type=Channel.COMMENT,
+                    external_ref=comment.id,
+                    media_ref=media_ref,
+                    occurred_at=comment.timestamp,
+                    received_at=now,
+                    rule_id=rule.id if rule else None,
+                )
+                self._record(session, event, rule, now)
 
     def poll_messages(self, sessions: sessionmaker, own: str, now: datetime) -> None:
-        network = self.instagram.network
         for conversation in self.instagram.list_conversations(since=now - MESSAGING_WINDOW):
             if self._read.get(conversation.id) == conversation.updated_at:
                 continue
             try:
-                messages = self.instagram.list_messages(conversation.id)
+                self._poll_conversation(sessions, own, now, conversation.id)
             except _RETRY_LATER:
                 raise
-            except InstagramError as exc:
-                log.warning("messages poll failed", extra={"error": str(exc)})
-                continue
-            # Only what the other person wrote and can still be answered; the account's own
-            # messages (including these replies) never fire a rule.
-            theirs = sorted(
-                (
-                    m
-                    for m in messages
-                    if m.sender_id is not None
-                    and m.sender_id != own
-                    and now - m.created_at < MESSAGING_WINDOW
-                ),
-                key=lambda m: m.created_at,
+            except Exception as exc:
+                _log_failure("messages poll", exc)
+            else:
+                self._read[conversation.id] = conversation.updated_at
+
+    def _poll_conversation(
+        self, sessions: sessionmaker, own: str, now: datetime, conversation_id: str
+    ) -> None:
+        network = self.instagram.network
+        messages = self.instagram.list_messages(conversation_id)
+        # Only what the other person wrote and can still be answered; the account's own
+        # messages (including these replies) never fire a rule.
+        theirs = sorted(
+            (
+                m
+                for m in messages
+                if m.sender_id is not None
+                and m.sender_id != own
+                and now - m.created_at < MESSAGING_WINDOW
+                and self._evaluable(m.created_at, now)
+            ),
+            key=lambda m: m.created_at,
+        )
+        ids = [m.id for m in theirs]
+        with sessions() as session, session.begin():
+            known = self._known(session, Channel.MESSAGE, ids)
+            # Our own sends, in case Instagram names their sender with an id other than the one
+            # the connection holds.
+            known |= set(
+                session.scalars(select(Delivery.result_ref).where(Delivery.result_ref.in_(ids)))
             )
-            with sessions() as session, session.begin():
-                known = self._known(session, Channel.MESSAGE, [m.id for m in theirs])
-                rules = active_rules(session, network, Channel.MESSAGE)
-                for message in theirs:
-                    if message.id in known:
-                        continue
-                    person = self._conversation(session, message.sender_id, message.created_at, now)
-                    rule = first_match(rules, message.text, occurred_at=message.created_at)
-                    event = Event(
-                        network=network,
-                        type=Channel.MESSAGE,
-                        external_ref=message.id,
-                        conversation_id=person.id,
-                        occurred_at=message.created_at,
-                        received_at=now,
-                        rule_id=rule.id if rule else None,
-                    )
-                    self._record(session, event, rule, now)
-            self._read[conversation.id] = conversation.updated_at
+            rules = active_rules(session, network, Channel.MESSAGE)
+            for message in theirs:
+                if message.id in known:
+                    continue
+                known.add(message.id)
+                person = self._conversation(session, message.sender_id, message.created_at, now)
+                rule = first_match(rules, message.text, occurred_at=message.created_at)
+                event = Event(
+                    network=network,
+                    type=Channel.MESSAGE,
+                    external_ref=message.id,
+                    conversation_id=person.id,
+                    occurred_at=message.created_at,
+                    received_at=now,
+                    rule_id=rule.id if rule else None,
+                )
+                self._record(session, event, rule, now)
 
     def _conversation(
         self, session: Session, person_id: str, written_at: datetime, now: datetime
@@ -279,9 +327,13 @@ class ReplyTask:
                 .order_by(Delivery.created_at, Delivery.id)
             ).all()
         for delivery_id in pending:
-            send = self._prepare(sessions, delivery_id)
-            if send is not None and not self._send(sessions, send):
-                return
+            try:
+                send = self._prepare(sessions, delivery_id)
+                if send is not None and not self._send(sessions, send):
+                    return
+            except Exception as exc:
+                # Left as it was: if attempted_at was written, the next pass fails it as unknown.
+                _log_failure("delivery", exc, delivery_id=delivery_id)
 
     def _prepare(self, sessions: sessionmaker, delivery_id: str) -> _Send | None:
         """Checks, right before the call, everything that can forbid it, and marks the delivery
@@ -354,16 +406,8 @@ class ReplyTask:
         )
         if sent_last_hour >= self.hourly_cap:
             return Reason.HOURLY_CAP
-        duplicate = session.scalar(
-            select(Delivery.id).where(
-                Delivery.event_id == delivery.event_id,
-                Delivery.action == delivery.action,
-                Delivery.id != delivery.id,
-                Delivery.attempted_at.is_not(None),
-            )
-        )
-        if duplicate is not None:
-            return Reason.DUPLICATE
+        # No duplicate check here: one rule per event, so a second delivery of the same action
+        # cannot be created. The unique indexes on deliveries are the safety net.
         return None
 
     def _send(self, sessions: sessionmaker, send: _Send) -> bool:

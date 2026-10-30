@@ -58,3 +58,9 @@ def test_reads_reply_settings():
         50,
         30,
     )
+
+
+def test_retention_must_outlast_the_private_reply_window():
+    with pytest.raises(ValueError, match="at least 8"):
+        Settings.from_env({"JORGEX_SOCIAL_RETENTION_DAYS": "7"})
+    assert Settings.from_env({"JORGEX_SOCIAL_RETENTION_DAYS": "8"}).retention_days == 8

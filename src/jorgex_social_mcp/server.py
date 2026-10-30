@@ -464,7 +464,7 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
             str | None,
             Field(
                 description="Why skipped or failed: kill_switch, paused, window_closed, "
-                "cooldown, hourly_cap, duplicate, refused or unknown."
+                "cooldown, hourly_cap, refused or unknown."
             ),
         ] = None,
         action: Annotated[
