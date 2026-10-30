@@ -125,7 +125,23 @@ async def call(client, name, /, **arguments):
     ],
 )
 async def test_tools_follow_the_token_permissions(app, transport, grants, expected):
-    assert await tool_names(server_for(app, transport, **grants)) == expected
+    # get_token needs no group: every valid token may ask what it may do.
+    assert await tool_names(server_for(app, transport, **grants)) == expected | {"get_token"}
+
+
+async def test_get_token_shows_the_token_permissions(app, transport):
+    async with Client(server_for(app, transport, stats="read")) as client:
+        result = await call(client, "get_token")
+
+    assert result[0] == "ok"
+    assert result[1]["permissions"] == {
+        "posts": "deny",
+        "scheduling": "deny",
+        "stats": "read",
+        "account": "deny",
+        "rules": "deny",
+        "events": "deny",
+    }
 
 
 async def test_the_instructions_name_only_tools_this_server_has(app, transport):
@@ -136,6 +152,7 @@ async def test_the_instructions_name_only_tools_this_server_has(app, transport):
     assert referenced <= names, referenced - names
     # The steps an agent cannot guess: uploading, publishing safely, unknown outcomes, rules.
     assert {
+        "get_token",
         "upload_media",
         "create_post",
         "publish_now",

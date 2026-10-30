@@ -55,6 +55,8 @@ WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world
 ON_ACCOUNT = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
 _RANK = {"deny": 0, "read": 1, "write": 2}
+# The level of a tool any valid token may call, whatever its permissions.
+ANY = "any"
 
 # What no single tool description says: the order of the flows, what touches the real account
 # and what each error code asks of the agent. A backticked identifier here is always a tool name
@@ -64,9 +66,10 @@ jorgex-social runs one Instagram account: posts (prepare, schedule, publish), au
 to comments and direct messages, and stored statistics. Each tool is one call to its REST API, \
 which checks this token's permissions and enforces every rule.
 
-Real account: call `get_account` first. With simulation false, `publish_now`, `schedule_post` \
-(at its time), `activate_rule` and turning the kill switch off act on the real account, and a \
-publication cannot be undone from here. With simulation true nothing reaches Instagram.
+Start with `get_token`, to see what this token may do, and `get_account`. With simulation \
+false, `publish_now`, `schedule_post` (at its time), `activate_rule` and turning the kill \
+switch off act on the real account, and a publication cannot be undone from here. With \
+simulation true nothing reaches Instagram.
 
 Publishing:
 1. `get_catalog`: post types, item and caption limits, accepted files.
@@ -168,6 +171,14 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         if "max_bytes" not in limits:
             limits["max_bytes"] = json.loads(call("GET", "/v1/catalog"))["upload"]["max_bytes"]
         return limits["max_bytes"]
+
+    # access
+
+    def get_token() -> str:
+        """What this token may do: its permissions per group (posts, scheduling, stats,
+        account, rules, events), each deny, read or write. Call it first; a tool whose group
+        is not granted at its level fails with forbidden."""
+        return call("GET", "/v1/token")
 
     # posts
 
@@ -594,6 +605,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         )
 
     return [
+        ("access", ANY, get_token, READ),
         ("posts", "read", get_catalog, READ),
         ("posts", "read", list_posts, READ),
         ("posts", "read", get_post, READ),
@@ -642,7 +654,7 @@ def build_server(api: Api) -> MCPServer:
         )
     server = MCPServer("jorgex-social", instructions=instructions(LOCAL_UPLOAD))
     for group, level, tool, annotations in tool_definitions(api):
-        if _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
+        if level == ANY or _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
             server.add_tool(tool, annotations=annotations, structured_output=False)
     return server
 

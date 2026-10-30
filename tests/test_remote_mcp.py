@@ -114,6 +114,24 @@ async def test_the_instructions_name_only_tools_the_remote_server_has(app, clock
 
 
 @pytest.mark.anyio
+async def test_get_token_shows_the_grant_permissions(app, clock):
+    oauth, _, _ = await operator_oauth(httpx2.ASGITransport(app=app), clock, rules="write")
+
+    async with mcp_client(app, auth=oauth) as client:
+        result = await call(client, "get_token")
+
+    assert result[0] == "ok"
+    assert result[1]["permissions"] == {
+        "posts": "deny",
+        "scheduling": "deny",
+        "stats": "deny",
+        "account": "deny",
+        "rules": "write",
+        "events": "deny",
+    }
+
+
+@pytest.mark.anyio
 async def test_without_a_token_mcp_points_to_its_metadata(app):
     async with app.router.lifespan_context(app):
         http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=PUBLIC)
