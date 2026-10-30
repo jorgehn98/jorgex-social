@@ -24,7 +24,7 @@ from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
 from jorgex_social.clock import SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
-from jorgex_social.instagram import make_instagram
+from jorgex_social.instagram import make_instagram, network_for
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import InstagramError
 from jorgex_social.instagram.fake import FakeInstagram
@@ -143,7 +143,7 @@ def cmd_set_password(_: argparse.Namespace, settings: Settings) -> None:
     password = read_new_password()
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
-        operator.set_password(session, password, SystemClock().now())
+        operator.set_password(session, network_for(settings), password, SystemClock().now())
     print("Password changed; every browser was signed out and every OAuth grant revoked.")
 
 
@@ -157,7 +157,7 @@ def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
     code = input("Code shown by the app: ") if sys.stdin.isatty() else sys.stdin.readline()
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
-        operator.enroll_totp(session, key, secret, code, SystemClock().now())
+        operator.enroll_totp(session, network_for(settings), key, secret, code, SystemClock().now())
     print("Second factor enrolled; every browser was signed out and every OAuth grant revoked.")
 
 

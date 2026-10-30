@@ -32,6 +32,9 @@ class IncidentType(StrEnum):
     # The webhook is configured, polling found activity it never delivered and it has been
     # silent for a day.
     WEBHOOK_SILENT = "webhook_silent"
+    # The password was right and the code wrong, repeatedly: the password may have leaked. Closes
+    # only when the credentials change.
+    SIGN_IN_PASSWORD_ACCEPTED = "sign_in_password_accepted"
 
 
 class ActorType(StrEnum):
@@ -106,8 +109,8 @@ class Setting(Base):
 
 
 class AuditEntry(Base):
-    """Append-only (database triggers refuse updates and deletes). Never holds request bodies,
-    secrets or third-party text."""
+    """Append-only (database triggers refuse updates and deletes), except that old denied
+    sign-ins are purged. Never holds request bodies, secrets or third-party text."""
 
     __tablename__ = "audit_log"
     __table_args__ = (Index("ix_audit_log_object", "object_type", "object_id"),)

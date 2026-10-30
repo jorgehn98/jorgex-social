@@ -109,6 +109,11 @@ window fail as missed_schedule, and a post whose containers were being made when
 fails with failure kill_switch; both must be scheduled again. Open incidents (`list_incidents`) \
 need a human; acknowledging one does not close it.
 
+sign_in_password_accepted: sign-ins to the web interface with the right password kept failing on \
+the code, so the password may have leaked. Tell the operator at once; if it was not them, they \
+should change the password on the server (set-password), which is what closes it. You cannot \
+close it, and a successful sign-in does not either.
+
 Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
 a page comes back shorter than limit; tools without offset say how to page in their \
 description.
@@ -417,7 +422,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         limit: Limit = None,
         offset: Offset = None,
     ) -> str:
-        """Channel incidents, newest first. An open incident's cause is still there."""
+        """Channel incidents, newest first. An open incident's cause is still there.
+        sign_in_password_accepted needs the operator, who should change the password if they did
+        not cause it: sign-ins had the right password and a wrong code (detail: wrong_codes)."""
         return call(
             "GET",
             "/v1/account/incidents",
@@ -430,7 +437,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         limit: Limit = None,
         offset: Offset = None,
     ) -> str:
-        """Audit log of writes and denied calls, newest first."""
+        """Audit log of writes and denied calls, newest first. operator.login entries give the
+        client address in detail, and reason wrong_code when a denied sign-in had the right
+        password. Denied sign-ins are kept for 90 days, everything else for good."""
         query = {"object_type": object_type, "object_id": object_id, "limit": limit}
         return call("GET", "/v1/account/audit", query={**query, "offset": offset})
 

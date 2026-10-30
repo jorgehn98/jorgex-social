@@ -232,6 +232,17 @@ service answers 429 without checking anything. There is no account lockout, so n
 out by failing on purpose from elsewhere. Password checks are expensive by design; at most two run at
 once, and a sign-in that cannot get a turn within two seconds gets 503.
 
+The audit log records each sign-in with the client's address. Denied sign-ins are deleted after 90
+days, since anyone can make the service write them; every other entry stays.
+
+Three sign-ins with the right password and a wrong code within an hour, with no successful sign-in
+between them, open the incident `sign_in_password_accepted`: **your password may have leaked**, and
+only the second factor stopped whoever has it. The page they get is the same as for a wrong password,
+so nothing tells them. If it was not you, run `set-password`. Changing the password or the second
+factor is the only thing that closes it: signing in or acknowledging it does not, so after your own
+mistyped codes you close it the same way. The audit log's denied `operator.login` entries show the
+addresses, with `wrong_code` as their reason.
+
 ## Remote MCP
 
 An agent connects to `https://social.example.com/mcp` with nothing but that URL: no token to copy,
@@ -278,6 +289,9 @@ Ending a grant ends its tokens and upload URLs; the client stays registered, so 
 consent again. Changing the password (`set-password`) or the second factor (`enroll-totp`) ends every
 grant. If a client keeps failing to connect after that, clear what it stored and start again; with
 Claude Code, `claude mcp logout jorgex-social` (the name you gave it in `claude mcp add`).
+
+A grant lasts 90 days from your consent (`expires_at` in `list-grants`), however often its tokens are
+refreshed. Past that its tokens stop working and the client asks for your consent again.
 
 Clients may only register redirect URIs on the loopback address, so an approved code always goes
 back to the machine that asked. A client that needs an https redirect must be listed in

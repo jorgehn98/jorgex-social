@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -58,7 +59,12 @@ def enrolled(app, settings, clock):
     with app.state.sessionmaker() as session, session.begin():
         operator.create_operator(session, PASSWORD, earlier)
         operator.enroll_totp(
-            session, key, TOTP_SECRET, pyotp.TOTP(TOTP_SECRET).at(earlier), earlier
+            session,
+            app.state.network,
+            key,
+            TOTP_SECRET,
+            pyotp.TOTP(TOTP_SECRET).at(earlier),
+            earlier,
         )
 
 
@@ -307,7 +313,7 @@ def test_changing_the_password_signs_every_browser_out(app, client, clock):
     log_in(client, clock)
 
     with app.state.sessionmaker() as session, session.begin():
-        operator.set_password(session, "another long password", clock.now())
+        operator.set_password(session, app.state.network, "another long password", clock.now())
 
     assert client.get("/ui/", follow_redirects=False).status_code == 303
 
@@ -682,7 +688,9 @@ def test_enrolment_refuses_a_non_ascii_code(app, settings, clock):
         app.state.sessionmaker() as session,
         session.begin(),
     ):
-        operator.enroll_totp(session, key, TOTP_SECRET, "１２３４５６", clock.now())
+        operator.enroll_totp(
+            session, app.state.network, key, TOTP_SECRET, "１２３４５６", clock.now()
+        )
 
 
 def test_logout_with_an_unknown_cookie_does_not_take_the_write_lock(app, client, monkeypatch):
@@ -765,3 +773,191 @@ def test_a_login_form_with_too_many_fields_is_a_bad_request(client):
     )
 
     assert response.status_code == 400
+
+
+# A right password with a wrong code
+
+
+def fail_the_code(client, clock, times=1):
+    for _ in range(times):
+        response = log_in(client, clock, code=wrong_code(clock.now()))
+        assert response.status_code == 401
+    return response
+
+
+def password_incidents(app):
+    with app.state.read_sessionmaker() as session:
+        return session.scalars(
+            select(ChannelIncident).where(ChannelIncident.type == "sign_in_password_accepted")
+        ).all()
+
+
+def login_details(app):
+    found = rows(
+        app,
+        "SELECT outcome, detail FROM audit_log WHERE action = 'operator.login' "
+        "ORDER BY occurred_at, rowid",
+    )
+    return [(outcome, json.loads(detail)) for outcome, detail in found]
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_the_third_wrong_code_opens_the_incident_and_the_answer_never_changes(app, client, clock):
+    wrong_password = log_in(client, clock, password="not the password at all")
+
+    answers = [fail_the_code(client, clock), fail_the_code(client, clock)]
+    assert password_incidents(app) == []
+
+    answers.append(fail_the_code(client, clock))
+    [incident] = password_incidents(app)
+
+    assert incident.detail == {"wrong_codes": 3}
+    assert incident.network == app.state.network
+    assert incident.closed_at is None
+    for answer in answers:
+        assert answer.status_code == wrong_password.status_code == 401
+        assert answer.text == wrong_password.text
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_wrong_passwords_do_not_count_as_wrong_codes(app, client, clock):
+    for _ in range(4):
+        log_in(client, clock, password="not the password at all")
+
+    assert password_incidents(app) == []
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_a_successful_sign_in_resets_the_count(app, client, clock):
+    fail_the_code(client, clock, times=2)
+    clock.advance(minutes=1)
+    assert log_in(client, clock).status_code == 303
+    clock.advance(minutes=1)
+
+    fail_the_code(client, clock, times=2)
+    assert password_incidents(app) == []
+
+    fail_the_code(client, clock)
+    assert len(password_incidents(app)) == 1
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_wrong_codes_older_than_an_hour_do_not_count(app, client, clock):
+    fail_the_code(client, clock, times=2)
+    clock.advance(hours=1)
+
+    fail_the_code(client, clock, times=2)
+    assert password_incidents(app) == []
+
+    fail_the_code(client, clock)
+    assert password_incidents(app)[0].detail == {"wrong_codes": 3}
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_signing_in_does_not_close_the_incident_and_the_cli_set_password_does(
+    app, client, clock, cli_env, monkeypatch
+):
+    fail_the_code(client, clock, times=3)
+    clock.advance(minutes=1)
+    assert log_in(client, clock).status_code == 303
+    assert password_incidents(app)[0].closed_at is None
+
+    _stdin(monkeypatch, "another long password\n")
+    main(["set-password"])
+
+    assert password_incidents(app)[0].closed_at is not None
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_enrolling_the_second_factor_again_closes_the_incident(app, settings, client, clock):
+    fail_the_code(client, clock, times=3)
+    clock.advance(minutes=5)
+    key = crypto.load_key(settings.secret_key_file)
+    with app.state.sessionmaker() as session, session.begin():
+        operator.enroll_totp(
+            session, app.state.network, key, TOTP_SECRET, code_at(clock.now()), clock.now()
+        )
+
+    assert password_incidents(app)[0].closed_at is not None
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_wrong_codes_from_before_a_password_change_do_not_reopen_the_incident(app, client, clock):
+    fail_the_code(client, clock, times=3)
+    clock.advance(minutes=1)
+    new_password = "another long password"
+    with app.state.sessionmaker() as session, session.begin():
+        operator.set_password(session, app.state.network, new_password, clock.now())
+    clock.advance(minutes=1)
+
+    assert (
+        log_in(client, clock, password=new_password, code=wrong_code(clock.now())).status_code
+        == 401
+    )
+
+    assert [incident.closed_at is not None for incident in password_incidents(app)] == [True]
+
+
+# The audit of signing in
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_the_audit_names_the_client_and_only_a_right_password_has_a_reason(app, clock):
+    client = TestClient(app, base_url=LOCAL, headers={"origin": LOCAL}, client=("198.51.100.7", 1))
+
+    log_in(client, clock, password="not the password at all")
+    fail_the_code(client, clock)
+    assert log_in(client, clock).status_code == 303
+
+    assert login_details(app) == [
+        ("denied", {"client": "198.51.100.7"}),
+        ("denied", {"client": "198.51.100.7", "reason": "wrong_code"}),
+        ("ok", {"client": "198.51.100.7"}),
+    ]
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_only_old_denied_sign_ins_are_purged(app, client, clock):
+    log_in(client, clock, password="purged after 90 days")
+    assert log_in(client, clock).status_code == 303
+    clock.advance(days=2)
+    fail_the_code(client, clock)
+    other_actions = rows(app, "SELECT count(*) FROM audit_log WHERE action != 'operator.login'")
+    clock.advance(days=88)
+
+    log_in(client, clock, password="another wrong password")
+
+    assert [outcome for outcome, _ in login_details(app)] == ["ok", "denied", "denied"]
+    assert (
+        rows(app, "SELECT count(*) FROM audit_log WHERE action != 'operator.login'")
+        == other_actions
+    )
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_only_denied_sign_ins_can_be_deleted_from_the_audit_log(app, client, clock):
+    assert log_in(client, clock).status_code == 303
+
+    for action in ("operator.login", "operator.created"):
+        with pytest.raises(Exception, match="append-only"), app.state.sessionmaker() as session:
+            session.execute(text("DELETE FROM audit_log WHERE action = :a"), {"a": action})
+
+
+# Password managers
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_the_form_gives_password_managers_a_username_the_server_ignores(client, clock):
+    page = client.get("/ui/login").text
+    assert 'name="username" value="operator" autocomplete="username" hidden' in page
+
+    fields = {
+        "username": "not checked",
+        "password": PASSWORD,
+        "code": code_at(clock.now()),
+        "next": "/ui/posts",
+    }
+    response = client.post("/ui/login", data=fields, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/posts"

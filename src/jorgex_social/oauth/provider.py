@@ -80,7 +80,7 @@ class Provider:
     def _token(self, issued: store.Issued) -> OAuthToken:
         return OAuthToken(
             access_token=issued.access,
-            expires_in=int(store.ACCESS_LIFETIME.total_seconds()),
+            expires_in=int(issued.expires_in.total_seconds()),
             refresh_token=issued.refresh,
         )
 
