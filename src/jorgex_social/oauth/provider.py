@@ -220,11 +220,13 @@ class Provider:
     # Access
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        def load(session, token, resource, now):
-            found = store.find_access(session, token, resource, now)
+        def load(session, token, now):
+            found = store.find_access(session, token, None, now)
             return found and (found, now)
 
-        found = await self._read(load, token, self.resource)
+        # The token's own resource: the SDK's bearer middleware compares it with this server's
+        # (validate_token_resource) and refuses any other.
+        found = await self._read(load, token)
         if found is None:
             return None
         access, now = found
@@ -233,7 +235,7 @@ class Provider:
             client_id=access.client_id,
             scopes=[],
             expires_at=int(_wall_clock(access.expires_at, now)),
-            resource=self.resource,
+            resource=access.resource,
             subject=SUBJECT,
         )
 

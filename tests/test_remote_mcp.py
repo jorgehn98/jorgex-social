@@ -17,6 +17,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from sqlalchemy import text
 from test_oauth import (  # the OAuth fixtures and helpers
     PUBLIC,
     RESOURCE,
@@ -122,6 +123,23 @@ async def test_a_revoked_or_unknown_token_is_refused(app, agent, browser):
             made_up = await http.post("/mcp", json={}, headers=bearer("jxo_made-up"))
 
     assert revoked.status_code == made_up.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_a_token_for_another_resource_is_refused(app, agent, browser):
+    _, tokens = connect(agent, browser, posts="read")
+    with app.state.sessionmaker() as session, session.begin():
+        session.execute(text("UPDATE oauth_grants SET resource = 'https://other.example/mcp'"))
+
+    async with app.router.lifespan_context(app):
+        http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=PUBLIC)
+        async with http:
+            response = await http.post("/mcp", json={}, headers=bearer(tokens["access_token"]))
+    loaded = await app.state.oauth_provider.load_access_token(tokens["access_token"])
+
+    assert response.status_code == 401
+    # Refused by the SDK's resource check, which sees the grant's own resource.
+    assert loaded.resource == "https://other.example/mcp"
 
 
 @pytest.mark.anyio

@@ -63,6 +63,8 @@ class Access:
     client_name: str | None
     permissions: dict[str, str]
     expires_at: datetime
+    # The resource (RFC 8707) its grant was issued for.
+    resource: str
 
     @property
     def name(self) -> str:
@@ -382,14 +384,18 @@ def rotate(session: Session, secret: str, client_id: str, now: datetime) -> Issu
 # Access tokens
 
 
-def find_access(session: Session, secret: str, resource: str, now: datetime) -> Access | None:
-    """Only reads. None unless the token is live, its grant stands and it was issued for
-    `resource`."""
+def find_access(
+    session: Session, secret: str, resource: str | None, now: datetime
+) -> Access | None:
+    """Only reads. None unless the token is live, its grant stands and, if `resource` is given,
+    it was issued for it."""
     found = session.get(OAuthToken, hash_token(secret))
     if found is None or found.kind != ACCESS or found.expires_at <= now:
         return None
     grant = session.get(OAuthGrant, found.grant_id)
-    if grant is None or grant.revoked_at is not None or grant.resource != resource:
+    if grant is None or grant.revoked_at is not None:
+        return None
+    if resource is not None and grant.resource != resource:
         return None
     client = session.get(OAuthClient, grant.client_id)
     return Access(
@@ -398,6 +404,7 @@ def find_access(session: Session, secret: str, resource: str, now: datetime) -> 
         client_name=client.name if client else None,
         permissions=grant.permissions,
         expires_at=found.expires_at,
+        resource=grant.resource,
     )
 
 

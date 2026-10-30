@@ -124,7 +124,7 @@ def install(app: FastAPI) -> None:
         auth=AuthSettings(
             issuer_url=provider.issuer,
             resource_server_url=provider.resource,
-            # Refuses a token issued for another resource, as the API does.
+            # Refuses a token whose grant names another resource, as the API does.
             validate_token_resource=True,
         ),
     )
