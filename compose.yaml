@@ -1,0 +1,60 @@
+# Two services from one image, sharing the /data volume. Configuration comes from .env (copy it
+# from .env.example); the paths below override whatever .env says so that everything the service
+# writes lands in the volume.
+
+x-service: &service
+  build: .
+  image: jorgex-social:local
+  env_file: .env
+  environment:
+    JORGEX_SOCIAL_DATABASE_PATH: /data/jorgex-social.db
+    JORGEX_SOCIAL_MEDIA_DIR: /data/media
+    JORGEX_SOCIAL_SECRET_KEY_FILE: /data/secret.key
+  volumes:
+    - data:/data
+  # A real PID 1 (tini) forwards signals; without it, a SIGTERM that arrives while Python is still
+  # starting is ignored by PID 1 and `docker compose stop` waits for the whole grace period.
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  api:
+    <<: *service
+    # Migrations run here, before the server starts; the worker only starts once this service
+    # is healthy, so the two never migrate at the same time.
+    command: ["sh", "-c", "jorgex-social migrate && exec jorgex-social serve --host 0.0.0.0"]
+    # Loopback only: put a reverse proxy with HTTPS in front (see README).
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    <<: *service
+    command: ["jorgex-social", "worker"]
+    # restart: when Compose recreates or restarts `api` (an upgrade), it stops this worker first
+    # and starts it again once the new `api` has migrated and is healthy. Only one worker may run:
+    # it holds a file lock next to the database, and a second one exits and restarts in a loop.
+    depends_on:
+      api:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      disable: true
+    # On SIGTERM the worker finishes the attempt in progress before exiting. A single post (one
+    # container, its processing wait and the publish call) fits in this window; a kill mid-attempt
+    # is recovered when the worker starts again (it resolves its predecessor's unfinished attempt).
+    stop_grace_period: 15m
+
+volumes:
+  data:

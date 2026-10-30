@@ -9,6 +9,8 @@ AGENTS.md
 .env
 .env.*
 !.env.example
+*.key
+token.txt
 
 # Runtime data, media and backups
 *.db

@@ -1,0 +1,9 @@
+# Allowlist: the build context holds only what the image needs, so no secret, database, local
+# configuration or internal note can reach it by accident.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+**/__pycache__
