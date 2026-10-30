@@ -375,6 +375,16 @@ git pull
 docker compose up -d --build
 ```
 
+The first upgrade to the version that publishes `/ui` (with a fixed subnet in `compose.yaml`) needs
+the network recreated, which `up` alone does not do:
+
+```sh
+docker compose down && docker compose up -d --build
+```
+
+Then run the real-address check in [Reverse proxy](#reverse-proxy) before relying on the sign-in
+limits.
+
 Compose stops the old worker before it replaces `api`, so the new version migrates with no worker
 running, and starts the new worker once `api` is healthy again. On stop, the worker finishes the
 publication in progress before exiting, so an upgrade or `docker compose down` can take up to
