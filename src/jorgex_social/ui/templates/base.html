@@ -4,22 +4,31 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>{% block title %}{% endblock %} · jorgex-social</title>
-<link rel="icon" href="/ui/static/favicon.svg" type="image/svg+xml">
+<title>{% block title %}{% endblock %} · {{ product_name }}</title>
+<link rel="icon" href="/ui/icon">
 <link rel="preload" href="/ui/static/fonts/inter-latin-var.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/ui/static/style.css">
+<link rel="stylesheet" href="/ui/appearance.css">
 </head>
 <body>
 {% block body %}
 <header class="top">
   <div class="top-inner">
-    <a class="wordmark" href="/ui/">Jorge<span class="x">X</span> Social</a>
+    <a class="wordmark" href="/ui/">{% include "_wordmark.html" %}</a>
     <nav aria-label="Sections">
       {% for href, label in [("/ui/", "Home"), ("/ui/posts", "Posts"), ("/ui/stats", "Stats"), ("/ui/rules", "Rules"), ("/ui/events", "Events"), ("/ui/incidents", "Incidents")] %}
       <a href="{{ href }}"{% if request.url.path == href or (href != "/ui/" and request.url.path.startswith(href)) %} aria-current="page"{% endif %}>{{ label }}</a>
       {% endfor %}
     </nav>
-    <form method="post" action="/ui/logout"><button type="submit">Sign out</button></form>
+    <details class="profile-menu">
+      <summary aria-label="Account menu">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7z"/></svg>
+      </summary>
+      <ul>
+        <li><a href="/ui/settings">Settings</a></li>
+        <li><form method="post" action="/ui/logout"><button type="submit">Sign out</button></form></li>
+      </ul>
+    </details>
   </div>
 </header>
 <main>

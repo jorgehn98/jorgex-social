@@ -154,6 +154,11 @@ incidents (`list_incidents`) need a human; acknowledging one does not close it. 
 restriction the API can keep answering while the account is limited, so calls that succeed prove \
 nothing: a human must check Account Status in the Instagram app.
 
+Appearance: `get_appearance` shows the web interface's product name and the part of it in the \
+accent colour, its CSS, its icon and the CSS variables that can be overridden. `set_appearance` \
+changes them, and only how the interface looks: nothing reaches Instagram. Its warnings are likely \
+typos in the CSS, which was saved anyway; check them.
+
 sign_in_password_accepted: sign-ins to the web interface with the right password kept failing on \
 the code, so the password may have leaked. Tell the operator at once; if it was not them, they \
 should change the password on the server (set-password), which is what closes it. You cannot \
@@ -172,7 +177,8 @@ a post, the error lists status and allowed).
 - content_changed: the post changed since you reviewed it; read it again and review the new \
 content_hash. invalid_post: it fails the catalog; see errors. unknown_media: those media ids \
 do not exist (unused uploads are purged); upload the files again.
-- in_the_past: use a future time, or publish_now. invalid_value, invalid_rule, or http_error \
+- in_the_past: use a future time, or publish_now. invalid_value, invalid_rule, \
+invalid_appearance, or http_error \
 with status 422: fix the arguments as the message or detail says.
 - idempotency_key_taken: use another key. media_ref_taken: another post already has that \
 media id; check it.
@@ -508,6 +514,56 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         check the account first."""
         return call("PUT", "/v1/account/kill-switch", json_body={"enabled": enabled})
 
+    def get_appearance() -> str:
+        """The web interface's product name, the part of it in the accent colour and its CSS; its
+        icon's type and size in bytes (icon null: the default icon); the CSS variables that can be
+        overridden, with their defaults; and warnings about the CSS (see set_appearance)."""
+        return call("GET", "/v1/appearance")
+
+    def set_appearance(
+        name: Annotated[
+            str | None, Field(description="Product name, 1 to 40 characters after stripping.")
+        ] = None,
+        name_highlight: Annotated[
+            str | None,
+            Field(
+                description="The part of the name shown in the accent colour: first occurrence, "
+                "case-sensitive. It must occur in the name. An empty string removes it. Changing "
+                "the name so that the current highlight no longer occurs is refused unless you "
+                "pass this too."
+            ),
+        ] = None,
+        css: Annotated[
+            str | None,
+            Field(
+                description="CSS up to 256 KB, loaded after the default stylesheet; it can load "
+                "same-origin resources only and run no script. An empty string removes it."
+            ),
+        ] = None,
+        icon_base64: Annotated[
+            str | None, Field(description="A PNG, ICO or SVG file up to 256 KB, in base64.")
+        ] = None,
+        clear_icon: Annotated[bool, Field(description="Back to the default icon.")] = False,
+        reset: Annotated[
+            bool, Field(description="Everything back to the defaults. Alone, with no other field.")
+        ] = False,
+    ) -> str:
+        """Change how the web interface looks, including its public sign-in page. Only what you
+        pass changes, and invalid_appearance means nothing did. The answer's warnings list custom
+        properties in the CSS the interface does not read: likely typos, saved all the same."""
+        return call(
+            "PUT",
+            "/v1/appearance",
+            json_body={
+                "name": name,
+                "name_highlight": name_highlight,
+                "css": css,
+                "icon_base64": icon_base64,
+                "clear_icon": clear_icon,
+                "reset": reset,
+            },
+        )
+
     # rules
 
     def list_rules(
@@ -750,8 +806,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ("account", "read", get_account, READ),
         ("account", "read", list_incidents, READ),
         ("account", "read", audit_log, READ),
+        ("account", "read", get_appearance, READ),
         ("account", "write", acknowledge_incident, WRITE),
         ("account", "write", set_kill_switch, WRITE),
+        ("account", "write", set_appearance, WRITE),
         ("rules", "read", list_rules, READ),
         ("rules", "read", get_rule, READ),
         ("rules", "read", test_rules, READ),

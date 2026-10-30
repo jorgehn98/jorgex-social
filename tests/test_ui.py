@@ -1,8 +1,11 @@
 import hashlib
 import io
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlencode
 
 import pyotp
 import pytest
@@ -14,7 +17,7 @@ from starlette.requests import Request
 from jorgex_social.access import operator
 from jorgex_social.access.models import Operator, OperatorSession
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import crypto
+from jorgex_social.account import appearance, crypto
 from jorgex_social.account.credential import seal
 from jorgex_social.account.models import ChannelIncident, Connection
 from jorgex_social.api import create_app
@@ -28,7 +31,15 @@ from jorgex_social.ui.routes import COOKIE, INVALID, cookie_is_secure
 START = datetime(2026, 10, 30, 12, 0, 10, tzinfo=UTC)
 PASSWORD = "correct horse battery staple"
 TOTP_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
-PAGES = ["/ui/", "/ui/posts", "/ui/stats", "/ui/rules", "/ui/events", "/ui/incidents"]
+PAGES = [
+    "/ui/",
+    "/ui/posts",
+    "/ui/stats",
+    "/ui/rules",
+    "/ui/events",
+    "/ui/incidents",
+    "/ui/settings/appearance",
+]
 
 
 @pytest.fixture
@@ -93,7 +104,9 @@ def rows(app, query, **params):
 # Without a session
 
 
-@pytest.mark.parametrize("path", [*PAGES, "/ui/posts/any", "/ui/stats/any", "/ui/media/any"])
+@pytest.mark.parametrize(
+    "path", [*PAGES, "/ui/settings", "/ui/posts/any", "/ui/stats/any", "/ui/media/any"]
+)
 def test_pages_redirect_to_login_without_a_session(client, path):
     response = client.get(path, follow_redirects=False)
 
@@ -636,7 +649,10 @@ def test_drafts_and_cancelled_posts_are_listed_last_and_folded(app, client, cloc
 
     page = client.get("/ui/posts").text
 
-    published, folded = page.index("A caption written by the operator"), page.index("<details")
+    published, folded = (
+        page.index("A caption written by the operator"),
+        page.index('<details class="folded'),
+    )
     assert published < folded < page.index("A draft in progress") < page.index("Called off")
 
 
@@ -1044,3 +1060,496 @@ def test_the_form_gives_password_managers_a_username_the_server_ignores(client, 
 
     assert response.status_code == 303
     assert response.headers["location"] == "/ui/posts"
+
+
+# Settings: appearance
+
+SETTINGS = "/ui/settings/appearance"
+PNG = b"\x89PNG\r\n\x1a\n" + b"p" * 32
+ICO = b"\x00\x00\x01\x00\x01\x00" + b"i" * 32
+SVG = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+NO_FILE = {"icon": ("", b"")}
+
+
+def save(client, *, files=None, **fields):
+    data = {"name": "Social", "name_highlight": "", "css": "", **fields}
+    return client.post(SETTINGS, data=data, files=files or NO_FILE, follow_redirects=False)
+
+
+def appearance_audit(app):
+    return rows(app, "SELECT actor_type, detail FROM audit_log WHERE action='appearance.updated'")
+
+
+@pytest.fixture
+def signed_in(client, clock, enrolled):
+    assert log_in(client, clock).status_code == 303
+    return client
+
+
+def test_settings_goes_to_its_first_section(signed_in):
+    response = signed_in.get("/ui/settings", follow_redirects=False)
+
+    assert (response.status_code, response.headers["location"]) == (303, SETTINGS)
+    page = signed_in.get(SETTINGS).text
+    assert '<a href="/ui/settings/appearance" aria-current="page">Appearance</a>' in page
+
+
+@pytest.mark.parametrize("path", ["/ui/settings", SETTINGS])
+def test_settings_with_an_old_sign_in_asks_for_credentials_and_returns(signed_in, clock, path):
+    clock.advance(hours=1)
+
+    response = signed_in.get(path, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/login?" + urlencode({"next": path})
+    assert "set-cookie" not in response.headers  # the session still serves the other pages
+    assert signed_in.get("/ui/").status_code == 200
+    back = signed_in.post(
+        "/ui/login",
+        data={"password": PASSWORD, "code": code_at(clock.now()), "next": path},
+        follow_redirects=False,
+    )
+    assert back.headers["location"] == path
+    assert signed_in.get(SETTINGS).status_code == 200
+
+
+def test_an_old_sign_in_cannot_save(app, signed_in, clock):
+    clock.advance(hours=1)
+
+    assert save(signed_in, name="Other").status_code == 303
+
+    assert "Other" not in signed_in.get("/ui/login").text
+    assert appearance_audit(app) == []
+
+
+def test_a_foreign_origin_cannot_save(app, signed_in):
+    refused = signed_in.post(
+        SETTINGS,
+        data={"name": "Other"},
+        files=NO_FILE,
+        headers={"origin": "https://evil.example"},
+    )
+
+    assert refused.status_code == 403
+    assert appearance_audit(app) == []
+
+
+def test_what_is_saved_shows_on_the_sign_in_page(app, signed_in):
+    saved = save(
+        signed_in,
+        name="  JorgeX Social ",
+        name_highlight="X",
+        css="body { color: red; }",
+        files={"icon": ("logo.png", PNG)},
+    )
+
+    assert (saved.status_code, saved.headers["location"]) == (303, f"{SETTINGS}?saved=1")
+    assert "Saved." in signed_in.get(saved.headers["location"]).text
+    visitor = TestClient(app, base_url=LOCAL)
+    page = visitor.get("/ui/login").text
+    assert 'Jorge<span class="accent">X</span> Social' in page
+    assert '<img class="wordmark-icon" src="/ui/icon"' in page
+    assert '<link rel="icon" href="/ui/icon">' in page
+    assert page.index("/ui/static/style.css") < page.index('href="/ui/appearance.css"')
+    assert "<title>Sign in · JorgeX Social</title>" in page
+    css = visitor.get("/ui/appearance.css")
+    assert css.text == "body { color: red; }"
+    assert css.headers["content-type"].startswith("text/css")
+    assert css.headers["x-content-type-options"] == "nosniff"
+    assert (visitor.get("/ui/icon").content, visitor.get("/ui/icon").headers["content-type"]) == (
+        PNG,
+        "image/png",
+    )
+
+
+def test_the_default_name_replaces_any_brand(app, signed_in):
+    for page in (TestClient(app, base_url=LOCAL).get("/ui/login").text, signed_in.get("/ui/").text):
+        assert "<title>" in page
+        assert "· Social</title>" in page
+        assert "Jorge" not in page
+        assert 'class="accent"' not in page
+
+
+def test_the_header_links_a_menu_that_signs_out(signed_in):
+    page = signed_in.get("/ui/").text
+    menu = page[page.index('<details class="profile-menu">') : page.index("</details>")]
+
+    assert 'aria-label="Account menu"' in menu
+    assert menu.index('href="/ui/settings"') < menu.index('action="/ui/logout"')
+    assert ">Settings</a>" not in page.replace(menu, "")
+    assert signed_in.post("/ui/logout", follow_redirects=False).status_code == 303
+    assert signed_in.get("/ui/", follow_redirects=False).headers["location"] == "/ui/login"
+
+
+def test_the_menu_is_not_on_the_sign_in_page(client):
+    assert "profile-menu" not in client.get("/ui/login").text
+
+
+@pytest.mark.parametrize("path", ["/ui/appearance.css", "/ui/icon"])
+def test_public_appearance_revalidates(app, signed_in, path):
+    visitor = TestClient(app, base_url=LOCAL)
+    first = visitor.get(path)
+    assert first.headers["cache-control"] == "no-cache"
+
+    etag = first.headers["etag"]
+    same = visitor.get(path, headers={"if-none-match": f'"other", W/{etag}'})
+    assert (same.status_code, same.content) == (304, b"")
+    assert same.headers["etag"] == etag
+
+    save(signed_in, css="a { color: red; }", files={"icon": ("x.png", PNG)})
+    assert visitor.get(path, headers={"if-none-match": etag}).status_code == 200
+
+
+def test_public_appearance_takes_no_write_lock(app, monkeypatch):
+    def forbidden():
+        raise AssertionError("a public appearance route opened a write session")
+
+    client = TestClient(app, base_url=LOCAL)
+    monkeypatch.setattr(app.state, "sessionmaker", forbidden)
+
+    assert client.get("/ui/appearance.css").text == ""
+    assert client.get("/ui/icon").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("data", "kind"),
+    [
+        (PNG, "image/png"),
+        (ICO, "image/x-icon"),
+        (SVG, "image/svg+xml"),
+        (b"\xef\xbb\xbf<?xml version='1.0'?>\n<!-- c --><!DOCTYPE svg>\n<svg/>", "image/svg+xml"),
+    ],
+)
+def test_the_icon_type_comes_from_its_content(app, signed_in, data, kind):
+    # The name and the part's Content-Type both say something else.
+    files = {"icon": ("notes.txt", data, "text/plain")}
+
+    assert save(signed_in, files=files).status_code == 303
+
+    icon = TestClient(app, base_url=LOCAL).get("/ui/icon")
+    assert (icon.content, icon.headers["content-type"]) == (data, kind)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"just some text",
+        b"<svgish></svgish>",
+        b"<html><svg></svg></html>",
+        b"\x00\x00\x01\x00\x00\x00",
+        b"\xff\xd8\xff\xe0 a jpeg",
+    ],
+)
+def test_anything_else_is_refused_and_the_form_keeps_what_was_entered(signed_in, data):
+    refused = save(
+        signed_in,
+        name="Kept",
+        css="a { color: red; }",
+        files={"icon": ("logo.png", data, "image/png")},
+    )
+
+    assert refused.status_code == 422
+    assert "The icon must be a PNG, ICO or SVG file." in refused.text
+    assert 'value="Kept"' in refused.text
+    assert "a { color: red; }</textarea>" in refused.text
+    assert "· Social</title>" in refused.text  # nothing saved
+    assert refused.headers["content-security-policy"].startswith("default-src 'none'")
+
+
+def test_limits(signed_in):
+    limit = appearance.MAX_CSS_BYTES
+
+    assert save(signed_in, css="a" * limit).status_code == 303
+    assert "The CSS is over 256 KB." in save(signed_in, css="a" * (limit + 1)).text
+    # Bytes, not characters.
+    assert save(signed_in, css="é" * (limit // 2 + 1)).status_code == 422
+    fits = PNG + b"p" * (appearance.MAX_ICON_BYTES - len(PNG))
+    assert save(signed_in, files={"icon": ("a.png", fits)}).status_code == 303
+    too_big = save(signed_in, files={"icon": ("a.png", fits + b"p")})
+    assert "The icon is over 256 KB." in too_big.text
+    assert save(signed_in, name="n" * 40).status_code == 303
+    assert "The name must be 1 to 40 characters." in save(signed_in, name="n" * 41).text
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+def test_an_empty_name_is_refused(signed_in, name):
+    refused = save(signed_in, name=name)
+
+    assert refused.status_code == 422
+    assert "The name must be 1 to 40 characters." in refused.text
+
+
+OVER_THE_CAP = b"name=" + b"a" * (1024 * 1024)
+URLENCODED = {"content-type": "application/x-www-form-urlencoded"}
+
+
+def _chunks():
+    yield OVER_THE_CAP[:1000]
+    yield OVER_THE_CAP[1000:]
+
+
+@pytest.mark.parametrize(
+    "request_args",
+    [
+        pytest.param({"content": OVER_THE_CAP, "headers": URLENCODED}, id="declared"),
+        pytest.param({"content": _chunks(), "headers": URLENCODED}, id="absent"),
+        pytest.param(
+            {"content": OVER_THE_CAP, "headers": {**URLENCODED, "content-length": "10"}},
+            id="false",
+        ),
+    ],
+)
+def test_a_body_over_one_megabyte_is_refused(app, signed_in, request_args):
+    response = signed_in.post(SETTINGS, **request_args)
+
+    assert response.status_code == 413
+    assert appearance_audit(app) == []
+
+
+def test_a_form_at_the_limits_of_css_and_icon_fits_the_body_cap(signed_in):
+    icon = PNG + b"p" * (appearance.MAX_ICON_BYTES - len(PNG))
+
+    saved = save(signed_in, css="a" * appearance.MAX_CSS_BYTES, files={"icon": ("a.png", icon)})
+
+    assert saved.status_code == 303
+
+
+def test_name_and_highlight_are_escaped_piece_by_piece(app, signed_in):
+    assert save(signed_in, name="<b>&<i>", name_highlight="&").status_code == 303
+
+    page = TestClient(app, base_url=LOCAL).get("/ui/login").text
+
+    assert '&lt;b&gt;<span class="accent">&amp;</span>&lt;i&gt;' in page
+    assert "<b>" not in page
+    assert "<title>Sign in · &lt;b&gt;&amp;&lt;i&gt;</title>" in page
+
+
+def test_only_the_first_occurrence_is_highlighted(app, signed_in):
+    assert save(signed_in, name="XaX", name_highlight="X").status_code == 303
+
+    page = TestClient(app, base_url=LOCAL).get("/ui/login").text
+
+    assert '<span class="accent">X</span>aX' in page
+
+
+@pytest.mark.parametrize(
+    ("name", "highlight"),
+    [("JorgeX", "x"), ("JorgeX", "Y"), ("Social", " Social")],
+)
+def test_a_highlight_not_in_the_name_is_refused(signed_in, name, highlight):
+    refused = save(signed_in, name=name, name_highlight=highlight)
+
+    assert refused.status_code == 422
+    assert "The highlight must be part of the name" in refused.text
+    assert f'value="{highlight}"' in refused.text
+
+
+def test_the_form_can_change_name_and_highlight_together(signed_in):
+    save(signed_in, name="JorgeX", name_highlight="X")
+
+    assert save(signed_in, name="Acme", name_highlight="me").status_code == 303
+
+    assert 'Ac<span class="accent">me</span>' in signed_in.get(SETTINGS).text
+
+
+def test_the_icon_cannot_be_replaced_and_removed_at_once(signed_in):
+    save(signed_in, files={"icon": ("a.png", PNG)})
+
+    refused = save(signed_in, clear_icon="on", files={"icon": ("b.png", ICO)})
+
+    assert refused.status_code == 422
+    assert "not both" in refused.text
+
+
+def test_removing_the_icon_brings_the_default_back(app, signed_in):
+    default = TestClient(app, base_url=LOCAL).get("/ui/icon").content
+    save(signed_in, files={"icon": ("a.png", PNG)})
+
+    assert 'name="clear_icon"' in signed_in.get(SETTINGS).text
+    assert save(signed_in, clear_icon="on").status_code == 303
+
+    assert TestClient(app, base_url=LOCAL).get("/ui/icon").content == default
+
+
+def test_reset_returns_the_defaults_and_audits_without_content(app, signed_in):
+    default = TestClient(app, base_url=LOCAL).get("/ui/icon").content
+    save(
+        signed_in,
+        name="Secret Brand",
+        name_highlight="Brand",
+        css="a { color: red; }",
+        files={"icon": ("a.png", PNG)},
+    )
+
+    # The button's form also sends the other fields, even invalid: they do not count.
+    assert save(signed_in, reset="1", name="").status_code == 303
+
+    visitor = TestClient(app, base_url=LOCAL)
+    assert "· Social</title>" in visitor.get("/ui/login").text
+    assert visitor.get("/ui/appearance.css").text == ""
+    assert visitor.get("/ui/icon").content == default
+    entries = appearance_audit(app)
+    assert [(actor, json.loads(detail)) for actor, detail in entries] == [
+        ("operator", {"changed": ["name", "name_highlight", "css", "icon"]}),
+        ("operator", {"changed": ["name", "name_highlight", "css", "icon"]}),
+    ]
+    assert "Secret" not in str(rows(app, "SELECT * FROM audit_log"))
+
+
+def test_only_real_changes_are_audited(app, signed_in):
+    save(signed_in, name="Acme", css="a { color: red; }\r\n")
+    # What a browser sends back unchanged: its textarea uses CRLF.
+    assert save(signed_in, name="Acme", css="a { color: red; }\r\n").status_code == 303
+
+    assert len(appearance_audit(app)) == 1
+
+
+def test_a_directly_opened_svg_icon_cannot_run_its_script(app, signed_in):
+    save(signed_in, files={"icon": ("a.svg", SVG)})
+
+    icon = TestClient(app, base_url=LOCAL).get("/ui/icon")
+
+    assert icon.content == SVG
+    assert icon.headers["content-type"] == "image/svg+xml"
+    assert icon.headers["x-content-type-options"] == "nosniff"
+    assert icon.headers["content-security-policy"] == (
+        "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+    )
+
+
+def test_the_default_icon_carries_the_same_headers_and_no_letter(client):
+    icon = client.get("/ui/icon")
+
+    assert icon.headers["content-type"] == "image/svg+xml"
+    assert "sandbox" in icon.headers["content-security-policy"]
+    assert b"<text" not in icon.content
+
+
+def test_the_sign_in_page_survives_an_unreadable_setting(app, client, caplog):
+    with app.state.sessionmaker() as session, session.begin():
+        session.execute(text("DROP TABLE settings"))
+
+    response = client.get("/ui/login")
+
+    assert response.status_code == 200
+    assert "· Social</title>" in response.text
+    assert "could not read the product name" in caplog.text
+
+
+# Everything can be themed
+
+
+def _stylesheet() -> str:
+    return (Path(appearance.__file__).parent.parent / "ui" / "static" / "style.css").read_text()
+
+
+def _outside_root(css: str) -> str:
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return re.sub(r"^:root \{.*?^\}", "", css, flags=re.M | re.S)
+
+
+LITERAL_COLOUR = re.compile(r"(?<!&)#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|hwb|oklch|lab)\(")
+COLOUR_WORDS = re.compile(
+    r"\b(?:black|white|gray|grey|red|green|blue|yellow|orange|purple|pink|cyan|magenta|silver"
+    r"|maroon|navy|teal|olive|lime|aqua|fuchsia)\b"
+)
+COLOUR_PROPERTY = re.compile(
+    r"(?:^|[;{\s])((?:background|color|fill|stroke|border|outline|box-shadow|text-shadow"
+    r"|caret-color|accent-color)[\w-]*)\s*:([^;}]*)",
+    re.M,
+)
+TEMPLATES = Path(appearance.__file__).parent.parent / "ui" / "templates"
+
+
+def test_the_stylesheet_has_no_literal_colour_outside_its_tokens():
+    css = _outside_root(_stylesheet())
+
+    assert LITERAL_COLOUR.findall(css) == []
+    declarations = COLOUR_PROPERTY.findall(css)
+    assert declarations  # the pattern still matches something
+    assert [d for d in declarations if COLOUR_WORDS.search(d[1])] == []
+
+
+def test_every_variable_the_stylesheet_uses_is_a_token():
+    used = set(re.findall(r"var\((--[\w-]+)", _stylesheet()))
+
+    # A pill's own parameter: each pill class sets it from a token.
+    assert used - {"--tone"} <= set(appearance.VARIABLES)
+    assert set(appearance.VARIABLES) <= used
+
+
+def test_templates_and_charts_paint_only_through_the_stylesheet():
+    chart = TEMPLATES.parent / "chart.py"
+    for path in [*TEMPLATES.iterdir(), chart]:
+        source = path.read_text()
+        assert "style=" not in source, path
+        assert LITERAL_COLOUR.findall(source) == [], path
+        painted = re.findall(r"""\b(?:fill|stroke)=["']([^"']*)""", source)
+        assert set(painted) <= {"currentColor", "none"}, path
+
+
+def test_the_tokens_keep_the_default_look():
+    assert {
+        name: appearance.VARIABLES[name]
+        for name in ("--bg", "--accent", "--accent-hover", "--accent-2", "--on-accent", "--shadow")
+    } == {
+        "--bg": "#101113",
+        "--accent": "#22d3ee",
+        "--accent-hover": "#67e8f9",
+        "--accent-2": "#a78bfa",
+        "--on-accent": "#101113",
+        "--shadow": "#000000",
+    }
+
+
+def test_the_page_lists_exactly_the_tokens_and_a_complete_light_theme(signed_in):
+    page = signed_in.get(SETTINGS).text
+
+    listed = re.findall(r'<td class="mono">(--[\w-]+)</td>', page)
+    assert listed == list(appearance.VARIABLES)
+    assert '<td class="mono">--accent</td><td class="mono">#22d3ee</td>' in page
+    assert "--cyan-400" not in page
+    assert ".wordmark-icon" in page and ".wordmark .accent" in page
+    # The example changes every colour, so nothing dark is left behind on a light page.
+    colours = {name for name, value in appearance.VARIABLES.items() if value.startswith("#")}
+    assert colours <= set(re.findall(r"(--[\w-]+):", appearance.LIGHT_THEME))
+    assert "color-scheme: light;" in appearance.LIGHT_THEME
+    assert appearance.warnings(appearance.LIGHT_THEME) == []
+
+
+def test_an_unknown_custom_property_is_saved_with_a_notice(app, signed_in):
+    css = """
+    /* --in-a-comment: 1; */
+    :root { --colr-bg: red; --accent: blue; --colr-bg: pink; }
+    a { color: var(--not-declared-here); }
+    .x { --tone: red; }
+    """
+
+    saved = save(signed_in, css=css)
+
+    assert saved.status_code == 303
+    page = signed_in.get(saved.headers["location"]).text
+    assert page.count('class="notice warning"') == 1
+    assert "--colr-bg is not a variable of this interface and does nothing" in page
+    assert TestClient(app, base_url=LOCAL).get("/ui/appearance.css").text.strip().startswith("/*")
+
+
+def test_the_page_of_a_refused_save_reports_on_the_css_entered(signed_in):
+    refused = save(signed_in, name="", css=":root { --colr-bg: red; }")
+
+    assert refused.status_code == 422
+    assert "--colr-bg is not a variable" in refused.text
+
+
+def test_cli_reset_appearance_recovers_and_audits(app, signed_in, cli_env, capsys):
+    save(signed_in, name="Acme", css="body { display: none; }")
+    capsys.readouterr()
+
+    main(["reset-appearance"])
+
+    assert json.loads(capsys.readouterr().out) == {"reset": ["name", "css"]}
+    visitor = TestClient(app, base_url=LOCAL)
+    assert "· Social</title>" in visitor.get("/ui/login").text
+    assert visitor.get("/ui/appearance.css").text == ""
+    (actor, detail) = appearance_audit(app)[-1]
+    assert (actor, json.loads(detail)) == ("operator", {"changed": ["name", "css"]})

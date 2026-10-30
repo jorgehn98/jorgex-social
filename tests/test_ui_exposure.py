@@ -15,7 +15,7 @@ from sqlalchemy import text
 
 from jorgex_social.access import operator
 from jorgex_social.access.limits import RateLimiter, client_key
-from jorgex_social.account import crypto
+from jorgex_social.account import appearance, crypto
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.ui.routes import BUSY, COOKIE, INVALID, TOO_MANY, safe_next
@@ -407,8 +407,8 @@ def test_what_the_proxy_publishes_still_answers(app):
     assert client.get("/health").status_code == 200
     assert client.get("/ui/login").status_code == 200
     assert client.get("/ui/static/style.css").status_code == 200
-    assert '<link rel="icon" href="/ui/static/favicon.svg"' in client.get("/ui/login").text
-    assert client.get("/ui/static/favicon.svg").headers["content-type"].startswith("image/svg+xml")
+    assert client.get("/ui/icon").headers["content-type"].startswith("image/svg+xml")
+    assert client.get("/ui/appearance.css").status_code == 200
     assert client.get("/v1x").status_code == 404  # an unknown path, as before
 
 
@@ -418,3 +418,26 @@ def test_through_the_proxy_nothing_is_audited_for_the_api(app, caplog):
 
     assert "unauthenticated" not in caplog.text
     assert audit_rows(app) == 0
+
+
+def test_the_appearance_api_is_not_public_but_what_pages_need_is(app):
+    client = TestClient(app, headers=VIA_PROXY)
+
+    assert client.get("/v1/appearance").status_code == 404
+    assert client.put("/v1/appearance", json={"name": "Hacked"}).status_code == 404
+    assert client.get("/ui/settings", follow_redirects=False).status_code == 303
+    assert client.get("/ui/icon").status_code == 200
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_the_consent_card_shows_the_name_and_icon_without_the_menu(app, clock):
+    client = browser(app)
+    assert attempt(client, clock, password=PASSWORD).status_code == 303
+    with app.state.sessionmaker() as session, session.begin():
+        appearance.update(session, clock.now(), name="Acme One", name_highlight="One")
+
+    page = client.get("/ui/oauth/consent?req=gone").text
+
+    assert 'Acme <span class="accent">One</span>' in page
+    assert '<img class="wordmark-icon" src="/ui/icon"' in page
+    assert "profile-menu" not in page

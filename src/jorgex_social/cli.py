@@ -18,6 +18,7 @@ from jorgex_social import logs, worker
 from jorgex_social.access import operator
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
+from jorgex_social.account import appearance
 from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
 from jorgex_social.account.credential import NotConnected
 from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
@@ -159,6 +160,14 @@ def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
     with sessions() as session, session.begin():
         operator.enroll_totp(session, network_for(settings), key, secret, code, SystemClock().now())
     print("Second factor enrolled; every browser was signed out and every OAuth grant revoked.")
+
+
+def cmd_reset_appearance(_: argparse.Namespace, settings: Settings) -> None:
+    """The way back when the operator's own CSS hides the page that could undo it."""
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        changed = appearance.update_by_operator(session, SystemClock().now(), reset=True)
+    print(json.dumps({"reset": changed}))
 
 
 def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
@@ -326,6 +335,11 @@ def build_parser() -> argparse.ArgumentParser:
         "enroll-totp", help="set up the operator's second factor (TOTP), confirming one code"
     )
 
+    sub.add_parser(
+        "reset-appearance",
+        help="put the web interface's name, CSS and icon back to the defaults",
+    )
+
     serve = sub.add_parser("serve", help="run the API server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -360,6 +374,8 @@ def main(argv: list[str] | None = None) -> None:
                 cmd_set_password(args, settings)
             case "enroll-totp":
                 cmd_enroll_totp(args, settings)
+            case "reset-appearance":
+                cmd_reset_appearance(args, settings)
             case "serve":
                 cmd_serve(args, settings)
             case "worker":

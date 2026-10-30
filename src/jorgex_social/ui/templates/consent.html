@@ -5,14 +5,14 @@
   {% include "_particles.svg" %}
   {% if error %}
   <div class="card">
-    <span class="wordmark">Jorge<span class="x">X</span> Social</span>
+    <span class="wordmark">{% include "_wordmark.html" %}</span>
     <h1>Connect a client</h1>
     <p class="notice" role="alert">{{ error }}</p>
     <p><a href="/ui/">Back to the interface</a></p>
   </div>
   {% else %}
   <form class="card" method="post" action="/ui/oauth/consent">
-    <span class="wordmark">Jorge<span class="x">X</span> Social</span>
+    <span class="wordmark">{% include "_wordmark.html" %}</span>
     <h1>Connect a client</h1>
     <p>A client calling itself <strong>{{ client_name or "(no name)" }}</strong> <span class="muted">(unverified)</span> asks to use this account.</p>
     <p class="muted">Your answer goes back to <code>{{ host }}{% if port %}:{{ port }}{% endif %}</code>. Approve only a connection you started yourself, and only the groups it needs.</p>

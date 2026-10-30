@@ -16,6 +16,7 @@ connect again with `connect-instagram --replace`.
 - [Start in simulation](#start-in-simulation)
 - [Reverse proxy](#reverse-proxy)
 - [Web interface](#web-interface)
+- [Your own look](#your-own-look)
 - [Create your Meta app](#create-your-meta-app)
 - [Switch to real mode](#switch-to-real-mode)
 - [Webhook](#webhook)
@@ -122,9 +123,9 @@ social.example.com {
 		method GET HEAD POST
 	}
 	handle @ui {
-		# The sign-in form is the largest body here; the service refuses more than 4 KB.
+		# Settings, with its CSS and icon, is the largest body here; the service refuses more than 1 MB.
 		request_body {
-			max_size 16KB
+			max_size 1MB
 		}
 		reverse_proxy 127.0.0.1:8000 {
 			header_up X-Forwarded-For {remote_host}
@@ -206,9 +207,10 @@ Point the MCP server at `http://localhost:8000` while the tunnel is open (see
 
 ## Web interface
 
-A read-only web interface at `/ui` shows the connection, scheduled and published posts, insights,
-rules, events and incidents. It cannot change anything; agents and scripts keep using the API. It is
-for one operator, who signs in with a password and a TOTP code from an authenticator app:
+A web interface at `/ui` shows the connection, scheduled and published posts, insights, rules, events
+and incidents. Only Settings can change anything, and only with a recent sign-in (see
+[Your own look](#your-own-look)); agents and scripts keep using the API. It is for one operator, who
+signs in with a password and a TOTP code from an authenticator app:
 
 ```sh
 docker compose exec api jorgex-social create-operator   # asks for the password (12+ characters)
@@ -220,12 +222,13 @@ app, and only enables it once you type a code the app shows. Running it again re
 factor; `set-password` changes the password. Both sign every browser out.
 
 With the proxy above, open `https://social.example.com/ui/`. `JORGEX_SOCIAL_PUBLIC_URL` must be that
-same origin: every form the interface posts (signing in and out) must come from it, which is what
+same origin: every form the interface posts (signing in and out, Settings) must come from it, which is what
 stops another site from posting on your behalf. Through the SSH tunnel, `http://localhost:8000/ui/`
 works too. The session cookie is `Secure` for every host except a loopback one (`localhost`,
 `127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it. Sessions last 7 days at
-most and end after 24 hours without activity. The OAuth consent page alone asks for your password
-and code again when you signed in over an hour ago; the rest of the interface stays signed in.
+most and end after 24 hours without activity. The OAuth consent page and Settings ask for your
+password and code again when you signed in over an hour ago; the rest of the interface stays signed
+in.
 
 Each client address (IPv6: each `/64`) gets 5 sign-in attempts a minute and 20 an hour
 (`JORGEX_SOCIAL_LOGIN_LIMIT_PER_MINUTE`, `JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR`); beyond that the
@@ -302,6 +305,32 @@ back to the machine that asked. A client that needs an https redirect must be li
 to 10 a minute and 30 an hour, and `/authorize`, `/token`, `/revoke` and `/upload` to 30 a minute
 and 300 an hour between the four of them, one budget they share. Clients nobody approved are
 forgotten after an hour.
+
+## Your own look
+
+The interface ships with a neutral name and icon. To set your own, open the profile menu at the top
+right and go to Settings, Appearance:
+
+- **Product name**, 1 to 40 characters, shown in the header, on the sign-in page and in the title.
+  You can pick a part of it to show in the accent colour.
+- **Custom CSS**, up to 256 KB, loaded after the default stylesheet. Every colour of the interface is
+  a CSS variable; the page lists them all with their defaults and has a complete light theme to copy.
+  A custom property that is not on the list gets a notice in case it is a typo, and is saved all the
+  same. The pages' Content-Security-Policy limits your CSS to resources from this site, with no script.
+- **Icon**, a PNG, ICO or SVG file up to 256 KB, used as the favicon and beside the name.
+
+The name, CSS and icon are public, because the sign-in page needs them, so put nothing private there.
+They live in the database, so your backups carry them. Agents use `GET` and `PUT /v1/appearance` with
+the `account` group, or the MCP tools `get_appearance` and `set_appearance`.
+
+CSS can hide the page that would undo it (`body { display: none }`). To recover, on the server:
+
+```sh
+docker compose exec api jorgex-social reset-appearance
+```
+
+Upgrading an existing installation: raise your proxy's request body limit for `/ui` to 1 MB, as in
+[the example above](#reverse-proxy), or saving a large CSS or icon fails with 413.
 
 ## Create your Meta app
 

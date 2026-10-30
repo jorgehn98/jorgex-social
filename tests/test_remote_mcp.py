@@ -93,7 +93,14 @@ async def test_an_agent_with_only_the_url_uses_the_tools_its_grant_allows(app, c
 
     # Every tool is registered (permissions are the token's), except the one that reads a local
     # path, which the upload URL replaces.
-    assert {"get_account", "set_kill_switch", "create_upload_url", "create_post"} <= names
+    assert {
+        "get_account",
+        "set_kill_switch",
+        "get_appearance",
+        "set_appearance",
+        "create_upload_url",
+        "create_post",
+    } <= names
     assert "upload_media" not in names
     assert catalog_answer[0] == "ok" and "post_types" in catalog_answer[1]
     assert denied == ("error", denied[1])

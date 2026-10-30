@@ -28,8 +28,8 @@ READ_POSTS = {"get_catalog", "list_posts", "get_post"}
 WRITE_POSTS = {"upload_media", "create_post", "update_post"}
 SCHEDULING = {"schedule_post", "publish_now", "cancel_post", "resolve_post"}
 STATS = {"account_stats", "media_stats", "media_history", "list_instagram_media"}
-READ_ACCOUNT = {"get_account", "list_incidents", "audit_log"}
-WRITE_ACCOUNT = {"acknowledge_incident", "set_kill_switch"}
+READ_ACCOUNT = {"get_account", "list_incidents", "audit_log", "get_appearance"}
+WRITE_ACCOUNT = {"acknowledge_incident", "set_kill_switch", "set_appearance"}
 READ_RULES = {"list_rules", "get_rule", "test_rules"}
 WRITE_RULES = {
     "create_rule",
@@ -614,3 +614,25 @@ async def test_update_refuses_a_field_both_given_and_cleared(app, transport):
     assert (outcome, error["code"]) == ("error", "invalid_value")
     assert "source_ref" in error["message"]
     assert len(transport.calls) == calls_before
+
+
+async def test_appearance_tools(app, transport):
+    async with Client(server_for(app, transport, account="write")) as client:
+        before = await call(client, "get_appearance")
+        saved = await call(
+            client,
+            "set_appearance",
+            name="Acme One",
+            name_highlight="One",
+            css=":root { --colr-bg: red; }",
+        )
+        refused = await call(client, "set_appearance", name="Other")
+
+    assert before[0] == "ok"
+    assert (before[1]["name"], before[1]["icon"]) == ("Social", None)
+    assert before[1]["variables"]["--accent"] == "#22d3ee"
+    assert saved[0] == "ok"
+    assert (saved[1]["name"], saved[1]["name_highlight"]) == ("Acme One", "One")
+    assert "--colr-bg" in saved[1]["warnings"][0]
+    assert refused[0] == "error"
+    assert (refused[1]["status"], refused[1]["code"]) == (422, "invalid_appearance")

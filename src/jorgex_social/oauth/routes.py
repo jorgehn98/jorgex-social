@@ -4,7 +4,6 @@ session and its cookie (Path=/ui) already live."""
 
 import logging
 from datetime import timedelta
-from typing import Annotated
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -24,20 +23,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, request_response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from jorgex_social.access import operator
 from jorgex_social.access.limits import RateLimiter, client_key
-from jorgex_social.access.models import OperatorSession
 from jorgex_social.access.tokens import Group, Level, TokenError, normalize_permissions
 from jorgex_social.oauth import store
 from jorgex_social.oauth.provider import Provider
-from jorgex_social.ui.routes import (
-    HEADERS,
-    SignInTooOld,
-    read_form,
-    render,
-    require_operator,
-    same_origin,
-)
+from jorgex_social.ui.routes import HEADERS, RecentSignIn, read_form, render, same_origin
 
 log = logging.getLogger(__name__)
 
@@ -132,26 +122,13 @@ consent = APIRouter(
 )
 
 
-def require_recent_sign_in(
-    request: Request, signed_in: Annotated[OperatorSession, Depends(require_operator)]
-) -> OperatorSession:
-    """Runs before the page binds the request to a session: bound to this old one, it would be
-    refused to the new session that signing in again creates."""
-    if request.app.state.clock.now() - signed_in.created_at >= operator.CONSENT_MAX_SIGN_IN_AGE:
-        raise SignInTooOld
-    return signed_in
-
-
-SignedIn = Annotated[OperatorSession, Depends(require_recent_sign_in)]
-
-
 def _origin(uri: str) -> str:
     parts = urlsplit(uri)
     return f"{parts.scheme}://{parts.netloc}"
 
 
 @consent.get("/consent")
-def consent_page(request: Request, signed_in: SignedIn, req: str = ""):
+def consent_page(request: Request, signed_in: RecentSignIn, req: str = ""):
     state = request.app.state
     with state.sessionmaker() as session, session.begin():
         opened = store.open_request(session, req, signed_in.id_hash, state.clock.now())
@@ -181,7 +158,7 @@ def consent_page(request: Request, signed_in: SignedIn, req: str = ""):
 
 
 @consent.post("/consent")
-async def consent_answer(request: Request, signed_in: SignedIn):
+async def consent_answer(request: Request, signed_in: RecentSignIn):
     form = await read_form(request)
     decision = form.get("decision")
     permissions = None
