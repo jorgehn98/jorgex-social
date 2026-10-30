@@ -23,6 +23,7 @@ from jorgex_social.account import crypto
 from jorgex_social.api import create_app
 from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
+from jorgex_social.config import Settings
 
 PUBLIC = "http://localhost"
 RESOURCE = f"{PUBLIC}/mcp"
@@ -333,12 +334,21 @@ def test_loopback_redirects_are_registered_without_a_secret(agent, uri):
     assert "client_secret" not in response.json()
 
 
-def test_a_listed_https_redirect_is_accepted(settings, clock):
-    listed = "https://client.example/callback"
-    agent = TestClient(create_app(replace(settings, oauth_redirect_uris=(listed,)), clock))
+@pytest.mark.parametrize(
+    ("listed", "registered"),
+    [
+        ("https://client.example/callback", "https://client.example/callback"),
+        ("HTTPS://Client.Example:443/callback", "https://client.example/callback"),
+        ("https://client.example", "https://client.example"),
+    ],
+)
+def test_a_listed_https_redirect_is_accepted(settings, clock, listed, registered):
+    configured = Settings.from_env({"JORGEX_SOCIAL_OAUTH_REDIRECT_URIS": listed})
+    allowed = replace(settings, oauth_redirect_uris=configured.oauth_redirect_uris)
+    agent = TestClient(create_app(allowed, clock))
 
-    assert register(agent, redirect_uris=[listed]).status_code == 201
-    assert register(agent, redirect_uris=[listed + "/other"]).status_code == 400
+    assert register(agent, redirect_uris=[registered]).status_code == 201
+    assert register(agent, redirect_uris=["https://client.example/other"]).status_code == 400
 
 
 def test_a_client_nobody_approved_is_forgotten_after_an_hour(app, agent, clock):

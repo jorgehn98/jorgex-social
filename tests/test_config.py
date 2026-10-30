@@ -129,5 +129,11 @@ def test_oauth_redirect_uris_are_https_only():
         "https://a.example/cb",
         "https://b.example/cb",
     )
+    # As the SDK parses what a client registers.
+    loose = {"JORGEX_SOCIAL_OAUTH_REDIRECT_URIS": "HTTPS://A.Example:443/cb, https://b.example"}
+    assert Settings.from_env(loose).oauth_redirect_uris == (
+        "https://a.example/cb",
+        "https://b.example",
+    )
     with pytest.raises(ValueError, match="https URIs only"):
         Settings.from_env({"JORGEX_SOCIAL_OAUTH_REDIRECT_URIS": "http://a.example/cb"})

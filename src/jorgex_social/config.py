@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import AnyUrl, ConfigDict, TypeAdapter
+
 ENV_PREFIX = "JORGEX_SOCIAL_"
 # Above the 7-day private-reply window plus the one-day margin the reply task keeps before
 # retention (replies/task.py), so nothing still answerable is ever purged.
@@ -24,12 +26,20 @@ def _positive(env, name: str, default: int) -> int:
     return value
 
 
+# The SDK's client metadata models parse URLs this way (url_preserve_empty_path).
+_URL = TypeAdapter(AnyUrl, config=ConfigDict(url_preserve_empty_path=True))
+
+
 def _https_uris(value: str) -> tuple[str, ...]:
-    uris = tuple(uri.strip() for uri in value.split(",") if uri.strip())
-    for uri in uris:
-        if not uri.startswith("https://"):
+    """Normalised as the OAuth SDK parses the redirect URIs a client registers (lower-case scheme
+    and host, no default port; an empty path kept empty), so the exact comparison can match."""
+    uris = []
+    for entry in filter(None, (part.strip() for part in value.split(","))):
+        uri = _URL.validate_python(entry)
+        if uri.scheme != "https":
             raise ValueError(f"{ENV_PREFIX}OAUTH_REDIRECT_URIS takes https URIs only")
-    return uris
+        uris.append(str(uri))
+    return tuple(uris)
 
 
 @dataclass(frozen=True)
