@@ -269,14 +269,14 @@ def test_only_the_hash_of_the_session_id_is_stored(app, client, clock):
 
 
 @pytest.mark.usefixtures("enrolled")
-def test_idle_session_expires_after_an_hour(client, clock):
+def test_idle_session_expires_after_a_day(client, clock):
     log_in(client, clock)
 
-    clock.advance(minutes=59)
+    clock.advance(hours=23)
     assert client.get("/ui/", follow_redirects=False).status_code == 200  # activity recorded
-    clock.advance(minutes=59)
+    clock.advance(hours=23)
     assert client.get("/ui/", follow_redirects=False).status_code == 200
-    clock.advance(minutes=61)
+    clock.advance(hours=24)
     response = client.get("/ui/", follow_redirects=False)
 
     assert response.status_code == 303
@@ -284,13 +284,15 @@ def test_idle_session_expires_after_an_hour(client, clock):
 
 
 @pytest.mark.usefixtures("enrolled")
-def test_session_expires_after_twelve_hours_even_when_active(client, clock):
+def test_session_expires_after_seven_days_even_when_active(client, clock):
     log_in(client, clock)
-    for _ in range(14):  # 11 h 40 min of activity
-        clock.advance(minutes=50)
+    for _ in range(7):  # 161 h of activity
+        clock.advance(hours=23)
         assert client.get("/ui/", follow_redirects=False).status_code == 200
 
-    clock.advance(minutes=21)
+    clock.advance(hours=6, minutes=59)
+    assert client.get("/ui/", follow_redirects=False).status_code == 200
+    clock.advance(minutes=1)
 
     assert client.get("/ui/", follow_redirects=False).status_code == 303
 

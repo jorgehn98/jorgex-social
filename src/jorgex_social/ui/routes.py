@@ -66,6 +66,10 @@ class LoginRequired(Exception):
     pass
 
 
+class SignInTooOld(LoginRequired):
+    """The session is valid but too old for this page: its cookie still serves the others."""
+
+
 def _is_loopback(host: str | None) -> bool:
     if host == "localhost":
         return True
@@ -153,13 +157,14 @@ def render(request: Request, name: str, status_code: int = 200, **context) -> Re
     )
 
 
-def _login_redirect(request: Request, _: LoginRequired) -> Response:
+def _login_redirect(request: Request, reason: LoginRequired) -> Response:
     location = "/ui/login"
     back = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     if request.method == "GET" and safe_next(back) == back != HOME:
         location += "?" + urlencode({"next": back})
     response = RedirectResponse(location, status_code=303, headers=HEADERS)
-    if COOKIE in request.cookies:  # expired or unknown: no use keeping it
+    # Expired or unknown: no use keeping it.
+    if COOKIE in request.cookies and not isinstance(reason, SignInTooOld):
         response.delete_cookie(COOKIE, path="/ui")
     return response
 
