@@ -71,16 +71,17 @@ same way. The API reference is at `/docs` in simulation; in real mode it answers
 
 ## Reverse proxy
 
-Only three paths need to be public: `/m/*`, the short-lived media URLs Instagram downloads from to
-publish, `/health`, and `/webhook`, where Meta notifies new comments and messages (see
-[Webhook](#webhook)). The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an
-SSH tunnel (below). A [Caddy](https://caddyserver.com/) site on the same host, which also obtains the
-HTTPS certificate; replace the domain with yours:
+Only a few paths need to be public: `/ui`, the web interface (see [Web interface](#web-interface)),
+`/m/*`, the short-lived media URLs Instagram downloads from to publish, `/health`, and `/webhook`,
+where Meta notifies new comments and messages (see [Webhook](#webhook)). Everything else answers 404
+at the proxy. The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an SSH tunnel
+(below). A [Caddy](https://caddyserver.com/) site on the same host, which also obtains the HTTPS
+certificate; replace the domain with yours:
 
 ```caddyfile
 social.example.com {
 	header {
-		# Start modest; raise max-age once HTTPS on this domain is known to work.
+		# Start modest; raise max-age to a year (31536000) once HTTPS on this domain is known to work.
 		Strict-Transport-Security "max-age=86400"
 		X-Content-Type-Options nosniff
 		Referrer-Policy no-referrer
@@ -97,7 +98,9 @@ social.example.com {
 		request_body {
 			max_size 1KB
 		}
-		reverse_proxy 127.0.0.1:8000
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Forwarded-For {remote_host}
+		}
 	}
 	@webhook {
 		path /webhook
@@ -108,7 +111,22 @@ social.example.com {
 		request_body {
 			max_size 1MB
 		}
-		reverse_proxy 127.0.0.1:8000
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+	@ui {
+		path /ui /ui/*
+		method GET HEAD POST
+	}
+	handle @ui {
+		# The sign-in form is the largest body here; the service refuses more than 4 KB.
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Forwarded-For {remote_host}
+		}
 	}
 
 	handle {
@@ -116,6 +134,32 @@ social.example.com {
 	}
 }
 ```
+
+`header_up X-Forwarded-For {remote_host}` **replaces** whatever the client sent with the address it
+connected from; never let the proxy append to a client's header. The service believes that header
+only from the proxy (`JORGEX_SOCIAL_FORWARDED_ALLOW_IPS`), and limits sign-in attempts per address.
+With Docker, the proxy reaches the container from the gateway of the network `compose.yaml` defines
+(`172.30.250.1` unless you set `JORGEX_SOCIAL_DOCKER_SUBNET` and `JORGEX_SOCIAL_DOCKER_GATEWAY` in
+`.env`), so that is the address trusted. Without Docker the default trusts `127.0.0.1` and `::1`.
+
+The service also answers 404 to `/v1`, `/docs`, `/redoc` and `/openapi.json` for any request that
+carries `X-Forwarded-For` (or `Forwarded`, or `X-Real-IP`), so a mistake in the proxy's allowlist
+does not publish the API. A proxy other than Caddy must set `X-Forwarded-For` on every request it
+forwards for both protections to work.
+
+Check that the service sees real addresses once the proxy is up: sign in once with a wrong
+password from your browser through the public URL, then look at the access log:
+
+```sh
+docker compose logs api | grep '/ui/login'
+```
+
+The line must show your own public address. If it shows the Docker gateway (`172.30.250.1`) instead,
+the trusted address does not match the proxy and every visitor shares one sign-in limit, yours
+included: fix `JORGEX_SOCIAL_FORWARDED_ALLOW_IPS` (or the two Docker variables) before going on.
+
+Caddy writes no access log unless you add a `log` directive; if you do, it already redacts the
+`Authorization` and `Cookie` headers, so leave `log_credentials` off.
 
 To use the API from your machine, open a tunnel and talk to `localhost` as if the API ran there:
 
@@ -125,8 +169,7 @@ curl -H "Authorization: Bearer jxs_your_token_here" http://localhost:8000/v1/tok
 ```
 
 Point the MCP server at `http://localhost:8000` while the tunnel is open (see
-[MCP server](README.md#mcp-server)). Exposing `/v1` publicly also works, since every call needs a
-token, but then add a rate limit at the proxy so nobody can hammer it with guessed tokens.
+[MCP server](README.md#mcp-server)).
 
 ## Web interface
 
@@ -141,15 +184,20 @@ docker compose exec api jorgex-social enroll-totp       # shows an otpauth:// UR
 
 `enroll-totp` prints the secret as an `otpauth://` URI (and as a plain key) for your authenticator
 app, and only enables it once you type a code the app shows. Running it again replaces the second
-factor; `set-password` changes the password. Both sign every browser out. Five failed sign-ins in a
-row lock the operator out for 15 minutes; `set-password` lifts the lock.
+factor; `set-password` changes the password. Both sign every browser out.
 
-Like the API, `/ui` is not public with the recommended proxy. Open the SSH tunnel and browse to
-`http://localhost:8000/ui/`. The session cookie is `Secure` for every host except a loopback one
-(`localhost`, `127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it; if you put
-`/ui` behind a proxy, serve it over HTTPS and rate-limit `POST /ui/login` there: each attempt costs
-an argon2 check, and the lockout protects the password, not the server's CPU. Sessions last 12 hours
-at most and end after an hour without activity.
+With the proxy above, open `https://social.example.com/ui/`. `JORGEX_SOCIAL_PUBLIC_URL` must be that
+same origin: every form the interface posts (signing in and out) must come from it, which is what
+stops another site from posting on your behalf. Through the SSH tunnel, `http://localhost:8000/ui/`
+works too. The session cookie is `Secure` for every host except a loopback one (`localhost`,
+`127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it. Sessions last 12 hours at
+most and end after an hour without activity.
+
+Each client address (IPv6: each `/64`) gets 5 sign-in attempts a minute and 20 an hour
+(`JORGEX_SOCIAL_LOGIN_LIMIT_PER_MINUTE`, `JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR`); beyond that the
+service answers 429 without checking anything. There is no account lockout, so nobody can keep you
+out by failing on purpose from elsewhere. Password checks are expensive by design; at most two run at
+once, and a sign-in that cannot get a turn within two seconds gets 503.
 
 ## Create your Meta app
 

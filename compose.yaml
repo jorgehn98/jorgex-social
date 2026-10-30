@@ -10,6 +10,10 @@ x-service: &service
     JORGEX_SOCIAL_DATABASE_PATH: /data/jorgex-social.db
     JORGEX_SOCIAL_MEDIA_DIR: /data/media
     JORGEX_SOCIAL_SECRET_KEY_FILE: /data/secret.key
+    # The reverse proxy on the host reaches the service from this network's gateway (below), so
+    # that is the one peer whose X-Forwarded-For is believed: the client address the sign-in
+    # limit counts. The SSH tunnel arrives from the gateway too, and adds no such header.
+    JORGEX_SOCIAL_FORWARDED_ALLOW_IPS: ${JORGEX_SOCIAL_DOCKER_GATEWAY:-172.30.250.1}
   volumes:
     - data:/data
   # A real PID 1 (tini) forwards signals; without it, a SIGTERM that arrives while Python is still
@@ -58,3 +62,12 @@ services:
 
 volumes:
   data:
+
+networks:
+  default:
+    # A fixed subnet, so the gateway trusted above is known in advance. If it collides with a
+    # network you already have, set both variables in .env (the gateway inside the subnet).
+    ipam:
+      config:
+        - subnet: ${JORGEX_SOCIAL_DOCKER_SUBNET:-172.30.250.0/24}
+          gateway: ${JORGEX_SOCIAL_DOCKER_GATEWAY:-172.30.250.1}
