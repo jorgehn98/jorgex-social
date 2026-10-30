@@ -98,11 +98,13 @@ def same_origin(request: Request) -> None:
     """CSRF check for every form post, on top of the SameSite=Strict cookie. The Origin must be
     the configured public URL (not whatever Host says), or a loopback one when the request did
     not come through the proxy: that is the SSH tunnel. Browsers send Origin on every POST; a
-    request with neither Origin nor Sec-Fetch-Site is not from a browser form, and is refused."""
+    request with neither Origin nor Sec-Fetch-Site is not from a browser form, and is refused.
+    Our own Referrer-Policy (no-referrer) makes browsers send `Origin: null` on these posts, so
+    a null Origin falls back to Sec-Fetch-Site, which a page cannot set."""
     if request.method != "POST":
         return
     origin = request.headers.get("origin")
-    if origin is None:
+    if origin is None or origin == "null":
         if request.headers.get("sec-fetch-site") == "same-origin":
             return
         raise HTTPException(403)

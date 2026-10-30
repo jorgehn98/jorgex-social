@@ -276,6 +276,9 @@ def _post_login(app, headers, client=("198.51.100.1", 50000), base_url=LOCAL):
         ({"origin": "http://localhost.evil.example.net"}, False),
         ({}, False),  # neither Origin nor Sec-Fetch-Site: not a browser form
         ({"sec-fetch-site": "same-origin"}, True),
+        # What a browser sends under our Referrer-Policy: no-referrer.
+        ({"origin": "null", "sec-fetch-site": "same-origin", **VIA_PROXY}, True),
+        ({"origin": "null", "sec-fetch-site": "cross-site", **VIA_PROXY}, False),
         ({"sec-fetch-site": "cross-site"}, False),
         ({"sec-fetch-site": "same-site"}, False),
     ],
