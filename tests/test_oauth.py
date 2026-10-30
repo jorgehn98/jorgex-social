@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -19,6 +20,7 @@ from sqlalchemy import text
 from jorgex_social.access import operator
 from jorgex_social.account import crypto
 from jorgex_social.api import create_app
+from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
 
 PUBLIC = "http://localhost"
@@ -733,3 +735,39 @@ def test_changing_the_credentials_ends_every_grant(app, settings, agent, browser
 
     assert api(agent, tokens["access_token"]).status_code == 401
     assert rows(app, "SELECT revoked_at FROM oauth_grants")[0].revoked_at is not None
+
+
+# The command line
+
+
+def test_grants_are_listed_and_revoked_from_the_cli(
+    app, settings, agent, browser, monkeypatch, capsys
+):
+    client_id, tokens = connect(agent, browser, posts="read")
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+
+    main(["list-grants"])
+    listing = capsys.readouterr().out
+    grant = json.loads(listing)[0]
+    main(["revoke-grant", "--id", grant["id"]])
+    capsys.readouterr()
+
+    assert grant["client_name"] == "Test agent"
+    assert grant["permissions"] == {**ALL_DENIED, "posts": "read"}
+    assert tokens["access_token"] not in listing and tokens["refresh_token"] not in listing
+    assert api(agent, tokens["access_token"]).status_code == 401
+    # The client stays registered and can ask again with the same id.
+    _, verifier, code = code_for(agent, browser, client_id=client_id, posts="read")
+    assert exchange(agent, client_id, code, verifier).status_code == 200
+
+
+def test_the_cli_can_revoke_every_grant(settings, agent, browser, monkeypatch, capsys):
+    _, first = connect(agent, browser, posts="read")
+    _, second = connect(agent, browser, stats="read")
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+
+    main(["revoke-grant", "--all"])
+
+    assert json.loads(capsys.readouterr().out) == {"revoked": 2}
+    assert api(agent, first["access_token"]).status_code == 401
+    assert api(agent, second["access_token"]).status_code == 401
