@@ -56,6 +56,11 @@ ON_ACCOUNT = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_w
 
 _RANK = {"deny": 0, "read": 1, "write": 2}
 
+INSTRUCTIONS = (
+    "Prepare, schedule and review posts, and manage automatic reply rules, of one Instagram "
+    "account through the jorgex-social API. Errors carry a stable `code`; decide by it."
+)
+
 Limit = Annotated[int | None, Field(description="Maximum number of results.")]
 Offset = Annotated[int | None, Field(description="Results to skip, for paging.")]
 PostId = Annotated[str, Field(description="Post id, as returned by create_post or list_posts.")]
@@ -72,8 +77,9 @@ def _local_error(code: str, message: str) -> ToolError:
     return ToolError(json.dumps({"status": None, "code": code, "message": message}))
 
 
-def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations]]:
-    """(group, level, tool, annotations). The docstring of each tool is what the agent reads."""
+def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations]]:
+    """(group, level, tool, annotations). The docstring of each tool is what the agent reads.
+    The service's remote MCP (jorgex_social/remote_mcp) registers these same definitions."""
 
     def call(method: str, path: str, *ids: str, **kwargs) -> str:
         """`path` takes each id in a `{}`, escaped."""
@@ -545,13 +551,8 @@ def build_server(api: Api) -> MCPServer:
                 "message": "GET /v1/token did not return the token's permissions.",
             }
         )
-    server = MCPServer(
-        "jorgex-social",
-        instructions="Prepare, schedule and review posts, and manage automatic reply rules, of "
-        "one Instagram account through the jorgex-social API. Errors carry a stable `code`; "
-        "decide by it.",
-    )
-    for group, level, tool, annotations in _tools(api):
+    server = MCPServer("jorgex-social", instructions=INSTRUCTIONS)
+    for group, level, tool, annotations in tool_definitions(api):
         if _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
             server.add_tool(tool, annotations=annotations, structured_output=False)
     return server

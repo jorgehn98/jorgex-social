@@ -85,6 +85,12 @@ async def upload_media(request: Request):
             "unsupported_media_type",
             f"Content-Type must be one of {', '.join(sorted(storage.UPLOAD_CONTENT_TYPES))}.",
         )
+    return await save_upload(request)
+
+
+async def save_upload(request: Request) -> Media:
+    """Streams the request body to disk as a new media (at most MAX_UPLOAD_BYTES, typed by its
+    signature) and stores it. Also behind the one-use upload URLs of remote agents."""
     limit = storage.MAX_UPLOAD_BYTES
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit:
