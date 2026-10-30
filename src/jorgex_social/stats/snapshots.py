@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, time, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from jorgex_social.clock import Clock
@@ -54,7 +55,8 @@ def store_recent_media(
     sessions: sessionmaker, network: str, items: list[Media], now: datetime
 ) -> None:
     """Replaces the stored recent media with the newest of `items`, a listing the caller already
-    made: storing it costs no call to the network."""
+    made: storing it costs no call to the network. Best effort: a database failure here is
+    logged and must not stop the stats sweep or the resolver that made the listing."""
     newest = sorted(items, key=lambda m: m.timestamp, reverse=True)[:RECENT_MEDIA_KEPT]
     rows = [
         {
@@ -66,8 +68,14 @@ def store_recent_media(
         }
         for m in newest
     ]
-    with sessions() as session, session.begin():
-        session.merge(RecentMedia(network=network, fetched_at=now, items=rows))
+    try:
+        with sessions() as session, session.begin():
+            session.merge(RecentMedia(network=network, fetched_at=now, items=rows))
+    except SQLAlchemyError as exc:
+        log.warning(
+            "could not store the recent media",
+            extra={"network": network, "error": type(exc).__name__},
+        )
 
 
 def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:

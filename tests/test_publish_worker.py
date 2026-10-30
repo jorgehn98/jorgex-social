@@ -1,17 +1,17 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from jorgex_social.access.tokens import create_token
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.errors import Refused, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
-from jorgex_social.instagram.types import ContainerKind, ProductType
+from jorgex_social.instagram.types import ContainerKind, ContainerStatus, ProductType
 from jorgex_social.publishing.models import Media
 from jorgex_social.publishing.worker import LONGEST_ATTEMPT, STALE_ATTEMPT, PublishTask
-from jorgex_social.stats.models import PostSnapshot
+from jorgex_social.stats.models import PostSnapshot, RecentMedia
 from jorgex_social.stats.snapshots import SnapshotTask
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
@@ -245,6 +245,41 @@ def test_the_resolvers_listing_refreshes_the_recent_media(app, client, api, task
     [live] = published(ig)
     assert [m["id"] for m in recent.json()["items"]] == [live.id]
     assert recent.json()["fetched_at"] is not None
+
+
+def recent_media(sessions):
+    with sessions() as session:
+        return session.get(RecentMedia, "simulation")
+
+
+def test_an_unknown_outcome_still_in_progress_does_not_list_media(api, task, sessions, ig):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("publish", Unavailable("502"))
+    task.publish_due(sessions)
+    assert api.get(post_id)["status"] == "outcome_unknown"
+    ig.container_status = lambda container_id: ContainerStatus.IN_PROGRESS
+
+    task.resolve(sessions)
+
+    assert api.get(post_id)["status"] == "outcome_unknown"
+    assert recent_media(sessions) is None
+
+
+def test_a_failing_store_of_recent_media_does_not_stop_the_resolver(
+    api, task, sessions, ig, caplog
+):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("publish", Unavailable("502 after going live"), after=True)
+    task.publish_due(sessions)
+    with sessions() as session, session.begin():
+        session.execute(text("DROP TABLE recent_media"))
+
+    task.resolve(sessions)
+
+    assert api.get(post_id)["status"] == "published"
+    assert "could not store the recent media" in caplog.text
 
 
 def test_finished_container_is_published_again_safely(api, task, sessions, ig):

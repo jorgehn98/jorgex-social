@@ -115,8 +115,9 @@ class RecentMediaOut(BaseModel):
 
 @recent_media_router.get("/instagram-media", response_model=RecentMediaOut)
 def recent_media(session: SessionDep, network: Network):
-    """The account's newest feed posts and reels, newest first, as of the worker's last listing
-    (hourly, and on its passes over posts in outcome_unknown). Stories are never listed."""
+    """The account's newest feed posts and reels, newest first, as of the worker's last listing.
+    It is refreshed by the hourly statistics sweep (and when the worker finds a published
+    container, in which case it settles the post itself). Stories are never listed."""
     row = session.get(RecentMedia, network)
     if row is None:
         return RecentMediaOut(fetched_at=None, items=[])

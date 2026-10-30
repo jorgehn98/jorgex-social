@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from jorgex_social.access.tokens import create_token
 from jorgex_social.clock import ManualClock
@@ -182,6 +182,17 @@ def test_each_sweep_replaces_the_recent_media(app, client, sessions, ig, clock):
     # Only the newest are kept, newest first: the oldest one is gone, not accumulated.
     assert [m["id"] for m in second["items"]] == newer[::-1]
     assert second["fetched_at"] > first["fetched_at"]
+
+
+def test_a_failing_store_of_recent_media_does_not_stop_the_sweep(sessions, ig, clock, caplog):
+    publish(ig, clock, IMAGE)
+    with sessions() as session, session.begin():
+        session.execute(text("DROP TABLE recent_media"))
+
+    SnapshotTask(ig, clock)(sessions)
+
+    assert count(sessions, PostSnapshot) == 1
+    assert "could not store the recent media" in caplog.text
 
 
 def test_api_rejects_dates_without_timezone(app, client):

@@ -75,22 +75,27 @@ Publishing:
 1. `get_catalog`: post types, item and caption limits, accepted files.
 2. {upload}
 3. `create_post` with the media ids and an idempotency_key, so a retry does not make a second \
-draft. Fix its errors with `update_post`; any edit changes content_hash.
+draft. Fix its errors with `update_post`; content edits change content_hash, so review the \
+one it returns.
 4. Review the post (`get_post`), then `schedule_post` for a future time (ISO 8601 with offset) \
 or `publish_now`. Always pass expected_hash, the content_hash you reviewed.
-5. Follow it with `get_post`: published (with permalink), failed (see failure; schedule it again \
-once its cause is fixed) or outcome_unknown.
+5. Follow it with `get_post`: scheduled or publishing means wait; then published (permalink \
+may be null), failed (see failure; schedule it again once its cause is fixed) or \
+outcome_unknown.
 Editing a scheduled post returns it to draft. Only draft and scheduled posts can be edited or \
 cancelled; to change a failed post, create a new one. A post not published within the grace \
 window after its time (kill switch on, service down) fails as missed_schedule.
 
 outcome_unknown: the service cannot tell whether Instagram published the post and keeps \
 checking; after an hour it opens a publish_unresolved incident. Never schedule it again to \
-retry: it could publish twice. Look for it with `list_instagram_media` (its fetched_at must be \
-later than the attempt's start, in `get_post`): if a media of that type appeared then, \
-`resolve_post` with published and its id. Stories are never listed, and a missing media may \
-only be late, so for a story, before resolving as not_published (which returns the post to \
-draft) or whenever you are unsure, have a human check the account.
+retry: it could publish twice. You may settle it as published yourself only when \
+`list_instagram_media` has a fetched_at later than the attempt's started_at (in `get_post`) \
+and exactly one media with a timestamp after that started_at and the post's product_type and \
+media_type (image: FEED and IMAGE; carousel: FEED and CAROUSEL_ALBUM; reel: REELS and VIDEO), \
+and the operator did not publish by hand in that window (ask if unsure): then `resolve_post` \
+with published and that id. Never resolve not_published without a human checking the account: \
+absence from the listing proves nothing, and stories are never listed. Otherwise leave the post \
+as it is and report its publish_unresolved incident.
 
 Rules: `create_rule` makes an inactive rule. `test_rules` with its rule_id and sample texts \
 shows what it would match and send, sending nothing. `activate_rule` makes it answer, only to \
@@ -100,11 +105,13 @@ while a human answers.
 
 Kill switch (`set_kill_switch`): on, nothing is written to Instagram. Scheduled posts wait, \
 and replies due meanwhile are skipped for good. Off, publishing resumes; posts past their grace \
-window fail as missed_schedule and must be scheduled again. Open incidents (`list_incidents`) \
+window fail as missed_schedule, and a post whose containers were being made when it turned on \
+fails with failure kill_switch; both must be scheduled again. Open incidents (`list_incidents`) \
 need a human; acknowledging one does not close it.
 
-Lists are newest first unless said otherwise; page with limit and offset until a page comes \
-back shorter than limit.
+Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
+a page comes back shorter than limit; tools without offset say how to page in their \
+description.
 
 Errors are JSON with a stable code and the HTTP status; act on the code:
 - invalid_token: the token is missing, unknown or revoked; stop. forbidden: this token lacks \
@@ -367,8 +374,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         until: Annotated[str | None, Field(description="ISO 8601 with offset.")] = None,
         limit: Limit = None,
     ) -> str:
-        """Account metrics per closed day, newest first, from the stored snapshots: the last 90
-        days unless limit says otherwise. Page back with until."""
+        """Account metrics per closed day, newest first, from the stored snapshots: the 90 most
+        recent stored days unless limit says otherwise. No offset: page back with until."""
         return call(
             "GET", "/v1/stats/account", query={"since": since, "until": until, "limit": limit}
         )
@@ -380,15 +387,18 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     def media_history(
         media_ref: Annotated[str, Field(description="Instagram media id.")], limit: Limit = None
     ) -> str:
-        """Every stored snapshot of one media, newest first. Empty if none has been taken yet."""
+        """Every stored snapshot of one media, newest first (365 unless limit says otherwise; no
+        offset). Empty if none has been taken yet."""
         return call("GET", "/v1/stats/media/{}", media_ref, query={"limit": limit})
 
     def list_instagram_media() -> str:
         """The account's newest feed posts and reels (up to 25), newest first: id (the media id
         for resolve_post and for a rule's media_ref), product_type, media_type, permalink and
         timestamp. A snapshot from the worker's last listing, not a live call: check fetched_at
-        (null if never listed). It refreshes hourly and when the worker checks a post in
-        outcome_unknown. Stories are never listed."""
+        (null if never listed). It is refreshed by the hourly statistics sweep (and when the
+        worker finds a published container, in which case it settles the post itself), so it
+        can be up to an hour old, or older while the sweep fails. Stories are never listed.
+        No paging: it is the whole snapshot."""
         return call("GET", "/v1/instagram-media")
 
     # account
