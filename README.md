@@ -31,6 +31,35 @@ creates with mode 600. Back that key up separately from the database. The worker
 before it expires, and `GET /v1/account` reports the connection status, open incidents and the kill
 switch.
 
+## MCP server
+
+`jorgex-social-mcp` is a thin MCP server (stdio) that runs on the agent's machine and turns each
+tool into one call to the REST API. It needs the `mcp` extra (`uv sync --extra mcp`, or
+`pip install "jorgex-social[mcp]"`) and two environment variables: `JORGEX_SOCIAL_URL`, the base URL
+of the API, and `JORGEX_SOCIAL_TOKEN`, an API token created with `create-token`. At startup it reads
+the token's permissions from `GET /v1/token` and exposes only the tools that token can use; the API
+still checks every call. API errors reach the agent as they come, with their stable `code`.
+
+Most agent clients take a JSON entry like this one (the exact file and key depend on the client):
+
+```json
+{
+  "mcpServers": {
+    "jorgex-social": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/jorgex-social", "--extra", "mcp", "jorgex-social-mcp"],
+      "env": {
+        "JORGEX_SOCIAL_URL": "https://social.example.com",
+        "JORGEX_SOCIAL_TOKEN": "jxs_your_token_here"
+      }
+    }
+  }
+}
+```
+
+Give the agent its own token with only the groups it needs. The URL must use HTTPS unless the API is
+on the same machine (`localhost`, `127.0.0.0/8` or `::1`): the token travels in every request.
+
 ## License
 
 MIT. See `LICENSE`.
