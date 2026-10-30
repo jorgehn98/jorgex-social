@@ -4,7 +4,7 @@ session and reuse the API's own query functions; only signing in and out write."
 import ipaddress
 import logging
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
@@ -15,6 +15,8 @@ from starlette.concurrency import run_in_threadpool
 
 from jorgex_social.access import operator
 from jorgex_social.access.deps import ReadSessionDep
+from jorgex_social.access.limits import client_key
+from jorgex_social.access.proxy import via_proxy
 from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
@@ -28,6 +30,9 @@ log = logging.getLogger(__name__)
 HERE = Path(__file__).parent
 COOKIE = "jxs_session"
 INVALID = "Invalid credentials."
+TOO_MANY = "Too many attempts. Try again later."
+BUSY = "The server is busy. Try again in a moment."
+HOME = "/ui/"
 MAX_FORM_BYTES = 4096
 # The pages need nothing from anywhere else: no scripts at all, styles, fonts and images from
 # this origin only.
@@ -77,6 +82,49 @@ def cookie_is_secure(request: Request) -> bool:
     return not (request.url.scheme == "http" and _is_loopback(request.url.hostname))
 
 
+def _origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        return None
+    return parts.scheme, parts.hostname.lower(), port or (443 if parts.scheme == "https" else 80)
+
+
+def same_origin(request: Request) -> None:
+    """CSRF check for every form post, on top of the SameSite=Strict cookie. The Origin must be
+    the configured public URL (not whatever Host says), or a loopback one when the request did
+    not come through the proxy: that is the SSH tunnel. Browsers send Origin on every POST; a
+    request with neither Origin nor Sec-Fetch-Site is not from a browser form, and is refused."""
+    if request.method != "POST":
+        return
+    origin = request.headers.get("origin")
+    if origin is None:
+        if request.headers.get("sec-fetch-site") == "same-origin":
+            return
+        raise HTTPException(403)
+    found = _origin(origin)
+    public_url = request.app.state.settings.public_url
+    if found is not None and public_url and found == _origin(public_url):
+        return
+    if found is not None and _is_loopback(found[1]) and not via_proxy(request.scope):
+        return
+    raise HTTPException(403)
+
+
+def safe_next(value: str | None) -> str:
+    """Where to go after signing in: only a path of this interface, never another site."""
+    if not value or "\\" in value or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        return HOME
+    parts = urlsplit(value)
+    segments = unquote(parts.path).split("/")
+    if parts.scheme or parts.netloc or segments[:2] != ["", "ui"] or {".", ".."} & set(segments):
+        return HOME
+    return value
+
+
 def require_operator(request: Request) -> None:
     session_id = request.cookies.get(COOKIE)
     now = request.app.state.clock.now()
@@ -102,14 +150,22 @@ def render(request: Request, name: str, status_code: int = 200, **context) -> Re
 
 
 def _login_redirect(request: Request, _: LoginRequired) -> Response:
-    response = RedirectResponse("/ui/login", status_code=303, headers=HEADERS)
+    location = "/ui/login"
+    back = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+    if request.method == "GET" and safe_next(back) == back != HOME:
+        location += "?" + urlencode({"next": back})
+    response = RedirectResponse(location, status_code=303, headers=HEADERS)
     if COOKIE in request.cookies:  # expired or unknown: no use keeping it
         response.delete_cookie(COOKIE, path="/ui")
     return response
 
 
-public = APIRouter(prefix="/ui", include_in_schema=False)
-pages = APIRouter(prefix="/ui", include_in_schema=False, dependencies=[Depends(require_operator)])
+public = APIRouter(prefix="/ui", include_in_schema=False, dependencies=[Depends(same_origin)])
+pages = APIRouter(
+    prefix="/ui",
+    include_in_schema=False,
+    dependencies=[Depends(same_origin), Depends(require_operator)],
+)
 
 
 # Signing in and out
@@ -117,7 +173,7 @@ pages = APIRouter(prefix="/ui", include_in_schema=False, dependencies=[Depends(r
 
 @public.get("/login")
 def login_form(request: Request):
-    return render(request, "login.html")
+    return render(request, "login.html", next=safe_next(request.query_params.get("next")))
 
 
 async def _form(request: Request) -> dict[str, str]:
@@ -137,20 +193,33 @@ async def _form(request: Request) -> dict[str, str]:
 
 @public.post("/login")
 async def login(request: Request):
-    form = await _form(request)
     state = request.app.state
-    session_id = await run_in_threadpool(
-        operator.log_in,
-        state.sessionmaker,
-        state.read_sessionmaker,
-        state.settings.secret_key_file,
-        form.get("password", ""),
-        form.get("code", ""),
-        state.clock.now(),
-    )
+    client = client_key(request.client.host if request.client else None)
+    wait = state.login_limiter.hit(client, state.clock.now())
+    if wait is not None:
+        # Turned away before the body, argon2 or the database: only this line records it.
+        log.warning("sign-in refused: too many attempts", extra={"client": client})
+        response = render(request, "login.html", 429, error=TOO_MANY, next=HOME)
+        response.headers["Retry-After"] = str(int(wait.total_seconds()) + 1)
+        return response
+    form = await _form(request)
+    next_page = safe_next(form.get("next"))
+    try:
+        session_id = await run_in_threadpool(
+            operator.log_in,
+            state.sessionmaker,
+            state.read_sessionmaker,
+            state.settings.secret_key_file,
+            form.get("password", ""),
+            form.get("code", ""),
+            state.clock.now(),
+        )
+    except operator.Busy:
+        log.warning("sign-in refused: every password check slot is busy")
+        return render(request, "login.html", 503, error=BUSY, next=next_page)
     if session_id is None:
-        return render(request, "login.html", 401, error=INVALID)
-    response = RedirectResponse("/ui/", status_code=303, headers=HEADERS)
+        return render(request, "login.html", 401, error=INVALID, next=next_page)
+    response = RedirectResponse(next_page, status_code=303, headers=HEADERS)
     response.set_cookie(
         COOKIE,
         session_id,

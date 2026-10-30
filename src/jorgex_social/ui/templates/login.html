@@ -11,6 +11,7 @@
     <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
     <label for="code">Authenticator code</label>
     <input id="code" class="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+    {% if next != "/ui/" %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
     <button class="primary" type="submit">Sign in</button>
   </form>
 </main>

@@ -1,5 +1,6 @@
 """The operator's sign-in to the web interface: password (argon2id), TOTP and server-side
-sessions, with a lockout after repeated failures (decision 04)."""
+sessions. Guessing is bounded per client address at the route (ui/routes.py), not per account:
+a lockout of the one account would let anyone keep the operator out."""
 
 import hmac
 import logging
@@ -22,8 +23,6 @@ from jorgex_social.account.models import ActorType, Outcome
 
 log = logging.getLogger(__name__)
 
-MAX_FAILURES = 5
-LOCKOUT = timedelta(minutes=15)
 SESSION_LIFETIME = timedelta(hours=12)
 IDLE_TIMEOUT = timedelta(hours=1)
 # last_activity_at is only as precise as this, so browsing does not write on every page.
@@ -33,8 +32,10 @@ TOTP_CONTEXT = "operator/totp"
 TOTP_ISSUER = "jorgex-social"
 TOTP_CODE = re.compile(r"[0-9]{6}")  # ASCII only: \d would also take other scripts' digits
 # Each argon2 check takes 64 MiB and a fraction of a second: at most this many at once, so a
-# burst of sign-ins queues instead of exhausting memory.
+# burst of sign-ins queues instead of exhausting memory, and only briefly, so it cannot tie up
+# every worker thread either.
 _password_checks = threading.BoundedSemaphore(2)
+PASSWORD_CHECK_WAIT = 2.0  # seconds
 
 # argon2id with the library's defaults (RFC 9106's low-memory profile).
 _hasher = PasswordHasher()
@@ -42,6 +43,10 @@ _hasher = PasswordHasher()
 
 class OperatorError(ValueError):
     pass
+
+
+class Busy(Exception):
+    """Every password check slot stayed taken for PASSWORD_CHECK_WAIT."""
 
 
 def get_operator(session: Session) -> Operator | None:
@@ -81,13 +86,11 @@ def create_operator(session: Session, password: str, now: datetime) -> Operator:
 
 
 def set_password(session: Session, password: str, now: datetime) -> Operator:
-    """Also lifts a lockout and signs every browser out."""
+    """Also signs every browser out."""
     operator = get_operator(session)
     if operator is None:
         raise OperatorError("there is no operator yet; run create-operator first")
     operator.password_hash = _hash_password(password)
-    operator.failed_attempts = 0
-    operator.locked_until = None
     _end_sessions(session)
     _audit(session, now, "operator.password_set", operator)
     return operator
@@ -135,15 +138,14 @@ def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datet
 
 
 def _password_matches(password_hash: str, password: str) -> bool:
-    with _password_checks:
-        try:
-            return _hasher.verify(password_hash, password)
-        except VerificationError, InvalidHashError:
-            return False
-
-
-def _locked(operator: Operator, now: datetime) -> bool:
-    return operator.locked_until is not None and operator.locked_until > now
+    if not _password_checks.acquire(timeout=PASSWORD_CHECK_WAIT):
+        raise Busy
+    try:
+        return _hasher.verify(password_hash, password)
+    except VerificationError, InvalidHashError:
+        return False
+    finally:
+        _password_checks.release()
 
 
 def log_in(
@@ -155,12 +157,16 @@ def log_in(
     now: datetime,
 ) -> str | None:
     """Returns a new session id, or None whatever the reason, so the caller cannot tell the
-    reasons apart. The checks read in a deferred transaction and run outside any transaction;
-    the write lock is taken only to record the outcome, and never while locked out or when
-    there is no operator."""
+    reasons apart. Raises Busy when no password check slot frees up in time. The checks read
+    in a deferred transaction and run outside any transaction; the write lock is taken only to
+    record the outcome, and never when there is no operator or the code is malformed."""
+    if not TOTP_CODE.fullmatch(code.strip()):
+        # Not even shaped like a code (the form only sends six digits): refused before paying
+        # for an argon2 check. It says nothing about the password, so it needs no record.
+        return None
     with read() as session, session.begin():
         operator = get_operator(session)
-    if operator is None or _locked(operator, now):
+    if operator is None:
         return None
     step = None
     if _password_matches(operator.password_hash, password):
@@ -172,10 +178,10 @@ def log_in(
             )
             step = totp_step(secret, code, now, operator.totp_last_step)
     with write() as session, session.begin():
-        # Read again under the write lock: a concurrent sign-in may have used the same code,
-        # locked the operator or changed the password since.
+        # Read again under the write lock: a concurrent sign-in may have used the same code or
+        # changed the password since.
         current = get_operator(session)
-        if current is None or _locked(current, now):
+        if current is None:
             return None
         still_valid = (
             current.password_hash == operator.password_hash
@@ -183,8 +189,6 @@ def log_in(
         )
         if step is not None and still_valid:
             current.totp_last_step = step
-            current.failed_attempts = 0
-            current.locked_until = None
             session_id = secrets.token_urlsafe(32)
             session.execute(delete(OperatorSession).where(OperatorSession.expires_at <= now))
             session.add(
@@ -198,13 +202,7 @@ def log_in(
             )
             _audit(session, now, "operator.login", current)
             return session_id
-        current.failed_attempts += 1
         _audit(session, now, "operator.login", current, Outcome.DENIED)
-        if current.failed_attempts >= MAX_FAILURES:
-            current.failed_attempts = 0
-            current.locked_until = now + LOCKOUT
-            _audit(session, now, "operator.locked", current, Outcome.DENIED)
-            log.warning("operator locked out after %d failed sign-ins", MAX_FAILURES)
         return None
 
 

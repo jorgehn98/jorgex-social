@@ -36,8 +36,6 @@ class Operator(Base):
     totp_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
     # The last TOTP time step accepted: a code is never accepted twice, nor an older one.
     totp_last_step: Mapped[int | None] = mapped_column(Integer)
-    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
-    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
