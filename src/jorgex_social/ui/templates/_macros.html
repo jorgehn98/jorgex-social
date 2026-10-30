@@ -1,0 +1,11 @@
+{% macro pill(value, tone=None) -%}
+<span class="pill {{ tone or value }}">{{ value | replace("_", " ") }}</span>
+{%- endmacro %}
+
+{% macro empty(text) -%}
+<p class="empty">{{ text }}</p>
+{%- endmacro %}
+
+{% macro detail(values) -%}
+{% if values %}{% for k, v in values.items() %}<span class="chip">{{ k }}={{ v }}</span> {% endfor %}{% else %}<span class="muted">—</span>{% endif %}
+{%- endmacro %}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_macros.html" import empty %}
+{% block title %}Stats{% endblock %}
+{% block main %}
+<h1>Stats</h1>
+<h2>Account</h2>
+{% if history %}
+<div class="grid">
+  <div class="card"><h3><span class="legend-key"></span>Reach per day</h3>{{ reach_chart or empty("No reach recorded.") }}</div>
+  <div class="card"><h3><span class="legend-key secondary"></span>Followers</h3>{{ followers_chart or empty("No follower count recorded.") }}</div>
+</div>
+<h3 class="section">Per day</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Day</th><th class="num">Reach</th><th class="num">Views</th><th class="num">Engaged</th><th class="num">Followers</th></tr></thead>
+  <tbody>
+  {% for s in history %}
+    <tr>
+      <td class="when">{{ s.period_start | day }}</td>
+      {% for name in ["reach", "views", "accounts_engaged"] %}
+      <td class="num">{{ "{:,}".format(s.metrics[name]) if s.metrics.get(name) is not none else "—" }}</td>
+      {% endfor %}
+      <td class="num">{{ "{:,}".format(s.followers) if s.followers is not none else "—" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No account snapshots yet. The worker takes one per closed day.") }}{% endif %}
+
+<h2>Publications</h2>
+{% if media %}
+<div class="table-wrap"><table>
+  <thead><tr><th>Published</th><th>Media</th><th>Type</th><th class="num">Reach</th><th class="num">Views</th><th class="num">Likes</th><th>Taken</th></tr></thead>
+  <tbody>
+  {% for s in media %}
+    <tr>
+      <td class="when">{{ s.published_at | when }}</td>
+      <td class="mono"><a href="/ui/stats/{{ s.media_ref }}">{{ s.media_ref }}</a></td>
+      <td class="mono">{{ s.product_type }}</td>
+      {% for name in ["reach", "views", "likes"] %}
+      <td class="num">{{ "{:,}".format(s.metrics[name]) if s.metrics.get(name) is not none else "—" }}</td>
+      {% endfor %}
+      <td class="when">{{ s.taken_at | when }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No publication snapshots yet.") }}{% endif %}
+{% endblock %}

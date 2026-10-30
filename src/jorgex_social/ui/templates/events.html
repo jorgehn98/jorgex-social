@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, empty %}
+{% block title %}Events{% endblock %}
+{% block main %}
+<h1>Events</h1>
+<p class="muted">Identifiers and outcomes only: the text of comments and messages is never stored.</p>
+<h2>Comments and messages</h2>
+{% if events %}
+<div class="table-wrap"><table>
+  <thead><tr><th>Received</th><th>Type</th><th>Source</th><th>Reference</th><th>Post</th><th>Rule</th></tr></thead>
+  <tbody>
+  {% for e in events %}
+    <tr>
+      <td class="when">{{ e.received_at | when }}</td>
+      <td class="mono">{{ e.type }}</td>
+      <td class="mono">{{ e.source }}</td>
+      <td class="mono">{{ e.external_ref }}</td>
+      <td class="mono">{{ e.media_ref or "—" }}</td>
+      <td>{% if e.rule_id %}{{ rule_names.get(e.rule_id, e.rule_id) }}{% else %}<span class="muted">no match</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No events yet.") }}{% endif %}
+
+<h2>Replies</h2>
+{% if deliveries %}
+<div class="table-wrap"><table>
+  <thead><tr><th>Created</th><th>Action</th><th>Status</th><th>Reason</th><th>Rule</th><th>Event</th><th>Error</th></tr></thead>
+  <tbody>
+  {% for d in deliveries %}
+    <tr>
+      <td class="when">{{ d.created_at | when }}</td>
+      <td class="mono">{{ d.action }}</td>
+      <td>{{ pill(d.status) }}</td>
+      <td class="mono">{{ d.reason or "—" }}</td>
+      <td>{{ rule_names.get(d.rule_id, d.rule_id) }}</td>
+      <td class="mono">{{ d.event_id }}</td>
+      <td class="mono">{% if d.error_code %}{{ d.error_code }}{% if d.error_subcode %}/{{ d.error_subcode }}{% endif %}{% else %}—{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No replies yet.") }}{% endif %}
+{% endblock %}

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, empty %}
+{% block title %}Home{% endblock %}
+{% block main %}
+<section class="hero">
+  {% include "_particles.svg" %}
+  <h1>{% if account.account %}@{{ account.account.username }}{% else %}No account connected{% endif %}</h1>
+  <p class="muted">{{ account.network }} · read-only view</p>
+</section>
+
+<div class="grid">
+  <div class="card stat">
+    <div class="label">Connection</div>
+    <div class="value">{{ pill(account.status.value) }}</div>
+    <p class="muted mono">checked {{ account.checked_at | when }}</p>
+  </div>
+  <div class="card stat">
+    <div class="label">Credential expires</div>
+    <div class="value mono">{{ account.credential_expires_at | when }}</div>
+  </div>
+  <div class="card stat">
+    <div class="label">Publishing quota</div>
+    <div class="value mono">
+      {% if account.limits %}{{ account.limits.quota_usage }} / {{ account.limits.quota_total }}{% else %}—{% endif %}
+    </div>
+  </div>
+  <div class="card stat">
+    <div class="label">Kill switch</div>
+    <div class="value">{% if account.kill_switch %}{{ pill("on") }}{% else %}{{ pill("off", "ok") }}{% endif %}</div>
+  </div>
+  <div class="card stat">
+    <div class="label">Webhook</div>
+    <div class="value">{% if account.webhook.configured %}{{ pill("configured", "ok") }}{% else %}{{ pill("not configured", "draft") }}{% endif %}</div>
+    <p class="muted mono">last {{ account.webhook.last_notification_at | when }}</p>
+  </div>
+  <div class="card stat">
+    <div class="label">Open incidents</div>
+    <div class="value mono">{% if account.open_incidents %}{{ pill(account.open_incidents ~ " open", "incident") }}{% else %}0{% endif %}</div>
+  </div>
+</div>
+
+<h2>Open incidents</h2>
+{% if incidents %}
+<div class="table-wrap"><table>
+  <thead><tr><th>Opened</th><th>Type</th><th>Acknowledged</th></tr></thead>
+  <tbody>
+  {% for i in incidents %}
+    <tr><td class="when">{{ i.opened_at | when }}</td><td>{{ pill(i.type, "incident") }}</td><td class="when">{{ i.acknowledged_at | when }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No open incidents.") }}{% endif %}
+
+<h2>Next scheduled</h2>
+{% if upcoming %}
+<div class="table-wrap"><table>
+  <thead><tr><th>When</th><th>Type</th><th>Caption</th></tr></thead>
+  <tbody>
+  {% for p in upcoming %}
+    <tr>
+      <td class="when">{{ p.scheduled_for | when }}</td>
+      <td class="mono">{{ p.type }}</td>
+      <td><a href="/ui/posts/{{ p.id }}">{{ p.caption | truncate(80) or "(no caption)" }}</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("Nothing scheduled.") }}{% endif %}
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block body %}
+<main class="login">
+  {% include "_particles.svg" %}
+  <form class="card" method="post" action="/ui/login">
+    <span class="wordmark">Jorge<span class="x">X</span> Social</span>
+    <h1>Sign in</h1>
+    {% if error %}<p class="notice" role="alert">{{ error }}</p>{% endif %}
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+    <label for="code">Authenticator code</label>
+    <input id="code" class="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+    <button class="primary" type="submit">Sign in</button>
+  </form>
+</main>
+{% endblock %}

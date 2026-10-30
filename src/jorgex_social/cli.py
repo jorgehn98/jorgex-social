@@ -15,6 +15,7 @@ from alembic.config import Config
 from sqlalchemy import select
 
 from jorgex_social import logs, worker
+from jorgex_social.access import operator
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
 from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
@@ -101,6 +102,43 @@ def read_secret(prompt: str) -> str:
     if sys.stdin.isatty():
         return getpass.getpass(prompt)
     return sys.stdin.readline()
+
+
+def read_new_password() -> str:
+    password = read_secret("New operator password (not shown): ").rstrip("\r\n")
+    if sys.stdin.isatty() and read_secret("Repeat it: ").rstrip("\r\n") != password:
+        raise SystemExit("error: the passwords do not match")
+    return password
+
+
+def cmd_create_operator(_: argparse.Namespace, settings: Settings) -> None:
+    password = read_new_password()
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        operator.create_operator(session, password, SystemClock().now())
+    print("Operator created. Run enroll-totp next: signing in needs the second factor.")
+
+
+def cmd_set_password(_: argparse.Namespace, settings: Settings) -> None:
+    password = read_new_password()
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        operator.set_password(session, password, SystemClock().now())
+    print("Password changed; every browser was signed out.")
+
+
+def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
+    key = load_key(settings.secret_key_file)
+    secret = operator.new_totp_secret()
+    # The URI holds the secret: it goes to this terminal only, never to a log.
+    print("Add this to your authenticator app (most can import the URI as text):")
+    print(operator.provisioning_uri(secret))
+    print(f"Or type the key by hand: {secret}")
+    code = input("Code shown by the app: ") if sys.stdin.isatty() else sys.stdin.readline()
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        operator.enroll_totp(session, key, secret, code, SystemClock().now())
+    print("Second factor enrolled; every browser was signed out.")
 
 
 def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
@@ -245,6 +283,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="switch this installation to a different account than the one connected",
     )
 
+    sub.add_parser(
+        "create-operator",
+        help="create the web interface's operator, reading the password from standard input",
+    )
+    sub.add_parser("set-password", help="change the operator's password, read from standard input")
+    sub.add_parser(
+        "enroll-totp", help="set up the operator's second factor (TOTP), confirming one code"
+    )
+
     serve = sub.add_parser("serve", help="run the API server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -269,10 +316,23 @@ def main(argv: list[str] | None = None) -> None:
                 cmd_list_tokens(args, settings)
             case "connect-instagram":
                 cmd_connect_instagram(args, settings)
+            case "create-operator":
+                cmd_create_operator(args, settings)
+            case "set-password":
+                cmd_set_password(args, settings)
+            case "enroll-totp":
+                cmd_enroll_totp(args, settings)
             case "serve":
                 cmd_serve(args, settings)
             case "worker":
                 cmd_worker(args, settings)
     # Messages of these errors never carry the token (instagram/client.py, account/crypto.py).
-    except (TokenError, SecretKeyError, NotConnected, ConnectError, InstagramError) as exc:
+    except (
+        TokenError,
+        operator.OperatorError,
+        SecretKeyError,
+        NotConnected,
+        ConnectError,
+        InstagramError,
+    ) as exc:
         raise SystemExit(f"error: {exc}") from None
