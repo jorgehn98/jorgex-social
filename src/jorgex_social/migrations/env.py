@@ -5,6 +5,7 @@ import jorgex_social.access.models  # noqa: F401  (registers tables on the metad
 import jorgex_social.account.models  # noqa: F401
 import jorgex_social.oauth.models  # noqa: F401
 import jorgex_social.publishing.models  # noqa: F401
+import jorgex_social.remote_mcp.models  # noqa: F401
 import jorgex_social.replies.models  # noqa: F401
 import jorgex_social.stats.models  # noqa: F401
 from jorgex_social.db import Base

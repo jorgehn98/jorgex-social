@@ -17,8 +17,9 @@ log = logging.getLogger(__name__)
 
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 # Unauthenticated by design and called by Meta on every notification: logging each one would only
-# be noise (the webhook logs its own outcome, without the body).
-UNLOGGED_UNAUTHENTICATED = {"/webhook"}
+# be noise (the webhook logs its own outcome, without the body). /mcp carries an OAuth token the
+# API sees on each tool call, which is what gets audited.
+UNLOGGED_UNAUTHENTICATED = {"/webhook", "/mcp"}
 
 
 def record(

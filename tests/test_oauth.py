@@ -209,10 +209,9 @@ class MemoryStorage:
         self.client_info = client_info
 
 
-@pytest.mark.anyio
-async def test_an_mcp_client_connects_with_only_the_url(app, clock, settings, caplog):
-    caplog.set_level(logging.DEBUG)
-    transport = httpx2.ASGITransport(app=app)
+async def operator_oauth(transport, clock, **levels):
+    """An MCP client's OAuth as the SDK does it, with the operator signed in on the consent page
+    granting `levels`. Returns the httpx auth, its storage and what the browser saw."""
     browser = httpx2.AsyncClient(transport=transport, base_url=PUBLIC, headers={"origin": PUBLIC})
     code = pyotp.TOTP(TOTP_SECRET).at(clock.now())
     signed_in = await browser.post("/ui/login", data={"password": PASSWORD, "code": code})
@@ -226,11 +225,10 @@ async def test_an_mcp_client_connects_with_only_the_url(app, clock, settings, ca
         seen["page"] = page
         fields = dict(re.findall(r'name="(req|nonce)" value="([^"]+)"', page.text))
         seen.update(fields)
-        decided = await browser.post(
-            "/ui/oauth/consent",
-            data={**fields, "decision": "allow", "posts": "write", "stats": "read"},
+        seen["back"] = await browser.post(
+            "/ui/oauth/consent", data={**fields, "decision": "allow", **levels}
         )
-        seen["back"] = decided
+        await browser.aclose()
 
     async def receive_callback() -> AuthorizationCodeResult:
         back = query_of(seen["back"])
@@ -249,9 +247,16 @@ async def test_an_mcp_client_connects_with_only_the_url(app, clock, settings, ca
         redirect_handler=open_in_browser,
         callback_handler=receive_callback,
     )
+    return oauth, storage, seen
+
+
+@pytest.mark.anyio
+async def test_an_mcp_client_connects_with_only_the_url(app, clock, settings, caplog):
+    caplog.set_level(logging.DEBUG)
+    transport = httpx2.ASGITransport(app=app)
+    oauth, storage, seen = await operator_oauth(transport, clock, posts="write", stats="read")
     async with httpx2.AsyncClient(transport=transport, base_url=PUBLIC, auth=oauth) as agent:
         response = await agent.get("/v1/token")
-    await browser.aclose()
 
     assert response.status_code == 200
     assert response.json()["permissions"] == {**ALL_DENIED, "posts": "write", "stats": "read"}
