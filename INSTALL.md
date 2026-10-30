@@ -8,8 +8,9 @@ Every installation uses its own Meta app, its own credentials and one Instagram 
 shared between installations, and nobody provides accounts, hosting or support for you.
 
 **Never paste a token, an app secret or a verify token into a chat, an issue, a pull request or a
-screenshot.** If one leaks, revoke it: generate a new token in Meta's dashboard, or reset the app
-secret there.
+screenshot.** If one leaks, assume generating a new token does not invalidate the old one: remove the app from
+the account's app permissions in Instagram (or reset the app secret in Meta's dashboard), then
+connect again with `connect-instagram --replace`.
 
 - [Requirements](#requirements)
 - [Start in simulation](#start-in-simulation)
@@ -153,8 +154,9 @@ at most and end after an hour without activity.
 ## Create your Meta app
 
 The service uses the Instagram API with Instagram login (`graph.instagram.com`). Your app only serves
-your own account, which has a role in the app, so it needs **standard access** only: no App Review, no
-advanced access and no business verification.
+your own account, which has a role in the app. On the app this guide was tested with, **standard
+access** was enough: no App Review, no advanced access and no business verification. That has not
+been re-verified on a newly created app; see the note below.
 
 Meta's dashboard changes often, so names and places below may differ slightly from what you see.
 
@@ -217,8 +219,9 @@ in development, the API does not return comments or messages from accounts witho
 app (on the tested app, the comment count went up but the list came back empty), and webhooks need a
 published app. You can return to development later with **Unpublish**.
 
-Do not request advanced access or App Review: they are for apps that serve other people's accounts,
-and this one serves only yours.
+You should not need advanced access or App Review: they are for apps that serve other people's
+accounts, and this one serves only yours. If a new app behaves differently, please open an issue
+(without secrets).
 
 ## Switch to real mode
 
@@ -252,7 +255,8 @@ In real mode the worker refuses to start without a connected account, so connect
 
 Without it, automatic replies still work: the worker polls comments and messages every two minutes.
 With it, Meta notifies each new comment and message as it happens and the reply goes out within
-seconds (Meta's messaging policy asks bots to answer within 30 seconds). Polling keeps running and
+seconds (Meta's messaging policy documentation, at the time of writing, asks automated replies to
+answer within 30 seconds). Polling keeps running and
 catches anything a notification missed; a comment seen both ways is answered once.
 
 The app must be published (Live) first.

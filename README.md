@@ -85,8 +85,8 @@ switch.
 ## MCP server
 
 `jorgex-social-mcp` is a thin MCP server (stdio) that runs on the agent's machine and turns each
-tool into one call to the REST API. It needs the `mcp` extra (`uv sync --extra mcp`, or
-`pip install "jorgex-social[mcp]"`) and two environment variables: `JORGEX_SOCIAL_URL`, the base URL
+tool into one call to the REST API. It needs the `mcp` extra (`uv sync --extra mcp` in a clone of this
+repository; the package is not on PyPI) and two environment variables: `JORGEX_SOCIAL_URL`, the base URL
 of the API, and `JORGEX_SOCIAL_TOKEN`, an API token created with `create-token`. At startup it reads
 the token's permissions from `GET /v1/token` and exposes only the tools that token can use; the API
 still checks every call. API errors reach the agent as they come, with their stable `code`.
