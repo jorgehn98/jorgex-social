@@ -12,7 +12,7 @@ reply to a person is worse than a missing one.
 
 import logging
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -23,6 +23,7 @@ from jorgex_social.account import incidents, kill_switch
 from jorgex_social.account.credential import connection_of
 from jorgex_social.account.models import IncidentType
 from jorgex_social.clock import Clock
+from jorgex_social.config import Settings
 from jorgex_social.instagram.errors import (
     AccountRestricted,
     AuthError,
@@ -109,6 +110,7 @@ class ReplyTask:
         cooldown: timedelta = timedelta(minutes=60),
         choose: Callable[[Sequence[str]], str] = random.choice,
         webhook: bool = False,
+        opt_out_words: Iterable[str] = Settings.opt_out_words,
     ) -> None:
         self.instagram = instagram
         self.clock = clock
@@ -119,7 +121,9 @@ class ReplyTask:
         self.retention = retention
         self.cooldown = cooldown
         self.webhook = webhook
-        self.intake = Intake(instagram.network, retention=retention, choose=choose)
+        self.intake = Intake(
+            instagram.network, retention=retention, choose=choose, opt_out_words=opt_out_words
+        )
         self._started = clock.now()
         self._last_poll: datetime | None = None
         # Set when a send failed in a way that affects every send (rate limit, credential,

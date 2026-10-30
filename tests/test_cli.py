@@ -145,3 +145,25 @@ def test_worker_in_real_mode_refuses_to_start_without_the_key(settings, monkeypa
 
     with pytest.raises(SystemExit, match="secret key file .* is missing"):
         main(["worker"])
+
+
+def test_the_worker_hands_the_opt_out_words_to_the_reply_task(settings, monkeypatch):
+    class Built(Exception):
+        pass
+
+    seen = {}
+
+    def reply_task(*args, **kwargs):
+        seen.update(kwargs)
+        raise Built
+
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+    monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(settings.secret_key_file))
+    monkeypatch.setenv("JORGEX_SOCIAL_OPT_OUT_WORDS", "halt,enough")
+    monkeypatch.setattr("jorgex_social.cli.ReplyTask", reply_task)
+    monkeypatch.setattr("jorgex_social.cli.logs.configure", lambda: None)
+
+    with pytest.raises(Built):
+        main(["worker"])
+
+    assert seen["opt_out_words"] == ("halt", "enough")

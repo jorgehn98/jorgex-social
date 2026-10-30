@@ -11,7 +11,7 @@ from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.errors import AccountRestricted, Refused, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerStatus, ProductType
-from jorgex_social.publishing.models import Media
+from jorgex_social.publishing.models import Media, Post
 from jorgex_social.publishing.worker import LONGEST_ATTEMPT, STALE_ATTEMPT, PublishTask
 from jorgex_social.stats.models import PostSnapshot, RecentMedia
 from jorgex_social.stats.snapshots import SnapshotTask
@@ -984,3 +984,90 @@ def test_credential_lost_mid_attempt_fails_the_post_without_leaving_it_stuck(
     assert (post["status"], post["failure"]) == ("failed", "credential_unavailable")
     assert post["attempts"][0]["result"] == "rejected"
     assert publishes == []
+
+
+# Publishing ceiling
+
+
+def seed_published(sessions, count, published_at, network="simulation"):
+    with sessions() as session, session.begin():
+        session.add_all(
+            Post(
+                network=network,
+                type="image",
+                status="published",
+                published_at=published_at,
+                external_ref=f"seed-{i}",
+                content_hash="seed",
+            )
+            for i in range(count)
+        )
+
+
+def test_at_the_ceiling_the_post_fails_without_calling_instagram(
+    api, task, sessions, ig, clock, requests
+):
+    seed_published(sessions, 50, clock.now() - timedelta(hours=23))
+    post_id = api.post()
+    api.publish_now(post_id)
+
+    task(sessions)
+
+    post = api.get(post_id)
+    assert (post["status"], post["failure"]) == ("failed", "daily_limit")
+    assert post["attempts"] == []
+    assert requests == []
+    assert published(ig) == []
+
+
+@pytest.mark.parametrize(
+    ("count", "age", "network"),
+    [
+        (49, timedelta(hours=1), "simulation"),
+        (50, timedelta(hours=24, seconds=1), "simulation"),
+        (50, timedelta(hours=1), "another-network"),
+    ],
+)
+def test_under_the_ceiling_the_post_publishes(api, task, sessions, ig, clock, count, age, network):
+    seed_published(sessions, count, clock.now() - age, network)
+    post_id = api.post()
+    api.publish_now(post_id)
+
+    task(sessions)
+
+    assert api.get(post_id)["status"] == "published"
+    assert len(published(ig)) == 1
+
+
+def test_the_post_that_reaches_the_ceiling_counts_for_the_next_one(api, task, sessions, ig, clock):
+    seed_published(sessions, 49, clock.now() - timedelta(hours=1))
+    first, second = api.post(), api.post()
+    api.publish_now(first)
+    api.publish_now(second)
+
+    task(sessions)
+
+    assert sorted(api.get(p)["status"] for p in (first, second)) == ["failed", "published"]
+    assert len(published(ig)) == 1
+
+
+def test_a_post_failed_at_the_ceiling_can_be_scheduled_again(
+    api, client, headers, task, sessions, ig, clock
+):
+    seed_published(sessions, 50, clock.now() - timedelta(hours=1))
+    post_id = api.post()
+    api.publish_now(post_id)
+    task(sessions)
+
+    response = client.post(
+        f"/v1/posts/{post_id}/schedule",
+        json={"scheduled_for": (clock.now() + timedelta(hours=24)).isoformat()},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["failure"] is None
+    clock.advance(hours=24)
+    task(sessions)
+
+    assert api.get(post_id)["status"] == "published"
+    assert len(published(ig)) == 1

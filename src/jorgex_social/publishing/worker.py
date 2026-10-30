@@ -71,6 +71,9 @@ STALE_ATTEMPT = LONGEST_ATTEMPT + timedelta(minutes=15)
 # Attempts that did not publish after which a post stops being retried on its own: an unexpected
 # exception that kills the worker every time must not loop forever.
 MAX_ATTEMPTS = 3
+# Our own ceiling on posts published in any 24 hours; Meta's page gives both 50 and 100. Counted
+# from our database, so posts published by hand are not in it and Meta's count is the real limit.
+MAX_POSTS_PER_DAY = 50
 # Instagram timestamps have whole seconds, so a post can look slightly older than its attempt.
 TIMESTAMP_SLACK = timedelta(minutes=1)
 RECENT_MEDIA_TO_SEARCH = 50
@@ -98,6 +101,14 @@ def _audit_post(
     audit.record(
         session, now, action, outcome, object_type="post", object_id=post.id, detail=detail
     )
+
+
+def _fail_unattempted(session: Session, now: datetime, post: Post, failure: str) -> None:
+    """Fails a post that never reached Instagram; it can be scheduled again."""
+    post.status = PostStatus.FAILED
+    post.failure = failure
+    _audit_post(session, now, "post.failed", post, Outcome.ERROR, {"failure": failure})
+    log.warning("post failed unattempted", extra={"post_id": post.id, "failure": failure})
 
 
 class ContainerFailed(Exception):
@@ -178,12 +189,7 @@ class PublishTask:
                 )
             )
             for post in missed:
-                post.status = PostStatus.FAILED
-                post.failure = "missed_schedule"
-                _audit_post(
-                    session, now, "post.failed", post, Outcome.ERROR, {"failure": post.failure}
-                )
-                log.warning("missed schedule", extra={"post_id": post.id})
+                _fail_unattempted(session, now, post, "missed_schedule")
         while self._credential_readable() and (plan := self._start(sessions, now)) is not None:
             self._attempt(sessions, plan)
 
@@ -215,6 +221,10 @@ class PublishTask:
             )
             if post is None:
                 return None
+            if self._published_since(session, now - timedelta(hours=24)) >= MAX_POSTS_PER_DAY:
+                # Any other post due now fails the same way on a later pass.
+                _fail_unattempted(session, now, post, "daily_limit")
+                return None
             attempt = self._new_attempt(session, post)
             media = {m.id: m for m in self._media_of(session, post)}
             for item in media.values():
@@ -234,6 +244,15 @@ class PublishTask:
                 cover_url=url(post.cover_media_id) if post.cover_media_id else None,
                 thumb_offset_ms=post.thumb_offset_ms,
             )
+
+    def _published_since(self, session: Session, since: datetime) -> int:
+        return session.scalar(
+            select(func.count()).where(
+                Post.network == self.instagram.network,
+                Post.status == PostStatus.PUBLISHED,
+                Post.published_at > since,
+            )
+        )
 
     def _new_attempt(
         self, session: Session, post: Post, container_ref: str | None = None

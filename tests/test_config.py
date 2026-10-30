@@ -69,6 +69,18 @@ def test_reads_reply_settings():
     )
 
 
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, ("stop", "unsubscribe", "baja")),
+        ({"JORGEX_SOCIAL_OPT_OUT_WORDS": " Halt , ,no more,"}, ("Halt", "no more")),
+        ({"JORGEX_SOCIAL_OPT_OUT_WORDS": ""}, ()),
+    ],
+)
+def test_reads_opt_out_words(env, expected):
+    assert Settings.from_env(env).opt_out_words == expected
+
+
 def test_retention_must_outlast_the_private_reply_window():
     with pytest.raises(ValueError, match="at least 8"):
         Settings.from_env({"JORGEX_SOCIAL_RETENTION_DAYS": "7"})

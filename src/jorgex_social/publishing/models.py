@@ -89,7 +89,7 @@ class Post(Base):
     published_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     external_ref: Mapped[str | None] = mapped_column(String(64))
     permalink: Mapped[str | None] = mapped_column(String(500))
-    # Why the post is `failed`: missed_schedule, refused, container_error, ...
+    # Why the post is `failed`: missed_schedule, daily_limit, refused, container_error, ...
     failure: Mapped[str | None] = mapped_column(String(32))
     idempotency_key: Mapped[str | None] = mapped_column(String(200), unique=True)
     content_hash: Mapped[str] = mapped_column(String(64))
