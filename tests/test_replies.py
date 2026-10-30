@@ -698,6 +698,32 @@ def test_a_rate_limited_send_waits_for_the_next_poll(client, headers, ig, sessio
     assert len(ig.sent) == 1
 
 
+def test_sends_on_every_pass_but_waits_for_the_next_poll_after_a_rate_limit(
+    client, headers, ig, sessions, clock
+):
+    ConnectionTask(ig, clock, None)(sessions)
+    task = ReplyTask(ig, clock)  # polls every 120 seconds
+    make_rule(client, headers)
+    media = publish(ig)
+    task(sessions)
+    ig.add_comment(media, "precio")
+    clock.advance(seconds=120)
+    ig.fail_next("reply_public", RateLimited("Instagram API 429", code=4))
+    task(sessions)  # polls, the first send is rate limited
+    calls = []
+    original = ig.reply_public
+    ig.reply_public = lambda *args: calls.append(clock.now()) or original(*args)
+
+    clock.advance(seconds=10)
+    task(sessions)  # a pass without a poll: still holding
+    assert calls == []
+    clock.advance(seconds=110)
+    task(sessions)
+
+    assert calls == [START + timedelta(seconds=240)]
+    assert by_action(sessions) == {"public_reply": ("sent", None), "private_reply": ("sent", None)}
+
+
 def test_polls_at_most_once_per_interval(ig, sessions, clock):
     ConnectionTask(ig, clock, None)(sessions)
     task = ReplyTask(ig, clock)  # every 120 seconds

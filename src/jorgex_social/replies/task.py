@@ -1,10 +1,9 @@
-"""Worker task for automatic replies: polls comments and direct messages, evaluates the rules on
-them in memory, sends the replies and purges what is past retention.
+"""Worker task for automatic replies: polls comments and direct messages and hands them to the
+intake (replies/intake.py, shared with the webhook), sends the replies and purges what is past
+retention.
 
-Third-party text exists only in the `Comment` and `Message` objects of one poll: it is matched
-against the rules and dropped, so the database and the logs only ever see identifiers. Each new
-event is stored together with its deliveries in one transaction, so a crash never leaves an
-event that would need its (gone) text to be evaluated again.
+Polling runs every `poll_every`; sending runs on every worker pass, so a reply to something the
+webhook recorded goes out within one pass instead of waiting for the next poll.
 
 Sending follows the publishing worker: one short transaction before the call to Instagram and
 one after, none during it. A reply whose outcome is unknown is never sent again; a duplicate
@@ -20,8 +19,9 @@ from datetime import datetime, timedelta
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from jorgex_social.account import kill_switch
+from jorgex_social.account import incidents, kill_switch
 from jorgex_social.account.credential import connection_of
+from jorgex_social.account.models import IncidentType
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.errors import (
     AuthError,
@@ -31,6 +31,7 @@ from jorgex_social.instagram.errors import (
     Refused,
 )
 from jorgex_social.instagram.types import Instagram
+from jorgex_social.replies.intake import MESSAGING_WINDOW, Intake
 from jorgex_social.replies.models import (
     Action,
     Channel,
@@ -39,24 +40,22 @@ from jorgex_social.replies.models import (
     DeliveryStatus,
     Event,
     Reason,
-    Rule,
+    Source,
 )
-from jorgex_social.replies.rules import active_rules, first_match
+from jorgex_social.replies.rules import active_rules
 
 log = logging.getLogger(__name__)
 
-# instagram.md, «Mensajería»: one private reply per comment within 7 days; a direct message can
-# be answered within 24 hours of the person's last message.
+# instagram.md, «Mensajería»: one private reply per comment within 7 days.
 PRIVATE_REPLY_WINDOW = timedelta(days=7)
-MESSAGING_WINDOW = timedelta(hours=24)
 HOUR = timedelta(hours=1)
 # Comments are polled on media up to this old (newest first, at most this many), plus any media
 # an active rule names. The 7-day window for a private reply counts from the comment, not the post.
 RECENT_MEDIA = timedelta(days=30)
 RECENT_MEDIA_TO_POLL = 50
-# Activity older than retention minus this margin is never evaluated: its event may already be
-# purged, and seeing it again must not answer it again.
-RETENTION_MARGIN = timedelta(days=1)
+# webhook_silent: the webhook has delivered nothing for this long while polling found activity
+# from the same period.
+WEBHOOK_SILENCE = timedelta(hours=24)
 
 # Nothing was sent and the cause affects every send: stop and try again on the next poll.
 _RETRY_LATER = (CredentialUnavailable, AuthError, RateLimited)
@@ -101,6 +100,7 @@ class ReplyTask:
         retention: timedelta = timedelta(days=90),
         cooldown: timedelta = timedelta(minutes=60),
         choose: Callable[[Sequence[str]], str] = random.choice,
+        webhook: bool = False,
     ) -> None:
         self.instagram = instagram
         self.clock = clock
@@ -108,25 +108,37 @@ class ReplyTask:
         self.hourly_cap = hourly_cap
         self.retention = retention
         self.cooldown = cooldown
-        self.choose = choose
+        self.webhook = webhook
+        self.intake = Intake(instagram.network, retention=retention, choose=choose)
+        self._started = clock.now()
         self._last_poll: datetime | None = None
+        # Set when a send failed in a way that affects every send (rate limit, credential):
+        # sending waits for the next poll instead of hitting Instagram on every pass.
+        self._hold_sends = False
         # Conversation id -> the activity already read. In memory: after a restart every recent
         # conversation is read once more, and the events' unique key drops what was seen.
         self._read: dict[str, datetime] = {}
 
     def __call__(self, sessions: sessionmaker) -> None:
         now = self.clock.now()
-        if self._last_poll and now - self._last_poll < self.poll_every:
-            return
-        self._last_poll = now
-        own = self._own_account(sessions)
-        if own is None:
-            log.warning("no connected account yet; not polling comments or messages")
-        else:
-            for name, step in (("comments", self.poll_comments), ("messages", self.poll_messages)):
-                _isolated(f"{name} poll", step, sessions, own, now)
-        _isolated("delivery", self.deliver, sessions)
-        _isolated("purge", self.purge, sessions, now)
+        polling = self._last_poll is None or now - self._last_poll >= self.poll_every
+        if polling:
+            self._last_poll = now
+            self._hold_sends = False
+            own = self._own_account(sessions)
+            if own is None:
+                log.warning("no connected account yet; not polling comments or messages")
+            else:
+                for name, step in (
+                    ("comments", self.poll_comments),
+                    ("messages", self.poll_messages),
+                ):
+                    _isolated(f"{name} poll", step, sessions, own, now)
+        if not self._hold_sends:
+            _isolated("delivery", self.deliver, sessions)
+        if polling:
+            _isolated("purge", self.purge, sessions, now)
+            _isolated("webhook health", self.watch_webhook, sessions, now)
 
     def _own_account(self, sessions: sessionmaker) -> str | None:
         with sessions() as session:
@@ -134,20 +146,6 @@ class ReplyTask:
         return connection.external_account_id if connection else None
 
     # Polling
-
-    def _known(self, session: Session, type_: Channel, refs: list[str]) -> set[str]:
-        return set(
-            session.scalars(
-                select(Event.external_ref).where(
-                    Event.network == self.instagram.network,
-                    Event.type == type_,
-                    Event.external_ref.in_(refs),
-                )
-            )
-        )
-
-    def _evaluable(self, occurred_at: datetime, now: datetime) -> bool:
-        return now - occurred_at < self.retention - RETENTION_MARGIN
 
     def poll_comments(self, sessions: sessionmaker, own: str, now: datetime) -> None:
         recent = [
@@ -169,35 +167,9 @@ class ReplyTask:
                 _log_failure("comments poll", exc, media_ref=media_ref)
 
     def _poll_media(self, sessions: sessionmaker, own: str, now: datetime, media_ref: str) -> None:
-        network = self.instagram.network
         comments = self.instagram.list_comments(media_ref)
-        # The account's own comments never fire a rule (no reply loops). Without an author it
-        # cannot be told apart from one, so it is dropped too.
-        others = [
-            c
-            for c in comments
-            if c.author_id is not None and c.author_id != own and self._evaluable(c.timestamp, now)
-        ]
         with sessions() as session, session.begin():
-            known = self._known(session, Channel.COMMENT, [c.id for c in others])
-            rules = active_rules(session, network, Channel.COMMENT)
-            for comment in others:
-                if comment.id in known:
-                    continue
-                known.add(comment.id)  # the same id twice in one listing is one event
-                rule = first_match(
-                    rules, comment.text, media_ref=media_ref, occurred_at=comment.timestamp
-                )
-                event = Event(
-                    network=network,
-                    type=Channel.COMMENT,
-                    external_ref=comment.id,
-                    media_ref=media_ref,
-                    occurred_at=comment.timestamp,
-                    received_at=now,
-                    rule_id=rule.id if rule else None,
-                )
-                self._record(session, event, rule, now)
+            self.intake.comments(session, own, [(media_ref, c) for c in comments], now, Source.POLL)
 
     def poll_messages(self, sessions: sessionmaker, own: str, now: datetime) -> None:
         for conversation in self.instagram.list_conversations(since=now - MESSAGING_WINDOW):
@@ -215,103 +187,9 @@ class ReplyTask:
     def _poll_conversation(
         self, sessions: sessionmaker, own: str, now: datetime, conversation_id: str
     ) -> None:
-        network = self.instagram.network
         messages = self.instagram.list_messages(conversation_id)
-        # Only what the other person wrote and can still be answered; the account's own
-        # messages (including these replies) never fire a rule.
-        theirs = sorted(
-            (
-                m
-                for m in messages
-                if m.sender_id is not None
-                and m.sender_id != own
-                and now - m.created_at < MESSAGING_WINDOW
-                and self._evaluable(m.created_at, now)
-            ),
-            key=lambda m: m.created_at,
-        )
-        ids = [m.id for m in theirs]
         with sessions() as session, session.begin():
-            known = self._known(session, Channel.MESSAGE, ids)
-            # Our own sends, in case Instagram names their sender with an id other than the one
-            # the connection holds.
-            known |= set(
-                session.scalars(select(Delivery.result_ref).where(Delivery.result_ref.in_(ids)))
-            )
-            rules = active_rules(session, network, Channel.MESSAGE)
-            for message in theirs:
-                if message.id in known:
-                    continue
-                known.add(message.id)
-                person = self._conversation(session, message.sender_id, message.created_at, now)
-                rule = first_match(rules, message.text, occurred_at=message.created_at)
-                event = Event(
-                    network=network,
-                    type=Channel.MESSAGE,
-                    external_ref=message.id,
-                    conversation_id=person.id,
-                    occurred_at=message.created_at,
-                    received_at=now,
-                    rule_id=rule.id if rule else None,
-                )
-                self._record(session, event, rule, now)
-
-    def _conversation(
-        self, session: Session, person_id: str, written_at: datetime, now: datetime
-    ) -> Conversation:
-        network = self.instagram.network
-        conversation = session.scalar(
-            select(Conversation).where(
-                Conversation.network == network, Conversation.external_id == person_id
-            )
-        )
-        if conversation is None:
-            conversation = Conversation(
-                network=network,
-                external_id=person_id,
-                last_user_message_at=written_at,
-                window_until=written_at + MESSAGING_WINDOW,
-                created_at=now,
-                updated_at=now,
-                purge_at=written_at + self.retention,
-            )
-            session.add(conversation)
-            session.flush()
-        elif written_at > conversation.last_user_message_at:
-            # Every new message from the person restarts the 24-hour window.
-            conversation.last_user_message_at = written_at
-            conversation.window_until = written_at + MESSAGING_WINDOW
-            conversation.purge_at = max(conversation.purge_at, written_at + self.retention)
-            conversation.updated_at = now
-        return conversation
-
-    def _record(self, session: Session, event: Event, rule: Rule | None, now: datetime) -> None:
-        """Stores the event and, if a rule fired, its deliveries, each with a variant picked now:
-        replies are only ever the operator's own text, never anything from the event."""
-        session.add(event)
-        session.flush()
-        if rule is None:
-            return
-        if event.type == Channel.COMMENT:
-            planned = (
-                (Action.PUBLIC_REPLY, rule.content.get("public_replies") or []),
-                (Action.PRIVATE_REPLY, rule.content.get("private_replies") or []),
-            )
-        else:
-            planned = ((Action.MESSAGE, rule.content.get("private_replies") or []),)
-        for action, variants in planned:
-            if variants:
-                session.add(
-                    Delivery(
-                        event_id=event.id,
-                        rule_id=rule.id,
-                        action=action,
-                        status=DeliveryStatus.PENDING,
-                        text=self.choose(variants),
-                        created_at=now,
-                    )
-                )
-        log.info("rule matched", extra={"event_id": event.id, "rule_id": rule.id})
+            self.intake.messages(session, own, messages, now, Source.POLL)
 
     # Sending
 
@@ -330,6 +208,7 @@ class ReplyTask:
             try:
                 send = self._prepare(sessions, delivery_id)
                 if send is not None and not self._send(sessions, send):
+                    self._hold_sends = True
                     return
             except Exception as exc:
                 # Left as it was: if attempted_at was written, the next pass fails it as unknown.
@@ -494,3 +373,38 @@ class ReplyTask:
                     ),
                 )
             )
+
+    # Webhook health
+
+    def watch_webhook(self, sessions: sessionmaker, now: datetime) -> None:
+        """Opens webhook_silent when the webhook is configured, has delivered nothing for a day
+        (counting from this worker's start if it never has), and polling found a comment or a
+        message from that day first. A valid notification closes it (replies/webhook.py); so does
+        turning the webhook off."""
+        network = self.instagram.network
+        with sessions() as session, session.begin():
+            if not self.webhook:
+                incidents.sync(session, network, IncidentType.WEBHOOK_SILENT, False, now)
+                return
+            connection = connection_of(session, network)
+            silent_since = (connection and connection.webhook_notified_at) or self._started
+            if now - silent_since < WEBHOOK_SILENCE:
+                return
+            missed = session.scalar(
+                select(func.count())
+                .select_from(Event)
+                .where(
+                    Event.network == network,
+                    Event.source == Source.POLL,
+                    Event.occurred_at > now - WEBHOOK_SILENCE,
+                )
+            )
+            if missed:
+                incidents.sync(
+                    session,
+                    network,
+                    IncidentType.WEBHOOK_SILENT,
+                    True,
+                    now,
+                    {"polled_events": missed},
+                )

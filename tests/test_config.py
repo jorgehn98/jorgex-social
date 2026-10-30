@@ -69,3 +69,31 @@ def test_retention_must_outlast_the_private_reply_window():
     with pytest.raises(ValueError, match="at least 8"):
         Settings.from_env({"JORGEX_SOCIAL_RETENTION_DAYS": "7"})
     assert Settings.from_env({"JORGEX_SOCIAL_RETENTION_DAYS": "8"}).retention_days == 8
+
+
+def test_reads_webhook_settings_and_keeps_secrets_out_of_repr():
+    settings = Settings.from_env(
+        {
+            "JORGEX_SOCIAL_WEBHOOK_VERIFY_TOKEN": " verify-QZX ",
+            "JORGEX_SOCIAL_META_APP_SECRET": "secret-QZX",
+            "JORGEX_SOCIAL_HUMAN_PAUSE_MINUTES": "45",
+        }
+    )
+
+    assert settings.webhook_enabled is True
+    assert settings.webhook_verify_token == "verify-QZX"
+    assert settings.human_pause_minutes == 45
+    assert "QZX" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"JORGEX_SOCIAL_WEBHOOK_VERIFY_TOKEN": "t"},
+        {"JORGEX_SOCIAL_META_APP_SECRET": "s"},
+        {"JORGEX_SOCIAL_WEBHOOK_VERIFY_TOKEN": " ", "JORGEX_SOCIAL_META_APP_SECRET": "s"},
+    ],
+)
+def test_the_webhook_needs_both_secrets(env):
+    assert Settings.from_env(env).webhook_enabled is False

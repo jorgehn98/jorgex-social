@@ -16,6 +16,9 @@ from jorgex_social.account.models import ActorType, AuditEntry, Outcome
 log = logging.getLogger(__name__)
 
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+# Unauthenticated by design and called by Meta on every notification: logging each one would only
+# be noise (the webhook logs its own outcome, without the body).
+UNLOGGED_UNAUTHENTICATED = {"/webhook"}
 
 
 def record(
@@ -104,7 +107,8 @@ class AuditMiddleware:
         if state.get("audit_actor") is None:
             # No valid token (401, or 405 before authentication): writing a row would let anyone
             # take the database write lock at will. Logged instead, without body or credentials.
-            log.info("unauthenticated %s answered %s", action, status_code)
+            if route.path not in UNLOGGED_UNAUTHENTICATED:
+                log.info("unauthenticated %s answered %s", action, status_code)
             return
         object_type, object_id = _object(scope.get("path_params", {}))
         app = scope["app"]

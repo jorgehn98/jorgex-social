@@ -29,6 +29,9 @@ class IncidentType(StrEnum):
     CREDENTIAL_UNREADABLE = "credential_unreadable"
     PERSISTENT_API_ERROR = "persistent_api_error"
     PUBLISH_UNRESOLVED = "publish_unresolved"
+    # The webhook is configured, polling found activity it never delivered and it has been
+    # silent for a day.
+    WEBHOOK_SILENT = "webhook_silent"
 
 
 class ActorType(StrEnum):
@@ -63,6 +66,8 @@ class Connection(Base):
     # On Instagram, the publishing quota.
     limits: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # Last notification from the network's webhook with a valid signature.
+    webhook_notified_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
 
 class ChannelIncident(Base):
