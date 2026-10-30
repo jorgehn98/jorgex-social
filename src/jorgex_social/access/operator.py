@@ -219,9 +219,10 @@ def log_in(
     now: datetime,
 ) -> str | None:
     """Returns a new session id, or None whatever the reason, so the caller cannot tell the
-    reasons apart: only the audit detail does. Raises Busy when no password check slot frees up in time. The checks read
-    in a deferred transaction and run outside any transaction; the write lock is taken only to
-    record the outcome, and never when there is no operator or the code is malformed."""
+    reasons apart: only the audit detail does. Raises Busy when no password check slot frees up
+    in time. The checks read in a deferred transaction and run outside any transaction; the write
+    lock is taken only to record the outcome, and never when there is no operator or the code is
+    malformed."""
     if not TOTP_CODE.fullmatch(code.strip()):
         # Not even shaped like a code (the form only sends six digits): refused before paying
         # for an argon2 check. It says nothing about the password, so it needs no record.
