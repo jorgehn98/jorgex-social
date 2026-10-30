@@ -21,7 +21,7 @@ from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.logs import JsonFormatter
 from jorgex_social.replies.models import Conversation, Delivery, Event, Rule
-from jorgex_social.replies.rules import first_match, matches, rule_warnings
+from jorgex_social.replies.rules import first_match, matches, opt_out_form, rule_warnings
 from jorgex_social.replies.task import ReplyTask
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
@@ -1261,7 +1261,21 @@ def conversations(client, headers):
     return client.get("/v1/conversations", headers=headers).json()
 
 
-@pytest.mark.parametrize("text", ["stop", "STOP", "  Stop ", "unsubscribe", "baja", "BÁJA"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "stop",
+        "STOP",
+        "  Stop ",
+        "unsubscribe",
+        "baja",
+        "BÁJA",
+        "stop.",
+        "Stop!",
+        "¡Baja!",
+        "stop !",
+    ],
+)
 def test_an_opt_out_word_pauses_for_good_and_sends_nothing(
     client, headers, ig, sessions, task, text
 ):
@@ -1424,3 +1438,80 @@ def test_warnings_come_with_every_answer_and_block_nothing(client, headers):
         headers=headers,
     ).json()
     assert fixed["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    ("text", "form"),
+    [
+        ("stop.", "stop"),
+        ("¡BÁJA!!", "baja"),
+        ("...stop...", "stop"),
+        ("stop \U0001f6d1", "stop"),  # a symbol, as emoji are
+        ("stop it", "stop it"),
+        ("stop it.", "stop it"),
+        ("stop.it", "stop.it"),  # only the ends
+        ("...", ""),
+        ("", ""),
+    ],
+)
+def test_opt_out_form(text, form):
+    assert opt_out_form(text) == form
+
+
+@pytest.mark.parametrize("text", ["stop it", "stop it.", "please stop by the store", "...", ""])
+def test_other_text_is_no_opt_out(client, headers, ig, sessions, task, text):
+    ig.add_message(PERSON, text)
+
+    task(sessions)
+
+    [conversation] = conversations(client, headers)
+    assert conversation["paused_forever"] is False
+
+
+def test_a_configured_word_is_compared_without_its_end_marks(client, headers, ig, sessions, clock):
+    ConnectionTask(ig, clock, None)(sessions)
+    ig.add_message(PERSON, "halt")
+
+    ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=["¡Hált!"])(sessions)
+
+    [conversation] = conversations(client, headers)
+    assert conversation["paused_forever"] is True
+
+
+def test_a_word_of_only_marks_never_opts_out(client, headers, ig, sessions, clock):
+    ConnectionTask(ig, clock, None)(sessions)
+    ig.add_message(PERSON, "!!!")
+    ig.add_message(OTHER_PERSON, "")
+
+    ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=["!!!"])(sessions)
+
+    assert [c["paused_forever"] for c in conversations(client, headers)] == [False, False]
+
+
+def test_a_timed_pause_cannot_lift_an_opt_out(client, headers, ig, sessions, task, clock):
+    make_rule(client, headers, channel="message", content=INFO_RULE)
+    ig.add_message(PERSON, "info")
+    task.poll_messages(sessions, ACCOUNT_ID, clock.now())
+    clock.advance(seconds=1)
+    ig.add_message(PERSON, "stop")
+    task.poll_messages(sessions, ACCOUNT_ID, clock.now())
+    [conversation] = conversations(client, headers)
+    pause = f"/v1/conversations/{conversation['id']}/pause"
+
+    until = (clock.now() + timedelta(hours=1)).isoformat()
+    refused = client.post(pause, json={"until": until}, headers=headers)
+    forever = client.post(pause, json={"forever": True}, headers=headers)
+    clock.advance(hours=2)
+    task.deliver(sessions)
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "invalid_state"
+    assert forever.status_code == 200
+    [conversation] = conversations(client, headers)
+    assert (conversation["paused_forever"], conversation["paused_until"]) == (True, None)
+    assert ig.sent == []
+    assert by_action(sessions) == {"message": ("skipped", "paused")}
+
+    client.post(f"/v1/conversations/{conversation['id']}/resume", headers=headers)
+    until = (clock.now() + timedelta(hours=1)).isoformat()
+    assert client.post(pause, json={"until": until}, headers=headers).status_code == 200

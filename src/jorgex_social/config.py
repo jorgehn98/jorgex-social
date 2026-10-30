@@ -85,8 +85,9 @@ class Settings:
     # A direct message the account sent by hand (not one of our replies) pauses automatic replies
     # to that person for this long.
     human_pause_minutes: int = 30
-    # A direct message that is exactly one of these, ignoring case and accents, silences that person
-    # for good (Meta's Developer Policies 5.2b ask to respect opt-outs immediately). Empty: off.
+    # A direct message that is exactly one of these, ignoring case, accents and punctuation or
+    # symbols at its ends, silences that person for good (Meta's Developer Policies 5.2b ask to
+    # respect opt-outs immediately). Empty: off.
     opt_out_words: tuple[str, ...] = ("stop", "unsubscribe", "baja")
     # Peers whose X-Forwarded-For uvicorn believes (comma-separated addresses or networks): the
     # reverse proxy, as seen from the service. Behind Docker that is the network's gateway

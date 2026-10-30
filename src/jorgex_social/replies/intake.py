@@ -28,7 +28,7 @@ from jorgex_social.replies.models import (
     Rule,
     Source,
 )
-from jorgex_social.replies.rules import active_rules, first_match, normalize
+from jorgex_social.replies.rules import active_rules, first_match, opt_out_form
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +52,8 @@ class Intake:
         self.network = network
         self.retention = retention
         self.choose = choose
-        self.opt_out_words = frozenset(map(normalize, opt_out_words))
+        # Without the empty form: a message with no words is not a request to stop.
+        self.opt_out_words = frozenset(filter(None, map(opt_out_form, opt_out_words)))
 
     def _known(self, session: Session, type_: Channel, refs: list[str]) -> set[str]:
         return set(
@@ -142,7 +143,7 @@ class Intake:
             known.add(message.id)
             person = self._conversation(session, message.sender_id, message.created_at, now)
             rule = None
-            if normalize(message.text) in self.opt_out_words:
+            if opt_out_form(message.text) in self.opt_out_words:
                 self._opt_out(session, person, now)
             else:
                 rule = first_match(rules, message.text, occurred_at=message.created_at)

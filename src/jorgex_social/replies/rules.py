@@ -122,6 +122,17 @@ def normalize(text: str) -> str:
     return " ".join(stripped.casefold().split())
 
 
+def _is_edge_mark(char: str) -> bool:
+    return char.isspace() or unicodedata.category(char)[0] in "PS"
+
+
+def opt_out_form(text: str) -> str:
+    """`text` normalized and without punctuation or symbols at its ends, as people write "stop."
+    or "¡baja!". Inside it nothing changes, so "stop it" stays different from "stop"."""
+    normalized = normalize(text)
+    return normalized.strip("".join(filter(_is_edge_mark, normalized)))
+
+
 def _hit(mode: str, text: str, keyword: str) -> bool:
     match mode:
         case "exact":

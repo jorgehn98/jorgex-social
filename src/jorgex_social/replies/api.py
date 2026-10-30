@@ -400,13 +400,16 @@ def pause_conversation(
     """Stop automatic messages to this person, until a time or for good, for example while a
     human answers. Messages already queued are skipped as `paused`. Replies to this person's
     comments are too, but only if Instagram uses the same id for a comment's author and a
-    message's sender, which is not verified."""
+    message's sender, which is not verified. A conversation paused for good, as an opt-out is,
+    refuses `until` with `invalid_state`, so it cannot lift by itself: only resume ends it."""
     if body.forever == (body.until is not None):
         raise _error(422, "invalid_value", "Give either until or forever=true.")
     now = request.app.state.clock.now()
     if body.until is not None and body.until <= now:
         raise _error(422, "in_the_past", "until is in the past.")
     conversation = _conversation(session, network, conversation_id)
+    if conversation.paused_forever and body.until is not None:
+        raise _error(409, "invalid_state", "Paused for good; resume it first.")
     conversation.paused_forever = body.forever
     conversation.paused_until = body.until
     conversation.updated_at = now

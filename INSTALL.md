@@ -442,13 +442,13 @@ Too many automatic replies can get an Instagram account restricted, so they are 
 - A public reply not sent within 24 hours of the comment is skipped.
 - A direct message that is exactly one of `JORGEX_SOCIAL_OPT_OUT_WORDS` (`stop`, `unsubscribe`,
   `baja`) silences that person for good, as Meta's Developer Policies (5.2b) ask to respect opt-outs
-  immediately. Case and accents are ignored, but the whole message must match, so "please stop by the
-  store" does not count and neither does "stop." unless you add it to the list. Nothing is sent back,
-  not even a confirmation, and no rule fires. Replies already pending end as `paused`; those to the
+  immediately. Case, accents and punctuation or symbols at either end are ignored, so "Stop!" counts,
+  but the rest of the message must match exactly, so "stop it" and "please stop by the store" do not.
+  Nothing is sent back, not even a confirmation, and no rule fires. Replies already pending end as `paused`; those to the
   person's comments only if Instagram uses the same id for a comment's author and a message's sender,
   which has not been verified. The person shows as `paused_forever` in `GET /v1/conversations`, with
-  `conversation.opted_out` in the audit log, and `POST /v1/conversations/{id}/resume` undoes it. An
-  empty value turns this off.
+  `conversation.opted_out` in the audit log. Only `POST /v1/conversations/{id}/resume` undoes it: a
+  pause with `until` is refused. An empty value turns this off.
 - Rules get `warnings` in the API, the MCP and the web interface: fewer than 3 public variants, public
   replies on every post, a link in a comment's first private message, or a variant with no letter or
   digit. These are reported by automation users, not published by Meta, so a rule with warnings can
@@ -473,6 +473,9 @@ What the service cannot do for you:
   `sent` means Instagram accepted the reply, not that it reached the person.
 - Do not write captions or replies that require following, liking or commenting to receive promised
   content: Meta's spam policy lists engagement gating.
+- An opt-out written during a full outage of over 24 hours is not seen, because messages that old are
+  not read. Nobody is answered from that time either, but the person stays unpaused, so a later
+  message from them can fire a rule.
 - After an outage of over an hour, check the webhook subscription in Meta's dashboard. Meta's pages
   disagree on whether it unsubscribes the account: one says it may after an hour of failures, another
   talks about 36 hours of retries.

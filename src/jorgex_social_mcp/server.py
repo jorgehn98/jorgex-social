@@ -116,12 +116,13 @@ reported practice, not Meta's published rules, and block nothing: tell the opera
 if you can. Do not write rule copy that requires following, liking or commenting to receive \
 promised content either.
 
-Opt-out: a direct message that is exactly one of the operator's opt-out words pauses that person \
-for good and fires no rule, and nothing is sent back. `list_conversations` shows it as \
+Opt-out: a direct message that is exactly one of the operator's opt-out words, ignoring case, \
+accents and punctuation or symbols at its ends, pauses that person for good and fires no rule, \
+and nothing is sent back. `list_conversations` shows it as \
 paused_forever, and `audit_log` as conversation.opted_out. It reaches their comments under the \
-same condition as a pause. Never `resume_conversation` or `pause_conversation` a paused_forever \
-conversation unless a human asks: either one lifts the opt-out, a pause with until once that time \
-passes. `test_rules` does not apply opt-out words.
+same condition as a pause. Never `resume_conversation` a paused_forever conversation unless a \
+human asks: it lifts the opt-out, and it is the only way to. `pause_conversation` with until is \
+refused there with invalid_state. `test_rules` does not apply opt-out words.
 
 Kill switch (`set_kill_switch`): on, nothing is written to Instagram. Scheduled posts wait, \
 and replies due meanwhile are skipped for good. Off, publishing resumes; posts past their grace \
@@ -141,7 +142,8 @@ description.
 Errors are JSON with a stable code and the HTTP status; act on the code:
 - invalid_token: the token is missing, unknown or revoked; stop. forbidden: this token lacks \
 the group or level named in the error; do not retry, tell the operator.
-- not_found: wrong id. invalid_state: the post or rule is not in a status that allows it (for \
+- not_found: wrong id. invalid_state: the post, rule or conversation is not in a status that \
+allows it (for \
 a post, the error lists status and allowed).
 - content_changed: the post changed since you reviewed it; read it again and review the new \
 content_hash. invalid_post: it fails the catalog; see errors. unknown_media: those media ids \
@@ -589,7 +591,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         one of until or forever. Queued messages to them are skipped. Replies to their comments
         are too, but only when Instagram uses the same id for a comment's author and a message's
         sender, which is not verified. With the webhook configured, a conversation also pauses
-        for a while on its own when the account answers it by hand."""
+        for a while on its own when the account answers it by hand. A conversation paused for
+        good, as an opt-out is, refuses until with invalid_state: only resume_conversation ends
+        it."""
         body = {"until": until, "forever": forever}
         return call(
             "POST",
