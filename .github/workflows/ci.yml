@@ -32,7 +32,12 @@ jobs:
       - run: docker compose up -d --wait --wait-timeout 180 api && docker compose up -d worker
       - run: curl -fsS http://127.0.0.1:8000/health
       - run: test -n "$(docker compose ps --status running --quiet worker)"
-      - run: timeout 60 docker compose stop worker && docker compose logs worker | grep -q "worker stopped"
+      # Stop it only once it is running its loop: a SIGTERM during start-up simply ends the
+      # process (nothing to finish yet), which would not exercise the graceful shutdown.
+      - run: |
+          for _ in $(seq 60); do docker compose logs worker | grep -q "worker started" && break; sleep 1; done
+          timeout 60 docker compose stop worker
+          docker compose logs worker | grep -q "worker stopped"
       - if: failure()
         run: docker compose logs
       - if: always()
