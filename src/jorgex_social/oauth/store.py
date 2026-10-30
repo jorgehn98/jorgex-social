@@ -320,15 +320,17 @@ def _live_refresh(
 def _retry(session: Session, token: OAuthToken, now: datetime) -> bool:
     """A used refresh token presented again within the grace period, while the pair it gave has
     not been used either: the client most likely never received that answer. Once a retry is
-    answered, that pair counts as used (rotate), so only one retry is tolerated."""
+    answered, that pair counts as used (rotate), so only one retry is tolerated. A token marked
+    used by such a retry never produced a pair: it is never a retry itself, or the two holders
+    could each keep rotating their own branch of the family."""
     if token.used_at is None or now - token.used_at > REFRESH_GRACE:
         return False
     children = session.scalars(
         select(OAuthToken.used_at).where(
             OAuthToken.parent_hash == token.hash, OAuthToken.kind == REFRESH
         )
-    )
-    return all(used_at is None for used_at in children)
+    ).all()
+    return bool(children) and all(used_at is None for used_at in children)
 
 
 def check_refresh(session: Session, secret: str, client_id: str, now: datetime) -> bool | None:

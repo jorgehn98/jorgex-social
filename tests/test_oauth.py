@@ -684,6 +684,21 @@ def test_a_retry_cannot_silently_take_the_family_over(app, agent, browser, clock
     assert ("oauth.refresh_reused", "denied") in audit_actions(app)
 
 
+def test_the_pair_a_retry_replaced_ends_the_grant_even_within_the_grace(app, agent, browser):
+    """The client rotated; a thief retried the old token; the client, its access now refused,
+    refreshes at once. That is two holders: the family ends, the thief's branch included."""
+    client_id, first = connect(agent, browser, posts="read")
+    clients_pair = refresh(agent, client_id, first["refresh_token"]).json()
+    thiefs_pair = refresh(agent, client_id, first["refresh_token"]).json()
+
+    replay = refresh(agent, client_id, clients_pair["refresh_token"])
+
+    assert replay.json()["error"] == "invalid_grant"
+    assert api(agent, thiefs_pair["access_token"]).status_code == 401
+    assert refresh(agent, client_id, thiefs_pair["refresh_token"]).status_code == 400
+    assert ("oauth.refresh_reused", "denied") in audit_actions(app)
+
+
 def test_only_one_retry_is_tolerated(agent, browser, clock):
     client_id, first = connect(agent, browser, posts="read")
     refresh(agent, client_id, first["refresh_token"])
