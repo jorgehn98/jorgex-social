@@ -299,7 +299,8 @@ class ReplyTask:
         person = conversation
         if event.author_ref is not None:
             # Finds the pause only if Instagram names a comment's author and a message's sender
-            # with the same id, which is not verified: if it does not, this finds nobody.
+            # with the same id: seen matching in one test, not documented by Meta. If it does not
+            # match, this finds nobody.
             person = session.scalar(
                 select(Conversation).where(
                     Conversation.network == event.network,

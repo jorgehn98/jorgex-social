@@ -11,7 +11,7 @@
       <td>{{ r.name }}{% for w in r.warnings %}<p class="muted">{{ w.message }}</p>{% endfor %}</td>
       <td>{% if r.archived_at %}{{ pill("archived", "draft") }}{% elif r.active %}{{ pill("active") }}{% else %}{{ pill("inactive", "draft") }}{% endif %}</td>
       <td class="mono">{{ r.channel }}</td>
-      <td class="mono">{{ r.media_ref or "every post" }}</td>
+      <td class="mono">{% if r.waiting_for_post %}waiting for post {{ r.post_id }}{% else %}{{ r.media_ref or "every post" }}{% endif %}</td>
       <td>
         <div class="chips">{% for k in r.content.keywords %}<span class="chip">{{ k }}</span>{% endfor %}</div>
         {% if r.content.exclude %}<p class="muted">except: {{ r.content.exclude | join(", ") }}</p>{% endif %}

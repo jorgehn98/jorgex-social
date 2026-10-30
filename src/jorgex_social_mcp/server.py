@@ -106,10 +106,19 @@ shows what it would match and send, sending nothing. `activate_rule` makes it an
 what arrives afterwards. The first matching active rule wins, lowest priority number first. \
 `list_deliveries` shows what was sent or why not; `pause_conversation` silences one person \
 while a human answers, and reaches their comments only when Instagram uses the same id for a \
-comment's author and a message's sender, which is not verified. Each rule answers a person once \
-per post. Replies go out at a limited pace per minute, so a pending one may simply be waiting; \
-public replies expire 24 hours after the comment and have their own, lower hourly cap. A sent \
-delivery means Instagram accepted the reply, not that it was delivered.
+comment's author and a message's sender: seen matching in one test, not documented by Meta. Each \
+rule answers a person once per post. Replies go out at a limited pace per minute, so a pending \
+one may simply be waiting; public replies expire 24 hours after the comment and have their own, \
+lower hourly cap. A sent delivery means Instagram accepted the reply, not that it was delivered.
+
+A rule for a post that is not out yet: `create_post`, `create_rule` with its post_id, \
+`activate_rule`, `schedule_post`, in that order, and nothing else is needed. Until the post is \
+published the rule is waiting_for_post and answers nothing; a rule waiting for a post that is \
+cancelled or failed has the warning post_not_going_out. When the post is published the rule gets \
+its media_ref, and a comment written in the moments before that is answered at the next poll, up \
+to JORGEX_SOCIAL_REPLY_POLL_SECONDS later. This does not work for a post published by hand in the \
+Instagram app: add its media_ref to the rule afterwards with `update_rule`. Comments from before \
+activation are not answered either way, and stories cannot have a rule.
 
 A rule that replies publicly needs at least 3 public variants that differ in more than case, \
 accents or spacing. That is this service's own floor, not a Meta rule, and it is refused with \
@@ -528,7 +537,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     ) -> str:
         """Which rule a sample text would fire and which variants it could send. Stores nothing
         and sends nothing. Opt-out words are not applied: a direct message that is exactly one of
-        them fires no rule, whatever this says."""
+        them fires no rule, whatever this says. With the rule_id of a rule waiting for its post, it
+        shows what the rule would match once bound and a note says it is waiting; otherwise
+        waiting rules fire nothing."""
         body = {"channel": channel, "text": text, "media_ref": media_ref, "rule_id": rule_id}
         return call(
             "POST", "/v1/rules/test", json_body={k: v for k, v in body.items() if v is not None}
@@ -541,6 +552,14 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         media_ref: Annotated[
             str | None,
             Field(description="Only comments on this Instagram media id; omit for every post."),
+        ] = None,
+        post_id: Annotated[
+            str | None,
+            Field(
+                description="Only comments on this post of this service, not yet published or "
+                "already out; not with media_ref, and not a story or a cancelled post. The rule "
+                "waits, answering nothing, until the post is published."
+            ),
         ] = None,
         priority: Annotated[
             int | None, Field(description="Lower is tried first; default 100.")
@@ -555,6 +574,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             "channel": channel,
             "content": content,
             "media_ref": media_ref,
+            "post_id": post_id,
             "priority": priority,
         }
         return call("POST", "/v1/rules", json_body={k: v for k, v in body.items() if v is not None})
@@ -565,11 +585,22 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         content: Annotated[
             RuleContent | None, Field(description="Replaces the whole content.")
         ] = None,
-        media_ref: str | None = None,
+        media_ref: Annotated[
+            str | None, Field(description="Answer on this media id; ends any link to a post.")
+        ] = None,
+        post_id: Annotated[
+            str | None,
+            Field(
+                description="Tie the rule to this post of this service, replacing its media_ref; "
+                "as in create_rule."
+            ),
+        ] = None,
         priority: int | None = None,
         clear: Annotated[
             list[Literal["media_ref"]] | None,
-            Field(description="media_ref: apply the rule to every post."),
+            Field(
+                description="media_ref: apply the rule to every post, ending any link to a post."
+            ),
         ] = None,
     ) -> str:
         """Edit a rule; only the fields given change. An active rule keeps answering, with the
@@ -578,7 +609,13 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         service's own floor, not a Meta rule. A rule stored with fewer keeps answering, but any
         edit, even of its name alone, gets that same refusal until content fixes it. The answer's
         warnings list what automation users report as risky; they block nothing."""
-        given = {"name": name, "content": content, "media_ref": media_ref, "priority": priority}
+        given = {
+            "name": name,
+            "content": content,
+            "media_ref": media_ref,
+            "post_id": post_id,
+            "priority": priority,
+        }
         given = {k: v for k, v in given.items() if v is not None}
         both = sorted(set(clear or []) & set(given))
         if both:
@@ -589,7 +626,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     def activate_rule(rule_id: RuleId) -> str:
         """Start answering with this rule on the real account, unless the service runs in
         simulation. Only comments and messages written from now on fire it. A rule with warnings
-        activates all the same; read them first."""
+        activates all the same; read them first. A rule waiting for its post can be activated, and
+        starts answering when the post is published."""
         return call("POST", "/v1/rules/{}/activate", rule_id)
 
     def deactivate_rule(rule_id: RuleId) -> str:
@@ -611,10 +649,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         """Stop automatic messages to one person, until a time or until resumed; give exactly
         one of until or forever. Queued messages to them are skipped. Replies to their comments
         are too, but only when Instagram uses the same id for a comment's author and a message's
-        sender, which is not verified. With the webhook configured, a conversation also pauses
-        for a while on its own when the account answers it by hand. A conversation paused for
-        good, as an opt-out is, refuses until with invalid_state: only resume_conversation ends
-        it."""
+        sender: seen matching in one test, not documented by Meta. With the webhook configured, a
+        conversation also pauses for a while on its own when the account answers it by hand. A
+        conversation paused for good, as an opt-out is, refuses until with invalid_state: only
+        resume_conversation ends it."""
         body = {"until": until, "forever": forever}
         return call(
             "POST",
