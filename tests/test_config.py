@@ -9,11 +9,16 @@ def test_defaults_to_simulation():
 
 def test_reads_environment():
     settings = Settings.from_env(
-        {"JORGEX_SOCIAL_DATABASE_PATH": "/data/x.db", "JORGEX_SOCIAL_SIMULATION": "false"}
+        {
+            "JORGEX_SOCIAL_DATABASE_PATH": "/data/x.db",
+            "JORGEX_SOCIAL_SIMULATION": "false",
+            "JORGEX_SOCIAL_API_DOCS": "true",
+        }
     )
 
     assert str(settings.database_path) == "/data/x.db"
     assert settings.simulation is False
+    assert settings.api_docs is True
 
 
 def test_rejects_ambiguous_flag():
