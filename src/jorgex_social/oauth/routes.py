@@ -27,7 +27,14 @@ from jorgex_social.access.limits import RateLimiter, client_key
 from jorgex_social.access.tokens import Group, Level, TokenError, normalize_permissions
 from jorgex_social.oauth import store
 from jorgex_social.oauth.provider import Provider
-from jorgex_social.ui.routes import HEADERS, RecentSignIn, read_form, render, same_origin
+from jorgex_social.ui.routes import (
+    HEADERS,
+    RecentSignIn,
+    read_form,
+    render,
+    render_off_loop,
+    same_origin,
+)
 
 log = logging.getLogger(__name__)
 
@@ -168,9 +175,9 @@ async def consent_answer(request: Request, signed_in: RecentSignIn):
                 {group.value: form.get(group.value, Level.DENY.value) for group in Group}
             )
         except TokenError:
-            return render(request, "consent.html", 400, error=GONE)
+            return await render_off_loop(request, "consent.html", 400, error=GONE)
     elif decision != "deny":
-        return render(request, "consent.html", 400, error=GONE)
+        return await render_off_loop(request, "consent.html", 400, error=GONE)
     state = request.app.state
 
     def answer() -> str | None:
@@ -187,7 +194,7 @@ async def consent_answer(request: Request, signed_in: RecentSignIn):
     location = await run_in_threadpool(answer)
     if location is None:
         # Never a redirect: nothing about this request can be trusted to say where to.
-        return render(request, "consent.html", 400, error=GONE)
+        return await render_off_loop(request, "consent.html", 400, error=GONE)
     # 303, so the browser follows with a GET instead of sending the form again.
     return RedirectResponse(location, status_code=303, headers=HEADERS)
 

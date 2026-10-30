@@ -441,3 +441,6 @@ def test_the_consent_card_shows_the_name_and_icon_without_the_menu(app, clock):
     assert 'Acme <span class="accent">One</span>' in page
     assert '<img class="wordmark-icon" src="/ui/icon"' in page
     assert "profile-menu" not in page
+    # CSS could swap the permission columns of a page that grants access.
+    assert "/ui/appearance.css" not in page
+    assert "/ui/appearance.css" in client.get("/ui/login").text

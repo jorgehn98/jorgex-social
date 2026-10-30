@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import html
@@ -1011,3 +1012,22 @@ def test_tokens_issued_near_the_end_of_a_grant_do_not_outlive_it(app, agent, bro
 
     assert api(agent, renewed["access_token"]).status_code == 401
     assert refresh(agent, client_id, renewed["refresh_token"]).json()["error"] == "invalid_grant"
+
+
+def test_a_refused_consent_answer_reads_nothing_on_the_event_loop(app, browser, monkeypatch):
+    on_the_loop = []
+    opened = app.state.read_sessionmaker
+
+    def watched():
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return opened()
+        on_the_loop.append("read session opened on the event loop")
+        return opened()
+
+    monkeypatch.setattr(app.state, "read_sessionmaker", watched)
+
+    for data in ({"decision": "maybe"}, {"decision": "deny", "req": "gone", "nonce": "x"}):
+        assert browser.post("/ui/oauth/consent", data=data).status_code == 400
+    assert on_the_loop == []

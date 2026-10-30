@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Connect a client{% endblock %}
+{# This page grants access: custom CSS could swap its permission columns or hide what is asked. #}
+{% block custom_css %}{% endblock %}
 {% block body %}
 <main class="login">
   {% include "_particles.svg" %}

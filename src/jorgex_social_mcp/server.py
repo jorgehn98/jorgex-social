@@ -537,7 +537,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             str | None,
             Field(
                 description="CSS up to 256 KB, loaded after the default stylesheet; it can load "
-                "same-origin resources only and run no script. An empty string removes it."
+                "same-origin resources only and run no script. Every page but the OAuth consent "
+                "page loads it, since CSS there could disguise a grant. An empty string removes "
+                "it."
             ),
         ] = None,
         icon_base64: Annotated[

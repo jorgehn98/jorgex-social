@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import json
@@ -1116,10 +1117,23 @@ def test_settings_with_an_old_sign_in_asks_for_credentials_and_returns(signed_in
 def test_an_old_sign_in_cannot_save(app, signed_in, clock):
     clock.advance(hours=1)
 
-    assert save(signed_in, name="Other").status_code == 303
+    response = save(signed_in, name="Other")
 
+    assert response.status_code == 303
+    # Back to Settings once signed in again, not Home; what was typed is not kept.
+    assert response.headers["location"] == "/ui/login?" + urlencode({"next": SETTINGS})
     assert "Other" not in signed_in.get("/ui/login").text
     assert appearance_audit(app) == []
+
+
+def test_a_post_without_a_session_gets_no_return_path(client):
+    response = save(client, name="Other")
+
+    assert response.headers["location"] == "/ui/login"
+
+
+def test_the_page_warns_that_saving_needs_a_recent_sign_in(signed_in):
+    assert "Saving requires a sign-in under an hour old" in signed_in.get(SETTINGS).text
 
 
 def test_a_foreign_origin_cannot_save(app, signed_in):
@@ -1553,3 +1567,55 @@ def test_cli_reset_appearance_recovers_and_audits(app, signed_in, cli_env, capsy
     assert visitor.get("/ui/appearance.css").text == ""
     (actor, detail) = appearance_audit(app)[-1]
     assert (actor, json.loads(detail)) == ("operator", {"changed": ["name", "css"]})
+
+
+def _record_reads_on_the_loop(app, monkeypatch) -> list[str]:
+    """Blocking on the event loop stalls every endpoint, so no read may start on it."""
+    on_the_loop = []
+    opened = app.state.read_sessionmaker
+
+    def watched():
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return opened()
+        on_the_loop.append("read session opened on the event loop")
+        return opened()
+
+    monkeypatch.setattr(app.state, "read_sessionmaker", watched)
+    return on_the_loop
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_a_failed_sign_in_reads_nothing_on_the_event_loop(app, client, clock, monkeypatch):
+    on_the_loop = _record_reads_on_the_loop(app, monkeypatch)
+
+    response = log_in(client, clock, password="wrong password!!")
+
+    assert response.status_code == 401
+    assert "· Social</title>" in response.text
+    assert on_the_loop == []
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_a_busy_sign_in_reads_nothing_on_the_event_loop(app, client, clock, monkeypatch):
+    def busy(*_):
+        raise operator.Busy
+
+    monkeypatch.setattr(operator, "log_in", busy)
+    on_the_loop = _record_reads_on_the_loop(app, monkeypatch)
+
+    response = log_in(client, clock)
+
+    assert response.status_code == 503
+    assert on_the_loop == []
+
+
+def test_the_saved_name_shows_on_a_failed_sign_in(app, signed_in, clock):
+    save(signed_in, name="Acme")
+    clock.advance(minutes=1)
+
+    response = log_in(TestClient(app, base_url=LOCAL, headers={"origin": LOCAL}), clock, "wrong!!")
+
+    assert response.status_code == 401
+    assert "· Acme</title>" in response.text

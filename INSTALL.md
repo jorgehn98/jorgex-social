@@ -317,10 +317,13 @@ right and go to Settings, Appearance:
   a CSS variable; the page lists them all with their defaults and has a complete light theme to copy.
   A custom property that is not on the list gets a notice in case it is a typo, and is saved all the
   same. The pages' Content-Security-Policy limits your CSS to resources from this site, with no script.
+  It applies everywhere except the OAuth consent page, which keeps only your name and icon: that page
+  grants access to your account, and CSS could disguise what you are granting.
 - **Icon**, a PNG, ICO or SVG file up to 256 KB, used as the favicon and beside the name.
 
 The name, CSS and icon are public, because the sign-in page needs them, so put nothing private there.
-They live in the database, so your backups carry them. Agents use `GET` and `PUT /v1/appearance` with
+They live in the database, so your backups carry them. Saving requires a sign-in under an hour old
+and a refused save loses what you typed, so long CSS edits are safer in a file. Agents use `GET` and `PUT /v1/appearance` with
 the `account` group, or the MCP tools `get_appearance` and `set_appearance`.
 
 CSS can hide the page that would undo it (`body { display: none }`). To recover, on the server:

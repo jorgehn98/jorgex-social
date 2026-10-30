@@ -820,3 +820,14 @@ def test_appearance_changes_are_audited_without_their_content(app, client, heade
         ).all()
     assert entry.detail == {"changed": ["name", "css"]}
     assert entry.actor_type == "token"
+
+
+def test_going_back_to_a_default_answers_the_default(client, headers):
+    icon = base64.b64encode(PNG).decode()
+    put_appearance(client, headers, name="Acme", css="a {}", icon_base64=icon)
+
+    # One at a time: each removes a row, and the same request reads it back for its answer. A later
+    # read of a row not yet loaded would flush the removal and hide the bug.
+    assert put_appearance(client, headers, name="Social").json()["name"] == "Social"
+    assert put_appearance(client, headers, css="").json()["css"] == ""
+    assert put_appearance(client, headers, clear_icon=True).json()["icon"] is None

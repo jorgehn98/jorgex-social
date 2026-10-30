@@ -266,7 +266,8 @@ def set_appearance(body: AppearanceIn, request: Request, session: SessionDep):
     """Name: 1 to 40 characters after stripping. Name highlight: a part of the name, shown in the
     accent colour (first occurrence, case-sensitive); changing the name so that the highlight no
     longer occurs is refused unless the request also changes or empties `name_highlight`. CSS: up
-    to 256 KB, stored as sent; the pages' CSP limits it to same-origin resources and no script.
+    to 256 KB, stored as sent; the pages' CSP limits it to same-origin resources and no script,
+    and the OAuth consent page does not load it.
     Icon: PNG, ICO or SVG up to 256 KB, base64, its type decided by its content. Anything else is
     422 `invalid_appearance`, and nothing changes. `warnings` lists custom properties in the CSS
     this interface does not read: likely typos, saved all the same."""

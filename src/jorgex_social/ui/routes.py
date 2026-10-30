@@ -199,11 +199,23 @@ def render(
     )
 
 
+async def render_off_loop(
+    request: Request, name: str, status_code: int = 200, **context
+) -> Response:
+    """`render` for async handlers. Its read would otherwise block the event loop for as long as the
+    pool makes it wait, and the connections it waits for need that loop to be released."""
+    product_name = await run_in_threadpool(_product_name, request)
+    return render(request, name, status_code, product_name=product_name, **context)
+
+
 def _login_redirect(request: Request, reason: LoginRequired) -> Response:
     location = "/ui/login"
     back = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     if request.method == "GET" and safe_next(back) == back != HOME:
         location += "?" + urlencode({"next": back})
+    elif isinstance(reason, SignInTooOld) and request.url.path.startswith("/ui/settings/"):
+        # The form cannot be kept, but the operator goes back to it rather than to Home.
+        location += "?" + urlencode({"next": SETTINGS_HOME})
     response = RedirectResponse(location, status_code=303, headers=HEADERS)
     # Expired or unknown: no use keeping it.
     if COOKIE in request.cookies and not isinstance(reason, SignInTooOld):
@@ -352,9 +364,9 @@ async def login(request: Request):
         )
     except operator.Busy:
         log.warning("sign-in refused: every password check slot is busy")
-        return render(request, "login.html", 503, error=BUSY, next=next_page)
+        return await render_off_loop(request, "login.html", 503, error=BUSY, next=next_page)
     if session_id is None:
-        return render(request, "login.html", 401, error=INVALID, next=next_page)
+        return await render_off_loop(request, "login.html", 401, error=INVALID, next=next_page)
     try:
         # The cookie it replaces would otherwise stay valid for days, unseen.
         await run_in_threadpool(_end_presented_session, request)

@@ -213,7 +213,10 @@ def update(
         values["css"] = _clean_css(css)
     if icon is not None:
         values["icon"] = _clean_icon(icon)
-    return [field for field, value in values.items() if _put(session, _KEYS[field], value, now)]
+    changed = [field for field, value in values.items() if _put(session, _KEYS[field], value, now)]
+    # A removed row stays readable through session.get until flushed, and callers read it back.
+    session.flush()
+    return changed
 
 
 def update_by_operator(session: Session, now: datetime, **changes: Any) -> list[str]:
