@@ -5,7 +5,7 @@
 <section class="hero">
   {% include "_particles.svg" %}
   <h1>{% if account.account %}@{{ account.account.username }}{% else %}No account connected{% endif %}</h1>
-  <p class="muted">{{ account.network }} · read-only view</p>
+  <p class="muted">{{ account.network }}</p>
 </section>
 
 <div class="grid">

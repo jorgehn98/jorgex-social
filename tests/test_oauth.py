@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import html
@@ -20,7 +21,7 @@ from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
 from sqlalchemy import select, text
 
 from jorgex_social.access import operator
-from jorgex_social.account import crypto
+from jorgex_social.account import appearance, crypto
 from jorgex_social.api import create_app
 from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
@@ -1011,3 +1012,37 @@ def test_tokens_issued_near_the_end_of_a_grant_do_not_outlive_it(app, agent, bro
 
     assert api(agent, renewed["access_token"]).status_code == 401
     assert refresh(agent, client_id, renewed["refresh_token"]).json()["error"] == "invalid_grant"
+
+
+def test_a_refused_consent_answer_reads_nothing_on_the_event_loop(app, browser, monkeypatch):
+    on_the_loop = []
+    opened = app.state.read_sessionmaker
+
+    def watched():
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return opened()
+        on_the_loop.append("read session opened on the event loop")
+        return opened()
+
+    monkeypatch.setattr(app.state, "read_sessionmaker", watched)
+
+    for data in ({"decision": "maybe"}, {"decision": "deny", "req": "gone", "nonce": "x"}):
+        assert browser.post("/ui/oauth/consent", data=data).status_code == 400
+    assert on_the_loop == []
+
+
+def test_an_oauth_token_with_account_write_cannot_write_css(app, agent, browser, clock):
+    with app.state.sessionmaker() as session, session.begin():
+        appearance.update_by_operator(session, clock.now(), css="kept {}")
+    _, tokens = connect(agent, browser, account="write")
+    token = tokens["access_token"]
+
+    refused = api(agent, token, "/v1/appearance", "PUT", json={"css": "a { display: none; }"})
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["code"] == "invalid_appearance"
+    assert api(agent, token, "/v1/appearance").json()["css"] == "kept {}"
+    saved = api(agent, token, "/v1/appearance", "PUT", json={"name": "Acme"})
+    assert saved.json()["name"] == "Acme"

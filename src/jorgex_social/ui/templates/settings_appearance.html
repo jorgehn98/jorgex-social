@@ -1,0 +1,41 @@
+{% extends "settings_layout.html" %}
+{% block title %}Appearance{% endblock %}
+{% block section %}
+{% if error %}<p class="notice" role="alert">{{ error }}</p>{% elif saved %}<p class="notice saved" role="status">Saved.</p>{% endif %}
+{% for warning in warnings %}<p class="notice warning" role="status">{{ warning }}</p>{% endfor %}
+<form class="card settings" method="post" action="/ui/settings/appearance" enctype="multipart/form-data">
+  <label for="name">Product name</label>
+  <input id="name" name="name" value="{{ form.name }}" maxlength="40" required>
+
+  <label for="name_highlight">Part of the name in the accent colour (optional, exactly as written in the name)</label>
+  <input id="name_highlight" name="name_highlight" value="{{ form.name_highlight }}" maxlength="40">
+
+  <label for="css">Custom CSS, up to 256 KB, loaded after the default stylesheet</label>
+  <textarea id="css" name="css" rows="12" spellcheck="false">
+{{ form.css }}</textarea>
+
+  <label for="icon">Icon: PNG, ICO or SVG, up to 256 KB</label>
+  <p class="settings-icon"><img src="/ui/icon" alt="Current icon" width="48" height="48"> <span class="muted">{% if has_icon %}Your icon{% else %}The default icon{% endif %}</span></p>
+  <input id="icon" name="icon" type="file" accept=".png,.ico,.svg">
+  {% if has_icon %}<label class="check"><input name="clear_icon" type="checkbox"> Remove the icon</label>{% endif %}
+
+  <button class="primary" type="submit">Save</button>
+  <button type="submit" name="reset" value="1" formnovalidate>Reset appearance</button>
+</form>
+
+<p class="muted">Saving requires a sign-in under an hour old, and a save refused for that loses what you typed, so long edits are safer in a file.</p>
+
+<h2>What your CSS can change</h2>
+<p class="muted">Only you can edit it, here: the API and agents can read it but not change it, because CSS can change what a page shows, such as hiding an open incident. It applies to every page except the OAuth consent page, which grants access to your account: CSS there could disguise what you are granting, so that page keeps only your name and icon. It can use images and fonts from this site only, and cannot run scripts. <code>.wordmark-icon</code> is the icon beside the name, and <code>.wordmark .accent</code> its highlighted part. These variables can be overridden; the value shown is the default. A custom property you declare that is not listed here is reported above in case it is a typo: it does nothing by itself, and your own variables are fine.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Variable</th><th>Default</th></tr></thead>
+  <tbody>
+  {% for variable, value in variables.items() %}
+    <tr><td class="mono">{{ variable }}</td><td class="mono">{{ value }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+<p class="muted">A light theme, for example:</p>
+<pre class="card mono">{{ light_theme }}</pre>
+<p class="muted">If your CSS ever hides this page, <code>jorgex-social reset-appearance</code> on the server puts everything back.</p>
+{% endblock %}

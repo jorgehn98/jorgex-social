@@ -1,5 +1,6 @@
-/* jorgex-social web interface. Dark only. Tokens share names and values with the JorgeX sites;
-   components paint with tokens, and tints are color-mix() of a token, never a loose hex. */
+/* The web interface. Dark by default, and an installation's own CSS can override every token in
+   :root (the Settings page lists them, read from this file). Components paint only with tokens, and
+   tints are color-mix() of a token, never a loose colour; tests/test_ui.py keeps that true. */
 
 @font-face {
   font-family: "Outfit";
@@ -22,7 +23,7 @@
 
 :root {
   color-scheme: dark;
-  --deep-dark: #101113;
+  --bg: #101113;
   --surface: #18191d;
   --surface-raised: #1d1f24;
   --surface-muted: #141518;
@@ -31,12 +32,14 @@
   --fg-1: #f3f4f6;
   --fg-2: #d1d5db;
   --fg-muted: #9ca3af;
-  --cyan-400: #22d3ee;
-  --cyan-300: #67e8f9;
-  --purple-400: #a78bfa;
+  --accent: #22d3ee;
+  --accent-hover: #67e8f9;
+  --accent-2: #a78bfa;
+  --on-accent: #101113;
   --danger: #f87171;
   --warning: #fbbf24;
   --success: #34d399;
+  --shadow: #000000;
 
   --radius-sm: 8px;
   --radius-md: 12px;
@@ -57,7 +60,7 @@
 
 body {
   margin: 0;
-  background: var(--deep-dark);
+  background: var(--bg);
   color: var(--fg-2);
   font: 400 15px/1.55 var(--font-body);
   -webkit-font-smoothing: antialiased;
@@ -65,17 +68,17 @@ body {
 
 /* One focus rule for everything. */
 :focus-visible {
-  outline: 2px solid var(--cyan-400);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 a {
-  color: var(--cyan-400);
+  color: var(--accent);
   text-decoration: none;
   transition: color 0.2s var(--ease);
 }
 a:hover {
-  color: var(--cyan-300);
+  color: var(--accent-hover);
 }
 
 h1,
@@ -148,8 +151,14 @@ main {
 .wordmark:hover {
   color: var(--fg-1);
 }
-.wordmark .x {
-  color: var(--cyan-400);
+.wordmark .accent {
+  color: var(--accent);
+}
+.wordmark-icon {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin-right: 0.5rem;
+  vertical-align: -0.25em;
 }
 
 nav {
@@ -158,8 +167,57 @@ nav {
   gap: 0.25rem;
   flex: 1;
 }
-.top form {
+.profile-menu {
+  position: relative;
   margin-left: auto;
+}
+.profile-menu > summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: var(--radius-pill);
+  color: var(--fg-muted);
+  cursor: pointer;
+  list-style: none;
+}
+.profile-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.profile-menu > summary:hover,
+.profile-menu[open] > summary {
+  color: var(--fg-1);
+  background: var(--surface-raised);
+}
+.profile-menu ul {
+  position: absolute;
+  right: 0;
+  z-index: 10;
+  min-width: 10rem;
+  margin: 0.25rem 0 0;
+  padding: 0.25rem;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.profile-menu a,
+.profile-menu button {
+  display: block;
+  width: 100%;
+  padding: 0.4rem 0.7rem;
+  font: 400 0.9rem var(--font-body);
+  text-align: left;
+  color: var(--fg-2);
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+}
+.profile-menu a:hover,
+.profile-menu button:hover {
+  color: var(--fg-1);
+  background: var(--surface-raised);
 }
 @media (max-width: 40rem) {
   nav {
@@ -204,14 +262,14 @@ button:hover {
   border-color: var(--border-strong);
 }
 button.primary {
-  background: var(--cyan-400);
-  border-color: var(--cyan-400);
-  color: var(--deep-dark);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
   font-weight: 600;
 }
 button.primary:hover {
-  background: var(--cyan-300);
-  border-color: var(--cyan-300);
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 button.primary:focus-visible {
   outline-color: var(--fg-1);
@@ -223,7 +281,8 @@ label {
   color: var(--fg-muted);
   margin-bottom: 0.35rem;
 }
-input {
+input,
+textarea {
   width: 100%;
   font: 400 1rem var(--font-body);
   color: var(--fg-1);
@@ -235,7 +294,9 @@ input {
   transition: border-color 0.2s var(--ease);
 }
 input:hover,
-input:focus {
+input:focus,
+textarea:hover,
+textarea:focus {
   border-color: var(--border-strong);
 }
 input.code {
@@ -304,6 +365,44 @@ details.folded > summary:hover h2 {
   border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
   background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--fg-1);
+}
+.notice.saved {
+  border-color: color-mix(in srgb, var(--success) 40%, transparent);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+}
+.notice.warning {
+  border-color: color-mix(in srgb, var(--warning) 40%, transparent);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+
+/* Settings */
+
+.settings-sections {
+  margin-bottom: 1rem;
+}
+.settings textarea {
+  display: block;
+  resize: vertical;
+  font: 400 0.85rem/1.5 var(--font-mono);
+}
+.settings-icon {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.settings .check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.settings .check input {
+  width: auto;
+  margin: 0;
+}
+pre.card {
+  overflow-x: auto;
+  color: var(--fg-2);
 }
 
 /* Tables */
@@ -430,7 +529,7 @@ ul.variants {
 .pill.scheduled,
 .pill.publishing,
 .pill.pending {
-  --tone: var(--cyan-400);
+  --tone: var(--accent);
 }
 .pill.outcome_unknown,
 .pill.expiring,
@@ -459,19 +558,19 @@ ul.variants {
   pointer-events: none;
 }
 .particles .p0 {
-  fill: var(--cyan-400);
+  fill: var(--accent);
 }
 .particles .p1 {
-  fill: color-mix(in oklab, var(--cyan-400) 75%, var(--purple-400));
+  fill: color-mix(in oklab, var(--accent) 75%, var(--accent-2));
 }
 .particles .p2 {
-  fill: color-mix(in oklab, var(--cyan-400) 50%, var(--purple-400));
+  fill: color-mix(in oklab, var(--accent) 50%, var(--accent-2));
 }
 .particles .p3 {
-  fill: color-mix(in oklab, var(--cyan-400) 25%, var(--purple-400));
+  fill: color-mix(in oklab, var(--accent) 25%, var(--accent-2));
 }
 .particles .p4 {
-  fill: var(--purple-400);
+  fill: var(--accent-2);
 }
 
 .hero {
@@ -502,7 +601,7 @@ ul.variants {
   position: relative;
   width: min(100%, 24rem);
   padding: 2rem;
-  box-shadow: 0 24px 48px -24px color-mix(in srgb, black 60%, transparent);
+  box-shadow: 0 24px 48px -24px color-mix(in srgb, var(--shadow) 60%, transparent);
 }
 .login .wordmark {
   display: block;
@@ -512,7 +611,7 @@ ul.variants {
   width: 100%;
 }
 
-/* Charts: one series each, cyan first, purple second. */
+/* Charts: one series each, the accent first, the second accent second. */
 
 .chart {
   width: 100%;
@@ -538,16 +637,16 @@ ul.variants {
   stroke-width: 2;
 }
 .chart--primary .chart-line {
-  stroke: var(--cyan-400);
+  stroke: var(--accent);
 }
 .chart--primary .chart-point {
-  fill: var(--cyan-400);
+  fill: var(--accent);
 }
 .chart--secondary .chart-line {
-  stroke: var(--purple-400);
+  stroke: var(--accent-2);
 }
 .chart--secondary .chart-point {
-  fill: var(--purple-400);
+  fill: var(--accent-2);
 }
 .legend-key {
   display: inline-block;
@@ -555,10 +654,10 @@ ul.variants {
   height: 2px;
   vertical-align: middle;
   margin-right: 0.4rem;
-  background: var(--cyan-400);
+  background: var(--accent);
 }
 .legend-key.secondary {
-  background: var(--purple-400);
+  background: var(--accent-2);
 }
 
 @media (prefers-reduced-motion: reduce) {

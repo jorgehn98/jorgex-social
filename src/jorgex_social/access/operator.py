@@ -26,7 +26,8 @@ log = logging.getLogger(__name__)
 
 SESSION_LIFETIME = timedelta(days=7)
 IDLE_TIMEOUT = timedelta(hours=24)
-# OAuth consent can grant a client full control, so a long session alone is not enough for it.
+# OAuth consent can grant a client full control and Settings changes what every page serves, so a
+# long session alone is not enough for them.
 CONSENT_MAX_SIGN_IN_AGE = timedelta(hours=1)
 # last_activity_at is only as precise as this, so browsing does not write on every page.
 ACTIVITY_RESOLUTION = timedelta(minutes=1)

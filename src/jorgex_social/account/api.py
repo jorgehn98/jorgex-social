@@ -2,12 +2,13 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-from jorgex_social.access.deps import SessionDep, require
+from jorgex_social.access.deps import ReadSessionDep, SessionDep, require
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import audit, incidents, kill_switch
+from jorgex_social.account import appearance, audit, incidents, kill_switch
 from jorgex_social.account.connection import status_at
 from jorgex_social.account.credential import connection_of
 from jorgex_social.account.models import (
@@ -19,6 +20,7 @@ from jorgex_social.account.models import (
 from jorgex_social.instagram.fake import FakeInstagram
 
 router = APIRouter(prefix="/v1/account", tags=["account"])
+appearance_router = APIRouter(prefix="/v1/appearance", tags=["account"])
 
 AccountRead = [Depends(require(Group.ACCOUNT, Level.READ))]
 AccountWrite = [Depends(require(Group.ACCOUNT, Level.WRITE))]
@@ -84,6 +86,57 @@ class AuditEntryOut(BaseModel):
     object_id: str | None
     outcome: str
     detail: dict[str, Any] | None
+
+
+class IconOut(BaseModel):
+    type: str
+    bytes: int
+
+
+class AppearanceSaved(BaseModel):
+    name: str
+    # The part of the name shown in the accent colour; empty for none.
+    name_highlight: str
+    # Null: the default icon.
+    icon: IconOut | None
+
+
+class AppearanceOut(AppearanceSaved):
+    css: str
+    # What the CSS can override, with the default values.
+    variables: dict[str, str]
+    # Custom properties in the CSS this interface does not read: likely typos. They block nothing.
+    warnings: list[str]
+
+
+class AppearanceIn(BaseModel):
+    """Only what is sent changes. Null or absent leaves a field as it is. There is no `css`, on
+    purpose: see `set_appearance`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_css(cls, data: Any) -> Any:
+        # Before extra="forbid", whose message would not tell an agent where CSS is edited.
+        if isinstance(data, dict) and "css" in data:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "code": "invalid_appearance",
+                    "message": "CSS can only be edited by the operator, in Settings.",
+                },
+            )
+        return data
+
+    name: str | None = None
+    # An empty string removes it. A new name the current highlight does not occur in is refused
+    # unless this is sent too.
+    name_highlight: str | None = None
+    icon_base64: str | None = None
+    clear_icon: bool = False
+    # Back to the default name and icon; the CSS stays. Alone: not with the fields above.
+    reset: bool = False
 
 
 @router.get("", response_model=AccountOut, dependencies=AccountRead)
@@ -204,3 +257,64 @@ def list_audit(
     # Ids are UUIDv7, so they break ties between entries written in the same instant in order.
     query = query.order_by(AuditEntry.occurred_at.desc(), AuditEntry.id.desc())
     return session.scalars(query.limit(limit).offset(offset)).all()
+
+
+def _appearance_saved(session: Session) -> AppearanceSaved:
+    name = appearance.name_of(session)
+    icon = appearance.icon_of(session)
+    return AppearanceSaved(
+        name=name.text,
+        name_highlight=name.highlight,
+        icon=icon and IconOut(type=icon.type, bytes=len(icon.data)),
+    )
+
+
+def _appearance_out(session: Session) -> AppearanceOut:
+    css = appearance.css_of(session)
+    return AppearanceOut(
+        **_appearance_saved(session).model_dump(),
+        css=css,
+        variables=appearance.VARIABLES,
+        warnings=appearance.warnings(css),
+    )
+
+
+@appearance_router.get("", response_model=AppearanceOut, dependencies=AccountRead)
+def get_appearance(session: ReadSessionDep):
+    """The product name, the CSS loaded after the default stylesheet, the icon's type and size,
+    the variables the CSS can override, and `warnings`: custom properties in the CSS this interface
+    does not read, likely typos. The icon itself is at `GET /ui/icon`."""
+    return _appearance_out(session)
+
+
+# A deliberate exception to the rule that everything the platform does reaches the API and the MCP:
+# CSS cannot be written here, whatever the token's permissions. Valid CSS can change what a page
+# shows, for example hide an open incident, so it would let an agent hide things from the operator
+# who oversees it. Do not add it back. The operator edits it in Settings; reading it is harmless.
+@appearance_router.put("", response_model=AppearanceSaved, dependencies=AccountWrite)
+def set_appearance(body: AppearanceIn, request: Request, session: SessionDep):
+    """Name: 1 to 40 characters after stripping. Name highlight: a part of the name, shown in the
+    accent colour (first occurrence, case-sensitive); changing the name so that the highlight no
+    longer occurs is refused unless the request also changes or empties `name_highlight`. Icon:
+    PNG, ICO or SVG up to 256 KB, base64, its type decided by its content. `reset` puts the name,
+    highlight and icon back to their defaults and leaves the CSS untouched. Anything else is 422
+    `invalid_appearance`, and nothing changes.
+
+    CSS cannot be sent here: the operator edits it in Settings."""
+    try:
+        changed = appearance.update(
+            session,
+            request.app.state.clock.now(),
+            name=body.name,
+            name_highlight=body.name_highlight,
+            icon=None if body.icon_base64 is None else appearance.decode_icon(body.icon_base64),
+            clear_icon=body.clear_icon,
+            reset=body.reset,
+        )
+    except appearance.InvalidAppearance as error:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "invalid_appearance", "message": str(error)},
+        ) from None
+    audit.set_detail(request, {"changed": changed})
+    return _appearance_saved(session)

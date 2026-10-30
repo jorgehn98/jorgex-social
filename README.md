@@ -14,8 +14,9 @@ through an authenticated REST API, so an AI agent can operate it end to end.
 - Replies to comments and direct messages by rules ("if a comment on this post contains X, reply
   with one of these versions"), within Meta's limits: one private reply per comment within 7 days,
   and direct messages only within 24 hours of the person's last message.
-- Exposes all of it through a REST API, a thin [MCP server](#mcp-server) for agents, and a
-  read-only web interface.
+- Exposes all of it through a REST API, a thin [MCP server](#mcp-server) for agents, and a web
+  interface that shows it. Each installation sets the interface's own name, CSS and icon
+  ([Your own look](INSTALL.md#your-own-look)).
 
 ## What it does not do
 

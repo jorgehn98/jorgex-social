@@ -1,1 +1,1 @@
-"""Read-only web interface for the operator, under /ui."""
+"""Web interface for the operator, under /ui."""

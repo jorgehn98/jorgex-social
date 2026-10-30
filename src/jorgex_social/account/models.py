@@ -43,7 +43,7 @@ class IncidentType(StrEnum):
 class ActorType(StrEnum):
     TOKEN = "token"
     SYSTEM = "system"
-    OPERATOR = "operator"  # commands run on the server, such as connect-instagram
+    OPERATOR = "operator"  # commands run on the server, such as connect-instagram, and Settings
 
 
 class Outcome(StrEnum):

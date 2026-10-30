@@ -1,23 +1,27 @@
-"""Read-only web interface for the operator (docs: interfaz). Pages read through the read-only
-session and reuse the API's own query functions; only signing in and out write."""
+"""Web interface for the operator (docs: interfaz). Pages read through the read-only session and
+reuse the API's own query functions; only signing in and out and Settings write."""
 
+import hashlib
 import ipaddress
 import logging
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
 
 from jorgex_social.access import operator
 from jorgex_social.access.deps import ReadSessionDep
 from jorgex_social.access.limits import client_key, is_listed
 from jorgex_social.access.models import OperatorSession
 from jorgex_social.access.proxy import via_proxy
+from jorgex_social.account import appearance
 from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
@@ -35,6 +39,12 @@ TOO_MANY = "Too many attempts. Try again later."
 BUSY = "The server is busy. Try again in a moment."
 HOME = "/ui/"
 MAX_FORM_BYTES = 4096
+# Appearance alone carries a CSS and an icon, each of up to 256 KB.
+MAX_SETTINGS_BYTES = 1024 * 1024
+SETTINGS_HOME = "/ui/settings/appearance"
+DEFAULT_ICON = (HERE / "static" / "favicon.svg").read_bytes()
+# An SVG opened directly is a document on this origin: this keeps any script in it from running.
+ICON_HEADERS = {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox"}
 # The pages need nothing from anywhere else: no scripts at all, styles, fonts and images from
 # this origin only.
 HEADERS = {
@@ -151,10 +161,51 @@ def require_operator(request: Request) -> OperatorSession:
     return found
 
 
-def render(request: Request, name: str, status_code: int = 200, **context) -> Response:
+def require_recent_sign_in(
+    request: Request, signed_in: Annotated[OperatorSession, Depends(require_operator)]
+) -> OperatorSession:
+    """Runs before the page binds the request to a session: bound to this old one, it would be
+    refused to the new session that signing in again creates."""
+    if request.app.state.clock.now() - signed_in.created_at >= operator.CONSENT_MAX_SIGN_IN_AGE:
+        raise SignInTooOld
+    return signed_in
+
+
+RecentSignIn = Annotated[OperatorSession, Depends(require_recent_sign_in)]
+
+
+def _product_name(request: Request) -> appearance.Name:
+    try:
+        with request.app.state.read_sessionmaker() as session, session.begin():
+            return appearance.name_of(session)
+    except SQLAlchemyError:
+        # Only a label: not worth failing a page over, least of all the sign-in.
+        log.warning("could not read the product name", exc_info=True)
+        return appearance.DEFAULT
+
+
+def render(
+    request: Request,
+    name: str,
+    status_code: int = 200,
+    *,
+    product_name: appearance.Name | None = None,
+    **context,
+) -> Response:
+    product_name = product_name or _product_name(request)
+    context |= {"product_name": product_name.text, "name_parts": product_name.parts()}
     return templates.TemplateResponse(
         request, name, context, status_code=status_code, headers=HEADERS
     )
+
+
+async def render_off_loop(
+    request: Request, name: str, status_code: int = 200, **context
+) -> Response:
+    """`render` for async handlers. Its read would otherwise block the event loop for as long as the
+    pool makes it wait, and the connections it waits for need that loop to be released."""
+    product_name = await run_in_threadpool(_product_name, request)
+    return render(request, name, status_code, product_name=product_name, **context)
 
 
 def _login_redirect(request: Request, reason: LoginRequired) -> Response:
@@ -162,6 +213,9 @@ def _login_redirect(request: Request, reason: LoginRequired) -> Response:
     back = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     if request.method == "GET" and safe_next(back) == back != HOME:
         location += "?" + urlencode({"next": back})
+    elif isinstance(reason, SignInTooOld) and request.url.path.startswith("/ui/settings/"):
+        # The form cannot be kept, but the operator goes back to it rather than to Home.
+        location += "?" + urlencode({"next": SETTINGS_HOME})
     response = RedirectResponse(location, status_code=303, headers=HEADERS)
     # Expired or unknown: no use keeping it.
     if COOKIE in request.cookies and not isinstance(reason, SignInTooOld):
@@ -176,6 +230,45 @@ pages = APIRouter(
     dependencies=[Depends(same_origin), Depends(require_operator)],
 )
 
+# Every section of Settings needs a recent sign-in, here rather than on each route.
+settings_pages = APIRouter(
+    prefix="/ui/settings",
+    include_in_schema=False,
+    dependencies=[Depends(same_origin), Depends(require_recent_sign_in)],
+)
+
+
+# Appearance, public because the sign-in page needs it. Read-only, so a flood cannot take the write
+# lock; every page links both, so the pages themselves need no extra read for them.
+
+
+def _revalidated(
+    request: Request, body: bytes, media_type: str, headers: dict[str, str] | None = None
+) -> Response:
+    etag = f'"{hashlib.sha256(body).hexdigest()[:32]}"'
+    answer = {
+        "Cache-Control": "no-cache",
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+        **(headers or {}),
+    }
+    sent = request.headers.get("if-none-match", "").split(",")
+    if etag in {value.strip().removeprefix("W/") for value in sent}:
+        return Response(status_code=304, headers=answer)
+    return Response(body, media_type=media_type, headers=answer)
+
+
+@public.get("/appearance.css")
+def appearance_css(request: Request, session: ReadSessionDep):
+    return _revalidated(request, appearance.css_of(session).encode(), "text/css")
+
+
+@public.get("/icon")
+def icon(request: Request, session: ReadSessionDep):
+    stored = appearance.icon_of(session)
+    body, media_type = (stored.data, stored.type) if stored else (DEFAULT_ICON, appearance.SVG)
+    return _revalidated(request, body, media_type, ICON_HEADERS)
+
 
 # Signing in and out
 
@@ -185,15 +278,21 @@ def login_form(request: Request):
     return render(request, "login.html", next=safe_next(request.query_params.get("next")))
 
 
+async def _read_body(request: Request, limit: int) -> bytes:
+    """Counts what actually arrives, so a missing or false Content-Length changes nothing."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            raise HTTPException(413)
+    return body
+
+
 async def read_form(request: Request) -> dict[str, str]:
     # Parsed by hand, with a cap on the body (nothing legitimate here is large) and on the number
     # of fields. python-multipart is installed now (the mcp SDK needs it), but this needs nothing
     # from it.
-    body = b""
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_FORM_BYTES:
-            raise HTTPException(413)
+    body = await _read_body(request, MAX_FORM_BYTES)
     try:
         fields = parse_qs(body.decode(errors="replace"), max_num_fields=10)
     except ValueError:  # more fields than any form here has
@@ -229,7 +328,8 @@ async def login(request: Request):
     client = client_key(request.client.host if request.client else None)
     wait = state.login_limiter.hit(client, state.clock.now())
     if wait is not None:
-        # Turned away before the body, argon2 or the database: only this line records it.
+        # Turned away before the body, argon2 or the database, so with the default name: only
+        # this line records it.
         log.warning("sign-in refused: too many attempts", extra={"client": client})
         if _counts_the_proxy(request):
             log.warning(
@@ -238,7 +338,14 @@ async def login(request: Request):
                 "sets X-Forwarded-For (ignore this if it was the SSH tunnel)",
                 extra={"client": client},
             )
-        response = render(request, "login.html", 429, error=TOO_MANY, next=HOME)
+        response = render(
+            request,
+            "login.html",
+            429,
+            product_name=appearance.DEFAULT,
+            error=TOO_MANY,
+            next=HOME,
+        )
         response.headers["Retry-After"] = str(int(wait.total_seconds()) + 1)
         return response
     form = await read_form(request)
@@ -257,9 +364,9 @@ async def login(request: Request):
         )
     except operator.Busy:
         log.warning("sign-in refused: every password check slot is busy")
-        return render(request, "login.html", 503, error=BUSY, next=next_page)
+        return await render_off_loop(request, "login.html", 503, error=BUSY, next=next_page)
     if session_id is None:
-        return render(request, "login.html", 401, error=INVALID, next=next_page)
+        return await render_off_loop(request, "login.html", 401, error=INVALID, next=next_page)
     try:
         # The cookie it replaces would otherwise stay valid for days, unseen.
         await run_in_threadpool(_end_presented_session, request)
@@ -431,8 +538,86 @@ def incidents(request: Request, session: ReadSessionDep):
     return render(request, "incidents.html", incidents=list_incidents(request, session, limit=200))
 
 
+# Settings: one route and one template extending settings_layout.html per section.
+
+
+@settings_pages.get("")
+def settings_home():
+    return RedirectResponse(SETTINGS_HOME, status_code=303, headers=HEADERS)
+
+
+def _appearance_page(
+    request: Request,
+    status_code: int = 200,
+    *,
+    error: str | None = None,
+    entered: dict[str, str] | None = None,
+) -> Response:
+    with request.app.state.read_sessionmaker() as session, session.begin():
+        name = appearance.name_of(session)
+        form = entered or {
+            "name": name.text,
+            "name_highlight": name.highlight,
+            "css": appearance.css_of(session),
+        }
+        has_icon = appearance.icon_of(session) is not None
+    return render(
+        request,
+        "settings_appearance.html",
+        status_code,
+        error=error,
+        saved="saved" in request.query_params,
+        form=form,
+        has_icon=has_icon,
+        warnings=appearance.warnings(form["css"]),
+        variables=appearance.VARIABLES,
+        light_theme=appearance.LIGHT_THEME,
+    )
+
+
+@settings_pages.get("/appearance")
+def appearance_page(request: Request):
+    return _appearance_page(request)
+
+
+def _save_appearance(request: Request, entered: dict[str, str], changes: dict) -> Response:
+    state = request.app.state
+    try:
+        with state.sessionmaker() as session, session.begin():
+            appearance.update_by_operator(session, state.clock.now(), **changes)
+    except appearance.InvalidAppearance as error:
+        return _appearance_page(request, 422, error=str(error), entered=entered)
+    # 303, so reloading the page does not send the form again.
+    return RedirectResponse(f"{SETTINGS_HOME}?saved=1", status_code=303, headers=HEADERS)
+
+
+@settings_pages.post("/appearance")
+async def appearance_save(request: Request):
+    # Read whole first, so nothing is parsed, and no temporary file opened, for a body over the cap.
+    body = await _read_body(request, MAX_SETTINGS_BYTES)
+
+    async def replay() -> dict:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    received = Request(request.scope, replay).form(
+        max_files=1, max_fields=6, max_part_size=MAX_SETTINGS_BYTES
+    )
+    async with received as form:
+        entered = {
+            field: value if isinstance(value := form.get(field), str) else ""
+            for field in ("name", "name_highlight", "css")
+        }
+        upload = form.get("icon")
+        # A form with no file chosen still sends the field, empty.
+        icon = (await upload.read() or None) if isinstance(upload, UploadFile) else None
+        reset, clear_icon = bool(form.get("reset")), bool(form.get("clear_icon"))
+    changes = {"reset": True} if reset else {**entered, "icon": icon, "clear_icon": clear_icon}
+    return await run_in_threadpool(_save_appearance, request, entered, changes)
+
+
 def install(app: FastAPI) -> None:
     app.add_exception_handler(LoginRequired, _login_redirect)
     app.mount("/ui/static", StaticFiles(directory=HERE / "static"), name="ui-static")
     app.include_router(public)
     app.include_router(pages)
+    app.include_router(settings_pages)

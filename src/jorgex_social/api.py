@@ -8,6 +8,7 @@ from sqlalchemy import text
 from jorgex_social.access.deps import TokenDep
 from jorgex_social.access.limits import RateLimiter
 from jorgex_social.access.proxy import TunnelOnlyMiddleware
+from jorgex_social.account.api import appearance_router
 from jorgex_social.account.api import router as account_router
 from jorgex_social.account.audit import AuditMiddleware
 from jorgex_social.clock import Clock, SystemClock
@@ -77,6 +78,7 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     # Added last, so it runs first: what it turns away is never audited nor routed.
     app.add_middleware(TunnelOnlyMiddleware)
     app.include_router(account_router)
+    app.include_router(appearance_router)
     app.include_router(stats_router)
     app.include_router(recent_media_router)
     app.include_router(publishing_router)

@@ -154,6 +154,12 @@ incidents (`list_incidents`) need a human; acknowledging one does not close it. 
 restriction the API can keep answering while the account is limited, so calls that succeed prove \
 nothing: a human must check Account Status in the Instagram app.
 
+Appearance: `get_appearance` shows the web interface's product name and the part of it in the \
+accent colour, its CSS, its icon, the CSS variables that can be overridden and warnings about \
+likely typos in the CSS. `set_appearance` changes the name, its highlight and the icon; nothing \
+reaches Instagram. CSS is only editable by the operator in Settings: to change it, ask them to \
+paste it there, and do not try to work around this.
+
 sign_in_password_accepted: sign-ins to the web interface with the right password kept failing on \
 the code, so the password may have leaked. Tell the operator at once; if it was not them, they \
 should change the password on the server (set-password), which is what closes it. You cannot \
@@ -172,7 +178,8 @@ a post, the error lists status and allowed).
 - content_changed: the post changed since you reviewed it; read it again and review the new \
 content_hash. invalid_post: it fails the catalog; see errors. unknown_media: those media ids \
 do not exist (unused uploads are purged); upload the files again.
-- in_the_past: use a future time, or publish_now. invalid_value, invalid_rule, or http_error \
+- in_the_past: use a future time, or publish_now. invalid_value, invalid_rule, \
+invalid_appearance, or http_error \
 with status 422: fix the arguments as the message or detail says.
 - idempotency_key_taken: use another key. media_ref_taken: another post already has that \
 media id; check it.
@@ -186,6 +193,12 @@ it. Never retry publish_now or schedule_post blindly: check the post with `get_p
 LOCAL_UPLOAD = (
     "`upload_media` with the absolute path of each file; it returns the media id. invalid_path, "
     "not_a_file and file_error mean the path cannot be read."
+)
+
+
+CSS_SETTINGS_ONLY = (
+    "CSS is only editable by the operator in Settings: ask them to paste it there, and do not try "
+    "to work around this."
 )
 
 
@@ -508,6 +521,53 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         check the account first."""
         return call("PUT", "/v1/account/kill-switch", json_body={"enabled": enabled})
 
+    def get_appearance() -> str:
+        """The web interface's product name, the part of it in the accent colour and its CSS; its
+        icon's type and size in bytes (icon null: the default icon); the CSS variables that can be
+        overridden, with their defaults; and warnings: custom properties in the CSS the interface
+        does not read, likely typos."""
+        return call("GET", "/v1/appearance")
+
+    def set_appearance(
+        name: Annotated[
+            str | None, Field(description="Product name, 1 to 40 characters after stripping.")
+        ] = None,
+        name_highlight: Annotated[
+            str | None,
+            Field(
+                description="The part of the name shown in the accent colour: first occurrence, "
+                "case-sensitive. It must occur in the name. An empty string removes it. Changing "
+                "the name so that the current highlight no longer occurs is refused unless you "
+                "pass this too."
+            ),
+        ] = None,
+        icon_base64: Annotated[
+            str | None, Field(description="A PNG, ICO or SVG file up to 256 KB, in base64.")
+        ] = None,
+        clear_icon: Annotated[bool, Field(description="Back to the default icon.")] = False,
+        reset: Annotated[
+            bool,
+            Field(
+                description="Name, highlight and icon back to the defaults; the CSS stays. Alone, "
+                "with no other field."
+            ),
+        ] = False,
+    ) -> str:
+        """Change the name and icon of the web interface, including its public sign-in page. Only
+        what you pass changes, and invalid_appearance means nothing did. CSS is only editable by the
+        operator in Settings: ask them to paste it there, and do not try to work around this."""
+        return call(
+            "PUT",
+            "/v1/appearance",
+            json_body={
+                "name": name,
+                "name_highlight": name_highlight,
+                "icon_base64": icon_base64,
+                "clear_icon": clear_icon,
+                "reset": reset,
+            },
+        )
+
     # rules
 
     def list_rules(
@@ -750,8 +810,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ("account", "read", get_account, READ),
         ("account", "read", list_incidents, READ),
         ("account", "read", audit_log, READ),
+        ("account", "read", get_appearance, READ),
         ("account", "write", acknowledge_incident, WRITE),
         ("account", "write", set_kill_switch, WRITE),
+        ("account", "write", set_appearance, WRITE),
         ("rules", "read", list_rules, READ),
         ("rules", "read", get_rule, READ),
         ("rules", "read", test_rules, READ),
@@ -768,6 +830,17 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     ]
 
 
+class Server(MCPServer):
+    """Refuses `css` on set_appearance. The SDK drops arguments a tool does not declare, so without
+    this an agent would get a success for CSS that was never saved."""
+
+    async def call_tool(self, name, arguments, context=None):
+        if name == "set_appearance" and "css" in arguments:
+            error = _local_error("invalid_appearance", CSS_SETTINGS_ONLY)
+            raise ToolError(f"Error executing tool {name}: {error}")
+        return await super().call_tool(name, arguments, context)
+
+
 def build_server(api: Api) -> MCPServer:
     """Asks the API what the token may do and registers only those tools."""
     answer = api.request("GET", "/v1/token")
@@ -780,7 +853,7 @@ def build_server(api: Api) -> MCPServer:
                 "message": "GET /v1/token did not return the token's permissions.",
             }
         )
-    server = MCPServer("jorgex-social", instructions=instructions(LOCAL_UPLOAD))
+    server = Server("jorgex-social", instructions=instructions(LOCAL_UPLOAD))
     for group, level, tool, annotations in tool_definitions(api):
         if level == ANY or _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
             server.add_tool(tool, annotations=annotations, structured_output=False)

@@ -25,14 +25,14 @@ import httpx2
 from fastapi import FastAPI
 from mcp.server.auth.provider import ProviderTokenVerifier
 from mcp.server.auth.settings import AuthSettings
-from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.routing import Route
 
 from jorgex_social.remote_mcp import uploads
 from jorgex_social_mcp.client import Api, ApiError, Body
-from jorgex_social_mcp.server import WRITE, instructions, tool_definitions
+from jorgex_social_mcp.server import WRITE, Server, instructions, tool_definitions
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def install(app: FastAPI) -> None:
     provider = getattr(app.state, "oauth_provider", None)
     if app.state.oauth_resource is None or provider is None:
         return
-    server = MCPServer(
+    server = Server(
         "jorgex-social",
         instructions=instructions(REMOTE_UPLOAD),
         token_verifier=ProviderTokenVerifier(provider),

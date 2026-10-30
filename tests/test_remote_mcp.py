@@ -38,6 +38,7 @@ from test_oauth import (  # the OAuth fixtures and helpers
 )
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account import appearance
 from jorgex_social.api import create_app
 from jorgex_social.logs import hide_query_strings
 from jorgex_social.oauth import store
@@ -93,7 +94,14 @@ async def test_an_agent_with_only_the_url_uses_the_tools_its_grant_allows(app, c
 
     # Every tool is registered (permissions are the token's), except the one that reads a local
     # path, which the upload URL replaces.
-    assert {"get_account", "set_kill_switch", "create_upload_url", "create_post"} <= names
+    assert {
+        "get_account",
+        "set_kill_switch",
+        "get_appearance",
+        "set_appearance",
+        "create_upload_url",
+        "create_post",
+    } <= names
     assert "upload_media" not in names
     assert catalog_answer[0] == "ok" and "post_types" in catalog_answer[1]
     assert denied == ("error", denied[1])
@@ -466,3 +474,23 @@ def test_the_upload_token_never_reaches_the_access_log(app, agent, browser, capl
     assert any('"POST /upload/[redacted] HTTP/1.1" 201' in line for line in lines)
     assert all(secret not in r.getMessage() for r in caplog.records)
     assert secret not in "\n".join(str(r) for r in rows(app, "SELECT * FROM upload_urls"))
+
+
+@pytest.mark.anyio
+async def test_the_remote_set_appearance_cannot_write_css(app, clock):
+    transport = httpx2.ASGITransport(app=app)
+    oauth, _, _ = await operator_oauth(transport, clock, account="write")
+    with app.state.sessionmaker() as session, session.begin():
+        appearance.update_by_operator(session, clock.now(), css="kept {}")
+
+    async with mcp_client(app, auth=oauth) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        refused = await call(client, "set_appearance", name="Acme", css="a { display: none; }")
+        after = await call(client, "get_appearance")
+        saved = await call(client, "set_appearance", name="Acme")
+
+    assert "css" not in tools["set_appearance"].input_schema["properties"]
+    assert refused[0] == "error"
+    assert refused[1]["code"] == "invalid_appearance"
+    assert (after[1]["css"], after[1]["name"]) == ("kept {}", "Social")
+    assert saved[0] == "ok" and saved[1]["name"] == "Acme"
