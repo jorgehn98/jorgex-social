@@ -407,6 +407,8 @@ def test_what_the_proxy_publishes_still_answers(app):
     assert client.get("/health").status_code == 200
     assert client.get("/ui/login").status_code == 200
     assert client.get("/ui/static/style.css").status_code == 200
+    assert '<link rel="icon" href="/ui/static/favicon.svg"' in client.get("/ui/login").text
+    assert client.get("/ui/static/favicon.svg").headers["content-type"].startswith("image/svg+xml")
     assert client.get("/v1x").status_code == 404  # an unknown path, as before
 
 
