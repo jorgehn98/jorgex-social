@@ -7,11 +7,13 @@ from sqlalchemy import func, select
 
 from jorgex_social.access.deps import SessionDep, require
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
+from jorgex_social.stats.models import AccountSnapshot, PostSnapshot, RecentMedia
 
-router = APIRouter(
-    prefix="/v1/stats", tags=["stats"], dependencies=[Depends(require(Group.STATS, Level.READ))]
-)
+StatsRead = [Depends(require(Group.STATS, Level.READ))]
+router = APIRouter(prefix="/v1/stats", tags=["stats"], dependencies=StatsRead)
+# Not a statistic, but the same kind of data (published media ids and permalinks), so the same
+# group reads it.
+recent_media_router = APIRouter(prefix="/v1", tags=["stats"], dependencies=StatsRead)
 
 
 class AccountSnapshotOut(BaseModel):
@@ -95,3 +97,28 @@ def media_history(media_ref: str, session: SessionDep, network: Network, limit: 
         .limit(limit)
     )
     return session.scalars(query).all()
+
+
+class RecentMediaItem(BaseModel):
+    id: str
+    product_type: str
+    media_type: str
+    permalink: str | None
+    timestamp: datetime
+
+
+class RecentMediaOut(BaseModel):
+    # When the worker last listed the account; null if it never has.
+    fetched_at: datetime | None
+    items: list[RecentMediaItem]
+
+
+@recent_media_router.get("/instagram-media", response_model=RecentMediaOut)
+def recent_media(session: SessionDep, network: Network):
+    """The account's newest feed posts and reels, newest first, as of the worker's last listing.
+    It is refreshed by the hourly statistics sweep (and when the worker finds a published
+    container, in which case it settles the post itself). Stories are never listed."""
+    row = session.get(RecentMedia, network)
+    if row is None:
+        return RecentMediaOut(fetched_at=None, items=[])
+    return RecentMediaOut(fetched_at=row.fetched_at, items=row.items)

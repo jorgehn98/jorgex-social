@@ -46,6 +46,7 @@ from jorgex_social.publishing.models import (
     PublishAttempt,
     Resolution,
 )
+from jorgex_social.stats.snapshots import store_recent_media
 
 log = logging.getLogger(__name__)
 
@@ -524,9 +525,12 @@ class PublishTask:
                     )
                 )
             )
+        listed = self.instagram.list_media(max_items=RECENT_MEDIA_TO_SEARCH)
+        # Already paid for: it also refreshes what agents see of the account.
+        store_recent_media(sessions, self.instagram.network, listed, self.clock.now())
         candidates = [
             m
-            for m in self.instagram.list_media(max_items=RECENT_MEDIA_TO_SEARCH)
+            for m in listed
             if m.id not in taken
             and m.product_type == product
             and m.timestamp >= pending.started_at - TIMESTAMP_SLACK

@@ -546,6 +546,7 @@ def test_simulation_answers_before_and_after_the_first_check(client, headers, se
     after = client.get("/v1/account", headers=headers).json()
 
     assert (before["network"], before["status"], before["account"]) == ("simulation", "ok", None)
+    assert before["simulation"] is True
     assert after["status"] == "ok"
     assert after["account"]["username"] == "simulated_account"
     assert after["limits"]["quota_total"] == 100
@@ -558,7 +559,7 @@ def test_real_mode_without_a_connection_is_missing(real):
 
     response = TestClient(real).get("/v1/account", headers=headers_for(real, account="read"))
 
-    assert response.json()["status"] == "missing"
+    assert (response.json()["status"], response.json()["simulation"]) == ("missing", False)
 
 
 def test_acknowledging_does_not_close(client, headers, sessions, ig, task):

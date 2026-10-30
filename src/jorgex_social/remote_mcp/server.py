@@ -32,7 +32,7 @@ from starlette.routing import Route
 
 from jorgex_social.remote_mcp import uploads
 from jorgex_social_mcp.client import Api, ApiError, Body
-from jorgex_social_mcp.server import INSTRUCTIONS, WRITE, tool_definitions
+from jorgex_social_mcp.server import WRITE, instructions, tool_definitions
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,13 @@ IN_PROCESS = "http://in-process"
 TOOL_THREADS = 8
 # Reads a local path, which on the server would be the server's: replaced by create_upload_url.
 LOCAL_ONLY = {"upload_media"}
+# The file is on the agent's machine, so it goes there straight to a one-use URL.
+REMOTE_UPLOAD = (
+    "`create_upload_url` for each file, then send it from your machine: "
+    "`curl --data-binary @/absolute/path/photo.jpg '<url>'`, with no token. The JSON answer's id "
+    "is the media id. One URL per file, valid ten minutes; too_many_upload_urls means use the "
+    "ones you have or wait."
+)
 LOOPBACK_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
 LOOPBACK_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
 
@@ -127,8 +134,7 @@ def install(app: FastAPI) -> None:
         return
     server = MCPServer(
         "jorgex-social",
-        instructions=INSTRUCTIONS
-        + " Upload files with create_upload_url: it gives a one-use URL to send the file to.",
+        instructions=instructions(REMOTE_UPLOAD),
         token_verifier=ProviderTokenVerifier(provider),
         auth=AuthSettings(
             issuer_url=provider.issuer,

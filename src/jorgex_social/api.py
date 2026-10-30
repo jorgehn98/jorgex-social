@@ -21,6 +21,7 @@ from jorgex_social.remote_mcp import server as remote_mcp
 from jorgex_social.replies.api import router as replies_router
 from jorgex_social.replies.intake import Intake
 from jorgex_social.replies.webhook import router as webhook_router
+from jorgex_social.stats.api import recent_media_router
 from jorgex_social.stats.api import router as stats_router
 from jorgex_social.ui import routes as ui
 
@@ -73,6 +74,7 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.add_middleware(TunnelOnlyMiddleware)
     app.include_router(account_router)
     app.include_router(stats_router)
+    app.include_router(recent_media_router)
     app.include_router(publishing_router)
     app.include_router(media_files_router)
     app.include_router(replies_router)

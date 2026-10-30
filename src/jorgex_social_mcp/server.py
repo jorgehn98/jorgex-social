@@ -55,11 +55,94 @@ WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world
 ON_ACCOUNT = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
 _RANK = {"deny": 0, "read": 1, "write": 2}
+# The level of a tool any valid token may call, whatever its permissions.
+ANY = "any"
 
-INSTRUCTIONS = (
-    "Prepare, schedule and review posts, and manage automatic reply rules, of one Instagram "
-    "account through the jorgex-social API. Errors carry a stable `code`; decide by it."
+# What no single tool description says: the order of the flows, what touches the real account
+# and what each error code asks of the agent. A backticked identifier here is always a tool name
+# (tests check it), so the guide never points at a tool the server does not have.
+_INSTRUCTIONS = """\
+jorgex-social runs one Instagram account: posts (prepare, schedule, publish), automatic replies \
+to comments and direct messages, and stored statistics. Each tool is one call to its REST API, \
+which checks this token's permissions and enforces every rule.
+
+Start with `get_token`, to see what this token may do, and `get_account`. With simulation \
+false, `publish_now`, `schedule_post` (at its time), `activate_rule` and turning the kill \
+switch off act on the real account, and a publication cannot be undone from here. With \
+simulation true nothing reaches Instagram.
+
+Publishing:
+1. `get_catalog`: post types, item and caption limits, accepted files.
+2. {upload}
+3. `create_post` with the media ids and an idempotency_key, so a retry does not make a second \
+draft. Fix its errors with `update_post`; content edits change content_hash, so review the \
+one it returns.
+4. Review the post (`get_post`), then `schedule_post` for a future time (ISO 8601 with offset) \
+or `publish_now`. Always pass expected_hash, the content_hash you reviewed.
+5. Follow it with `get_post`: scheduled or publishing means wait; then published (permalink \
+may be null), failed (see failure; schedule it again once its cause is fixed) or \
+outcome_unknown.
+Editing a scheduled post returns it to draft. Only draft and scheduled posts can be edited or \
+cancelled; to change a failed post, create a new one. A post not published within the grace \
+window after its time (kill switch on, service down) fails as missed_schedule.
+
+outcome_unknown: the service cannot tell whether Instagram published the post and keeps \
+checking; after an hour it opens a publish_unresolved incident. Never schedule it again to \
+retry: it could publish twice. You may settle it as published yourself only when \
+`list_instagram_media` has a fetched_at later than the attempt's started_at (in `get_post`) \
+and exactly one media with a timestamp after that started_at and the post's product_type and \
+media_type (image: FEED and IMAGE; carousel: FEED and CAROUSEL_ALBUM; reel: REELS and VIDEO), \
+and the operator did not publish by hand in that window (ask if unsure): then `resolve_post` \
+with published and that id. Never resolve not_published without a human checking the account: \
+absence from the listing proves nothing, and stories are never listed. Otherwise leave the post \
+as it is and report its publish_unresolved incident.
+
+Rules: `create_rule` makes an inactive rule. `test_rules` with its rule_id and sample texts \
+shows what it would match and send, sending nothing. `activate_rule` makes it answer, only to \
+what arrives afterwards. The first matching active rule wins, lowest priority number first. \
+`list_deliveries` shows what was sent or why not; `pause_conversation` silences one person \
+while a human answers.
+
+Kill switch (`set_kill_switch`): on, nothing is written to Instagram. Scheduled posts wait, \
+and replies due meanwhile are skipped for good. Off, publishing resumes; posts past their grace \
+window fail as missed_schedule, and a post whose containers were being made when it turned on \
+fails with failure kill_switch; both must be scheduled again. Open incidents (`list_incidents`) \
+need a human; acknowledging one does not close it.
+
+Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
+a page comes back shorter than limit; tools without offset say how to page in their \
+description.
+
+Errors are JSON with a stable code and the HTTP status; act on the code:
+- invalid_token: the token is missing, unknown or revoked; stop. forbidden: this token lacks \
+the group or level named in the error; do not retry, tell the operator.
+- not_found: wrong id. invalid_state: the post or rule is not in a status that allows it (for \
+a post, the error lists status and allowed).
+- content_changed: the post changed since you reviewed it; read it again and review the new \
+content_hash. invalid_post: it fails the catalog; see errors. unknown_media: those media ids \
+do not exist (unused uploads are purged); upload the files again.
+- in_the_past: use a future time, or publish_now. invalid_value, invalid_rule, or http_error \
+with status 422: fix the arguments as the message or detail says.
+- idempotency_key_taken: use another key. media_ref_taken: another post already has that \
+media id; check it.
+- public_url_missing: the operator must set the service's public URL; nothing to do from here.
+- too_large, unsupported_media_type: the file is over the catalog's max_bytes or is not JPEG, \
+MP4 or MOV.
+- unreachable, or a 5xx status: the service did not answer properly; retry later, then report \
+it. Never retry publish_now or schedule_post blindly: check the post with `get_post` first.
+"""
+
+LOCAL_UPLOAD = (
+    "`upload_media` with the absolute path of each file; it returns the media id. invalid_path, "
+    "not_a_file and file_error mean the path cannot be read."
 )
+
+
+def instructions(upload: str) -> str:
+    """The server's MCP instructions. Local and remote servers differ only in how files are
+    uploaded, which `upload` describes."""
+    return _INSTRUCTIONS.format(upload=upload)
+
 
 Limit = Annotated[int | None, Field(description="Maximum number of results.")]
 Offset = Annotated[int | None, Field(description="Results to skip, for paging.")]
@@ -67,8 +150,8 @@ PostId = Annotated[str, Field(description="Post id, as returned by create_post o
 ExpectedHash = Annotated[
     str | None,
     Field(
-        description="The content_hash you reviewed. The API refuses with content_changed if the "
-        "post changed since."
+        description="The content_hash you reviewed; always pass it. The API refuses with "
+        "content_changed if the post changed since."
     ),
 ]
 
@@ -98,6 +181,14 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         if "max_bytes" not in limits:
             limits["max_bytes"] = json.loads(call("GET", "/v1/catalog"))["upload"]["max_bytes"]
         return limits["max_bytes"]
+
+    # access
+
+    def get_token() -> str:
+        """What this token may do: its permissions per group (posts, scheduling, stats,
+        account, rules, events), each deny, read or write. Call it first; a tool whose group
+        is not granted at its level fails with forbidden."""
+        return call("GET", "/v1/token")
 
     # posts
 
@@ -172,7 +263,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ] = None,
         idempotency_key: Annotated[
             str | None,
-            Field(description="Sending the same key again returns the post created first."),
+            Field(
+                description="Recommended: sending the same key again returns the post created "
+                "first instead of a second one."
+            ),
         ] = None,
     ) -> str:
         """Create a draft. Returns it with its content_hash and the catalog errors and warnings; a
@@ -201,8 +295,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ] = None,
     ) -> str:
         """Edit a draft or a scheduled post; only the fields given change. A scheduled post goes
-        back to draft and has to be scheduled again. Published, failed or cancelled posts cannot
-        be edited."""
+        back to draft and has to be scheduled again. Other statuses cannot be edited: to change a
+        failed post, create a new one. Returns the new content_hash, to review before
+        scheduling."""
         given = {
             "type": type,
             "items": items,
@@ -227,8 +322,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ],
         expected_hash: ExpectedHash = None,
     ) -> str:
-        """Schedule a draft, scheduled or failed post. At that time the service publishes it to
-        the real account, unless it runs in simulation. The post must pass the catalog."""
+        """Schedule a draft, scheduled or failed post for a future time (a past one is refused
+        with in_the_past; use publish_now). At that time the service publishes it to the real
+        account, unless it runs in simulation. The post must pass the catalog. Editing it later
+        returns it to draft."""
         body = {"scheduled_for": scheduled_for, "expected_hash": expected_hash}
         return call(
             "POST",
@@ -238,8 +335,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         )
 
     def publish_now(post_id: PostId, expected_hash: ExpectedHash = None) -> str:
-        """Schedule the post for now: the worker publishes it to the real account on its next
-        pass, unless the service runs in simulation. Check the result with get_post."""
+        """Schedule a draft, scheduled or failed post for now: the worker publishes it to the
+        real account on its next pass, unless the service runs in simulation. Cannot be undone
+        once published. The post must pass the catalog. Follow it with get_post; do not call
+        this again for the same post unless get_post shows it failed."""
         body = {"expected_hash": expected_hash} if expected_hash is not None else {}
         return call("POST", "/v1/posts/{}/publish-now", post_id, json_body=body)
 
@@ -275,7 +374,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         until: Annotated[str | None, Field(description="ISO 8601 with offset.")] = None,
         limit: Limit = None,
     ) -> str:
-        """Account metrics per closed day, newest first, from the stored snapshots."""
+        """Account metrics per closed day, newest first, from the stored snapshots: the 90 most
+        recent stored days unless limit says otherwise. No offset: page back with until."""
         return call(
             "GET", "/v1/stats/account", query={"since": since, "until": until, "limit": limit}
         )
@@ -287,15 +387,27 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     def media_history(
         media_ref: Annotated[str, Field(description="Instagram media id.")], limit: Limit = None
     ) -> str:
-        """Every stored snapshot of one media, newest first. Empty if none has been taken yet."""
+        """Every stored snapshot of one media, newest first (365 unless limit says otherwise; no
+        offset). Empty if none has been taken yet."""
         return call("GET", "/v1/stats/media/{}", media_ref, query={"limit": limit})
+
+    def list_instagram_media() -> str:
+        """The account's newest feed posts and reels (up to 25), newest first: id (the media id
+        for resolve_post and for a rule's media_ref), product_type, media_type, permalink and
+        timestamp. A snapshot from the worker's last listing, not a live call: check fetched_at
+        (null if never listed). It is refreshed by the hourly statistics sweep (and when the
+        worker finds a published container, in which case it settles the post itself), so it
+        can be up to an hour old, or older while the sweep fails. Stories are never listed.
+        No paging: it is the whole snapshot."""
+        return call("GET", "/v1/instagram-media")
 
     # account
 
     def get_account() -> str:
-        """Connection status of the account, publishing limits, kill switch, number of open
-        incidents and the webhook (configured, time of the last valid notification). Never
-        includes the credential."""
+        """Whether the service runs in simulation (true: nothing reaches Instagram; false:
+        publishing, rules and the kill switch act on the real account), connection status,
+        publishing limits, kill switch, number of open incidents and the webhook (configured,
+        time of the last valid notification). Never includes the credential."""
         return call("GET", "/v1/account")
 
     def list_incidents(
@@ -322,14 +434,18 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         query = {"object_type": object_type, "object_id": object_id, "limit": limit}
         return call("GET", "/v1/account/audit", query={**query, "offset": offset})
 
-    def acknowledge_incident(incident_id: str) -> str:
+    def acknowledge_incident(
+        incident_id: Annotated[str, Field(description="Incident id, from list_incidents.")],
+    ) -> str:
         """Mark an incident as seen. It stays open until its cause is gone."""
         return call("POST", "/v1/account/incidents/{}/acknowledge", incident_id)
 
     def set_kill_switch(enabled: bool) -> str:
         """On: the service stops writing to the network (no publishing, no replies); scheduled
-        posts stay scheduled and replies due meanwhile are skipped. Off: it resumes, and posts
-        past their grace window fail as missed_schedule and can be rescheduled."""
+        posts stay scheduled and replies due meanwhile are skipped for good. Off: due posts
+        publish and active rules answer again on the real account, unless the service runs in
+        simulation; posts past their grace window fail as missed_schedule and can be
+        rescheduled."""
         return call("PUT", "/v1/account/kill-switch", json_body={"enabled": enabled})
 
     # rules
@@ -378,7 +494,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             str | None,
             Field(description="Only comments on this Instagram media id; omit for every post."),
         ] = None,
-        priority: Annotated[int | None, Field(description="Lower is tried first.")] = None,
+        priority: Annotated[
+            int | None, Field(description="Lower is tried first; default 100.")
+        ] = None,
     ) -> str:
         """Create an inactive rule. It answers nothing until activate_rule."""
         body = {
@@ -423,7 +541,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         return call("POST", "/v1/rules/{}/deactivate", rule_id)
 
     def archive_rule(rule_id: RuleId) -> str:
-        """Deactivate and archive a rule. It can no longer be edited or activated."""
+        """Deactivate and archive a rule, for good: it can no longer be edited or activated.
+        To stop it for now, use deactivate_rule."""
         return call("POST", "/v1/rules/{}/archive", rule_id)
 
     def pause_conversation(
@@ -434,7 +553,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         forever: Annotated[bool | None, Field(description="true: until resumed.")] = None,
     ) -> str:
         """Stop automatic messages to one person, until a time or until resumed; give exactly
-        one of until or forever. Queued messages to them are skipped."""
+        one of until or forever. Queued messages to them are skipped. With the webhook
+        configured, a conversation also pauses for a while on its own when the account answers
+        it by hand."""
         body = {"until": until, "forever": forever}
         return call(
             "POST",
@@ -505,6 +626,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         )
 
     return [
+        ("access", ANY, get_token, READ),
         ("posts", "read", get_catalog, READ),
         ("posts", "read", list_posts, READ),
         ("posts", "read", get_post, READ),
@@ -518,6 +640,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ("stats", "read", account_stats, READ),
         ("stats", "read", media_stats, READ),
         ("stats", "read", media_history, READ),
+        ("stats", "read", list_instagram_media, READ),
         ("account", "read", get_account, READ),
         ("account", "read", list_incidents, READ),
         ("account", "read", audit_log, READ),
@@ -551,9 +674,9 @@ def build_server(api: Api) -> MCPServer:
                 "message": "GET /v1/token did not return the token's permissions.",
             }
         )
-    server = MCPServer("jorgex-social", instructions=INSTRUCTIONS)
+    server = MCPServer("jorgex-social", instructions=instructions(LOCAL_UPLOAD))
     for group, level, tool, annotations in tool_definitions(api):
-        if _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
+        if level == ANY or _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
             server.add_tool(tool, annotations=annotations, structured_output=False)
     return server
 

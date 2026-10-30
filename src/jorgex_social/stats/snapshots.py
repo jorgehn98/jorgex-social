@@ -2,13 +2,14 @@ import logging
 from datetime import datetime, time, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.errors import AuthError, InstagramError, RateLimited
 from jorgex_social.instagram.types import Instagram, Media, ProductType
 from jorgex_social.publishing.models import Post, PostStatus, PostType
-from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
+from jorgex_social.stats.models import AccountSnapshot, PostSnapshot, RecentMedia
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,9 @@ OLD_INTERVAL = timedelta(days=7)
 STORY_LIFETIME = timedelta(hours=24)
 STORY_INTERVAL = timedelta(hours=6)
 
+# Media kept for agents to see what is on the account (GET /v1/instagram-media).
+RECENT_MEDIA_KEPT = 25
+
 # The sweep stops on these: retrying item by item would only repeat the failure.
 _STOP_SWEEP = (AuthError, RateLimited)
 
@@ -45,6 +49,33 @@ def closed_days(now: datetime) -> list[tuple[datetime, datetime]]:
         (last_end - timedelta(days=n + 1), last_end - timedelta(days=n))
         for n in reversed(range(BACKFILL_DAYS))
     ]
+
+
+def store_recent_media(
+    sessions: sessionmaker, network: str, items: list[Media], now: datetime
+) -> None:
+    """Replaces the stored recent media with the newest of `items`, a listing the caller already
+    made: storing it costs no call to the network. Best effort: a database failure here is
+    logged and must not stop the stats sweep or the resolver that made the listing."""
+    newest = sorted(items, key=lambda m: m.timestamp, reverse=True)[:RECENT_MEDIA_KEPT]
+    rows = [
+        {
+            "id": m.id,
+            "product_type": m.product_type.value,
+            "media_type": m.media_type,
+            "permalink": m.permalink,
+            "timestamp": m.timestamp.isoformat(),
+        }
+        for m in newest
+    ]
+    try:
+        with sessions() as session, session.begin():
+            session.merge(RecentMedia(network=network, fetched_at=now, items=rows))
+    except SQLAlchemyError as exc:
+        log.warning(
+            "could not store the recent media",
+            extra={"network": network, "error": type(exc).__name__},
+        )
 
 
 def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
@@ -101,6 +132,7 @@ def snapshot_media(
 ) -> int:
     """Feed posts and reels, including the ones published by hand."""
     items = instagram.list_media()
+    store_recent_media(sessions, instagram.network, items, now)
     with sessions() as session:
         last_taken = dict(
             session.execute(

@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -25,7 +26,7 @@ ALL_WRITE = {g: "write" for g in ("posts", "scheduling", "stats", "account", "ru
 READ_POSTS = {"get_catalog", "list_posts", "get_post"}
 WRITE_POSTS = {"upload_media", "create_post", "update_post"}
 SCHEDULING = {"schedule_post", "publish_now", "cancel_post", "resolve_post"}
-STATS = {"account_stats", "media_stats", "media_history"}
+STATS = {"account_stats", "media_stats", "media_history", "list_instagram_media"}
 READ_ACCOUNT = {"get_account", "list_incidents", "audit_log"}
 WRITE_ACCOUNT = {"acknowledge_incident", "set_kill_switch"}
 READ_RULES = {"list_rules", "get_rule", "test_rules"}
@@ -39,6 +40,8 @@ WRITE_RULES = {
     "resume_conversation",
 }
 EVENTS = {"list_events", "list_deliveries", "list_conversations"}
+# In the server instructions, a backticked identifier is always a tool name.
+TOOL_REFERENCE = re.compile(r"`([a-z_]+)`")
 
 
 @pytest.fixture
@@ -122,7 +125,49 @@ async def call(client, name, /, **arguments):
     ],
 )
 async def test_tools_follow_the_token_permissions(app, transport, grants, expected):
-    assert await tool_names(server_for(app, transport, **grants)) == expected
+    # get_token needs no group: every valid token may ask what it may do.
+    assert await tool_names(server_for(app, transport, **grants)) == expected | {"get_token"}
+
+
+async def test_get_token_shows_the_token_permissions(app, transport):
+    async with Client(server_for(app, transport, stats="read")) as client:
+        result = await call(client, "get_token")
+
+    assert result[0] == "ok"
+    assert result[1]["permissions"] == {
+        "posts": "deny",
+        "scheduling": "deny",
+        "stats": "read",
+        "account": "deny",
+        "rules": "deny",
+        "events": "deny",
+    }
+
+
+async def test_list_instagram_media_reads_the_workers_snapshot(app, transport):
+    async with Client(server_for(app, transport, stats="read")) as client:
+        result = await call(client, "list_instagram_media")
+
+    assert result == ("ok", {"fetched_at": None, "items": []})
+    assert transport.calls[-1][:2] == ("GET", "/v1/instagram-media")
+
+
+async def test_the_instructions_name_only_tools_this_server_has(app, transport):
+    async with Client(server_for(app, transport, **ALL_WRITE)) as client:
+        names = {tool.name for tool in (await client.list_tools()).tools}
+        referenced = set(TOOL_REFERENCE.findall(client.instructions or ""))
+
+    assert referenced <= names, referenced - names
+    # The steps an agent cannot guess: uploading, publishing safely, unknown outcomes, rules.
+    assert {
+        "get_token",
+        "upload_media",
+        "create_post",
+        "publish_now",
+        "resolve_post",
+        "list_instagram_media",
+        "test_rules",
+    } <= referenced
 
 
 async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):

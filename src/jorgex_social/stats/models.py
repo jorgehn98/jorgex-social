@@ -32,3 +32,16 @@ class AccountSnapshot(Base):
     taken_at: Mapped[datetime] = mapped_column(UTCDateTime)
     followers: Mapped[int | None] = mapped_column(Integer)  # at taken_at, not over the period
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class RecentMedia(Base):
+    """The account's newest feed posts and reels as the worker last listed them, so an agent can
+    see what is on the account without the API ever holding the credential. One row per network,
+    replaced by each listing: never a history."""
+
+    __tablename__ = "recent_media"
+
+    network: Mapped[str] = mapped_column(String(32), primary_key=True)
+    fetched_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    # Newest first: id, product_type, media_type, permalink and timestamp. Never the caption.
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
