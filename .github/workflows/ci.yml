@@ -27,9 +27,13 @@ jobs:
       # Dockerfile nor compose.yaml can rot.
       - run: cp .env.example .env
       - run: docker compose build --pull
-      - run: docker compose up -d --wait --wait-timeout 180
+      # The worker has no healthcheck, so wait on the API only; then make sure the worker stays up
+      # and stops promptly on SIGTERM.
+      - run: docker compose up -d --wait --wait-timeout 180 api && docker compose up -d worker
       - run: curl -fsS http://127.0.0.1:8000/health
+      - run: test -n "$(docker compose ps --status running --quiet worker)"
+      - run: timeout 60 docker compose stop worker && docker compose logs worker | grep -q "worker stopped"
       - if: failure()
         run: docker compose logs
       - if: always()
-        run: docker compose down -v
+        run: docker compose down -v --timeout 30

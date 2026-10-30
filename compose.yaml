@@ -12,6 +12,9 @@ x-service: &service
     JORGEX_SOCIAL_SECRET_KEY_FILE: /data/secret.key
   volumes:
     - data:/data
+  # A real PID 1 (tini) forwards signals; without it, a SIGTERM that arrives while Python is still
+  # starting is ignored by PID 1 and `docker compose stop` waits for the whole grace period.
+  init: true
   read_only: true
   tmpfs:
     - /tmp
@@ -50,7 +53,7 @@ services:
       disable: true
     # On SIGTERM the worker finishes the attempt in progress before exiting. A single post (one
     # container, its processing wait and the publish call) fits in this window; a kill mid-attempt
-    # is recovered later, but only after the attempt is considered stale.
+    # is recovered when the worker starts again (it resolves its predecessor's unfinished attempt).
     stop_grace_period: 15m
 
 volumes:
