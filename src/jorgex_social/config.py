@@ -24,6 +24,14 @@ def _positive(env, name: str, default: int) -> int:
     return value
 
 
+def _https_uris(value: str) -> tuple[str, ...]:
+    uris = tuple(uri.strip() for uri in value.split(",") if uri.strip())
+    for uri in uris:
+        if not uri.startswith("https://"):
+            raise ValueError(f"{ENV_PREFIX}OAUTH_REDIRECT_URIS takes https URIs only")
+    return uris
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path = Path("data/jorgex-social.db")
@@ -66,6 +74,9 @@ class Settings:
     # Sign-in attempts allowed per client address (IPv6: per /64), per minute and per hour.
     login_limit_per_minute: int = 5
     login_limit_per_hour: int = 20
+    # https redirect URIs an OAuth client may register besides loopback ones (comma-separated,
+    # matched exactly). Loopback (http://127.0.0.1, localhost, [::1]) is always allowed.
+    oauth_redirect_uris: tuple[str, ...] = ()
 
     @property
     def webhook_enabled(self) -> bool:
@@ -119,4 +130,5 @@ class Settings:
             login_limit_per_hour=_positive(
                 env, "LOGIN_LIMIT_PER_HOUR", defaults.login_limit_per_hour
             ),
+            oauth_redirect_uris=_https_uris(env.get(f"{ENV_PREFIX}OAUTH_REDIRECT_URIS", "")),
         )

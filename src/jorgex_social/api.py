@@ -14,6 +14,7 @@ from jorgex_social.clock import Clock, SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
 from jorgex_social.instagram import network_for
+from jorgex_social.oauth import routes as oauth
 from jorgex_social.publishing.api import public_router as media_files_router
 from jorgex_social.publishing.api import router as publishing_router
 from jorgex_social.replies.api import router as replies_router
@@ -76,4 +77,5 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.include_router(replies_router)
     app.include_router(webhook_router)
     ui.install(app)
+    oauth.install(app)
     return app

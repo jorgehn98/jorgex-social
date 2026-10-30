@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Connect a client{% endblock %}
+{% block body %}
+<main class="login">
+  {% include "_particles.svg" %}
+  {% if error %}
+  <div class="card">
+    <span class="wordmark">Jorge<span class="x">X</span> Social</span>
+    <h1>Connect a client</h1>
+    <p class="notice" role="alert">{{ error }}</p>
+    <p><a href="/ui/">Back to the interface</a></p>
+  </div>
+  {% else %}
+  <form class="card" method="post" action="/ui/oauth/consent">
+    <span class="wordmark">Jorge<span class="x">X</span> Social</span>
+    <h1>Connect a client</h1>
+    <p>A client calling itself <strong>{{ client_name or "(no name)" }}</strong> <span class="muted">(unverified)</span> asks to use this account.</p>
+    <p class="muted">Your answer goes back to <code>{{ host }}{% if port %}:{{ port }}{% endif %}</code>. Approve only a connection you started yourself, and only the groups it needs.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Group</th>{% for level in levels %}<th>{{ level }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for group in groups %}
+          <tr>
+            <td>{{ group }}</td>
+            {% for level in levels %}
+            <td><input type="radio" name="{{ group }}" value="{{ level }}" aria-label="{{ group }}: {{ level }}"{% if level == "deny" %} checked{% endif %}></td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <input type="hidden" name="req" value="{{ req }}">
+    <input type="hidden" name="nonce" value="{{ nonce }}">
+    <button class="primary" type="submit" name="decision" value="allow">Allow</button>
+    <button type="submit" name="decision" value="deny">Deny</button>
+  </form>
+  {% endif %}
+</main>
+{% endblock %}

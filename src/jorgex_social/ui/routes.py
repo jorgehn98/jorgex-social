@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from jorgex_social.access import operator
 from jorgex_social.access.deps import ReadSessionDep
 from jorgex_social.access.limits import client_key, is_listed
+from jorgex_social.access.models import OperatorSession
 from jorgex_social.access.proxy import via_proxy
 from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
@@ -125,7 +126,7 @@ def safe_next(value: str | None) -> str:
     return value
 
 
-def require_operator(request: Request) -> None:
+def require_operator(request: Request) -> OperatorSession:
     session_id = request.cookies.get(COOKIE)
     now = request.app.state.clock.now()
     found = None
@@ -141,6 +142,7 @@ def require_operator(request: Request) -> None:
         except OperationalError:
             # Bookkeeping only (a lock timeout): the page is served; the next one retries.
             log.warning("could not record the session's activity", exc_info=True)
+    return found
 
 
 def render(request: Request, name: str, status_code: int = 200, **context) -> Response:
@@ -176,7 +178,7 @@ def login_form(request: Request):
     return render(request, "login.html", next=safe_next(request.query_params.get("next")))
 
 
-async def _form(request: Request) -> dict[str, str]:
+async def read_form(request: Request) -> dict[str, str]:
     # Parsed by hand: FastAPI's Form needs python-multipart, a dependency the service otherwise
     # does without. The body is capped, as nothing legitimate here is large.
     body = b""
@@ -220,7 +222,7 @@ async def login(request: Request):
         response = render(request, "login.html", 429, error=TOO_MANY, next=HOME)
         response.headers["Retry-After"] = str(int(wait.total_seconds()) + 1)
         return response
-    form = await _form(request)
+    form = await read_form(request)
     next_page = safe_next(form.get("next"))
     try:
         session_id = await run_in_threadpool(
