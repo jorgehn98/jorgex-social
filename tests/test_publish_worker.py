@@ -231,6 +231,22 @@ def test_server_error_after_going_live_is_resolved_without_publishing_again(
     assert [(a["result"], a["resolved_as"]) for a in post["attempts"]] == [("unknown", "published")]
 
 
+def test_the_resolvers_listing_refreshes_the_recent_media(app, client, api, task, sessions, ig):
+    post_id = api.post()
+    api.publish_now(post_id)
+    ig.fail_next("publish", Unavailable("502 after going live"), after=True)
+    task.publish_due(sessions)
+
+    task.resolve(sessions)
+
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "reader", {"stats": "read"})
+    recent = client.get("/v1/instagram-media", headers={"Authorization": f"Bearer {secret}"})
+    [live] = published(ig)
+    assert [m["id"] for m in recent.json()["items"]] == [live.id]
+    assert recent.json()["fetched_at"] is not None
+
+
 def test_finished_container_is_published_again_safely(api, task, sessions, ig):
     post_id = api.post()
     api.publish_now(post_id)

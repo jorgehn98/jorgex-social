@@ -9,7 +9,12 @@ from jorgex_social.instagram.errors import AuthError, RateLimited, Refused
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
-from jorgex_social.stats.snapshots import BACKFILL_DAYS, SnapshotTask, closed_days
+from jorgex_social.stats.snapshots import (
+    BACKFILL_DAYS,
+    RECENT_MEDIA_KEPT,
+    SnapshotTask,
+    closed_days,
+)
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 IMAGE = ContainerRequest(ContainerKind.IMAGE, url="https://x.test/a.jpg", caption="c")
@@ -125,7 +130,9 @@ def auth(app, **grants):
 
 
 def test_api_requires_stats_read(app, client):
-    assert client.get("/v1/stats/media", headers=auth(app, posts="write")).status_code == 403
+    headers = auth(app, posts="write")
+    assert client.get("/v1/stats/media", headers=headers).status_code == 403
+    assert client.get("/v1/instagram-media", headers=headers).status_code == 403
 
 
 def test_api_returns_history(app, client, sessions, ig, clock):
@@ -148,6 +155,33 @@ def test_api_returns_history(app, client, sessions, ig, clock):
     assert len(history) == 2
     assert history[0]["taken_at"] > history[1]["taken_at"]
     assert [a["period_start"][:10] for a in account] == ["2026-10-27", "2026-10-26", "2026-10-25"]
+
+
+def test_recent_media_is_empty_until_the_worker_lists_it(app, client):
+    response = client.get("/v1/instagram-media", headers=auth(app, stats="read"))
+
+    assert response.json() == {"fetched_at": None, "items": []}
+
+
+def test_each_sweep_replaces_the_recent_media(app, client, sessions, ig, clock):
+    oldest = publish(ig, clock, IMAGE)
+    task = SnapshotTask(ig, clock)
+    task(sessions)
+    headers = auth(app, stats="read")
+    first = client.get("/v1/instagram-media", headers=headers).json()
+
+    newer = [publish(ig, clock, REEL) for _ in range(RECENT_MEDIA_KEPT)]
+    clock.advance(hours=1)
+    task(sessions)
+    second = client.get("/v1/instagram-media", headers=headers).json()
+
+    assert first["fetched_at"] == "2026-10-29T12:01:00Z"
+    assert [m["id"] for m in first["items"]] == [oldest]
+    assert first["items"][0]["product_type"] == "FEED"
+    assert set(first["items"][0]) == {"id", "product_type", "media_type", "permalink", "timestamp"}
+    # Only the newest are kept, newest first: the oldest one is gone, not accumulated.
+    assert [m["id"] for m in second["items"]] == newer[::-1]
+    assert second["fetched_at"] > first["fetched_at"]
 
 
 def test_api_rejects_dates_without_timezone(app, client):

@@ -86,8 +86,11 @@ window after its time (kill switch on, service down) fails as missed_schedule.
 
 outcome_unknown: the service cannot tell whether Instagram published the post and keeps \
 checking; after an hour it opens a publish_unresolved incident. Never schedule it again to \
-retry: it could publish twice. Have a human check the account, then `resolve_post` with \
-published (and the media id, if known) or not_published, which returns it to draft.
+retry: it could publish twice. Look for it with `list_instagram_media` (its fetched_at must be \
+later than the attempt's start, in `get_post`): if a media of that type appeared then, \
+`resolve_post` with published and its id. Stories are never listed, and a missing media may \
+only be late, so for a story, before resolving as not_published (which returns the post to \
+draft) or whenever you are unsure, have a human check the account.
 
 Rules: `create_rule` makes an inactive rule. `test_rules` with its rule_id and sample texts \
 shows what it would match and send, sending nothing. `activate_rule` makes it answer, only to \
@@ -380,6 +383,14 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         """Every stored snapshot of one media, newest first. Empty if none has been taken yet."""
         return call("GET", "/v1/stats/media/{}", media_ref, query={"limit": limit})
 
+    def list_instagram_media() -> str:
+        """The account's newest feed posts and reels (up to 25), newest first: id (the media id
+        for resolve_post and for a rule's media_ref), product_type, media_type, permalink and
+        timestamp. A snapshot from the worker's last listing, not a live call: check fetched_at
+        (null if never listed). It refreshes hourly and when the worker checks a post in
+        outcome_unknown. Stories are never listed."""
+        return call("GET", "/v1/instagram-media")
+
     # account
 
     def get_account() -> str:
@@ -619,6 +630,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ("stats", "read", account_stats, READ),
         ("stats", "read", media_stats, READ),
         ("stats", "read", media_history, READ),
+        ("stats", "read", list_instagram_media, READ),
         ("account", "read", get_account, READ),
         ("account", "read", list_incidents, READ),
         ("account", "read", audit_log, READ),

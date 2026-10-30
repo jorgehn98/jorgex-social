@@ -110,7 +110,23 @@ async def test_the_instructions_name_only_tools_the_remote_server_has(app, clock
 
     # A backticked identifier is always a tool name; uploads go through the upload URL here.
     assert referenced <= names, referenced - names
-    assert {"create_upload_url", "create_post", "publish_now", "resolve_post"} <= referenced
+    assert {
+        "create_upload_url",
+        "create_post",
+        "publish_now",
+        "resolve_post",
+        "list_instagram_media",
+    } <= referenced
+
+
+@pytest.mark.anyio
+async def test_list_instagram_media_works_remotely(app, clock):
+    oauth, _, _ = await operator_oauth(httpx2.ASGITransport(app=app), clock, stats="read")
+
+    async with mcp_client(app, auth=oauth) as client:
+        result = await call(client, "list_instagram_media")
+
+    assert result == ("ok", {"fetched_at": None, "items": []})
 
 
 @pytest.mark.anyio
