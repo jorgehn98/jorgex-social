@@ -7,10 +7,15 @@ from sqlalchemy import func, select
 
 from jorgex_social.access.deps import SessionDep, require
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import audit, kill_switch
+from jorgex_social.account import audit, incidents, kill_switch
 from jorgex_social.account.connection import status_at
 from jorgex_social.account.credential import connection_of
-from jorgex_social.account.models import AuditEntry, ChannelIncident, ConnectionStatus
+from jorgex_social.account.models import (
+    AuditEntry,
+    ChannelIncident,
+    ConnectionStatus,
+    IncidentType,
+)
 from jorgex_social.instagram.fake import FakeInstagram
 
 router = APIRouter(prefix="/v1/account", tags=["account"])
@@ -163,9 +168,18 @@ def acknowledge_incident(incident_id: str, request: Request, session: SessionDep
 def set_kill_switch(body: KillSwitchIn, request: Request, session: SessionDep):
     """On: the worker stops writing to the network (no containers, no publishing, no replies).
     Scheduled posts stay scheduled; those past the grace window when it is turned off fail as
-    `missed_schedule` and can be rescheduled. Replies due while it is on are skipped."""
+    `missed_schedule` and can be rescheduled. Replies due while it is on are skipped.
+
+    It also turns on by itself when Instagram reports the account as restricted, with an
+    `account_restricted` incident. Only turning it off here closes that incident; if Instagram
+    refuses again, both come back."""
     audit.set_detail(request, {"enabled": body.enabled})
-    setting = kill_switch.set_state(session, body.enabled, request.app.state.clock.now())
+    now = request.app.state.clock.now()
+    setting = kill_switch.set_state(session, body.enabled, now)
+    if not body.enabled:
+        incidents.sync(
+            session, request.app.state.network, IncidentType.ACCOUNT_RESTRICTED, False, now
+        )
     return KillSwitchOut(enabled=setting.value, updated_at=setting.updated_at)
 
 

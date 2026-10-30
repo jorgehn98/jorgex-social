@@ -195,8 +195,9 @@ def signature_valid(secret: str, body: bytes, header: str | None) -> bool:
 
 def _sending(session: Session, network: str, conversation: Conversation) -> bool:
     """Meta can echo a reply before the worker has stored its id, so an unknown echo may be a
-    send still in flight: a message to this conversation, or any private reply (its comment's
-    author is not stored, so it cannot be tied to a conversation)."""
+    send still in flight: a message to this conversation, or any private reply (whether its
+    comment's `author_ref` is the id the conversation uses is not verified, so it cannot be tied
+    to a conversation)."""
     return (
         session.scalar(
             select(Delivery.id)

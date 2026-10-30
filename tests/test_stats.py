@@ -5,7 +5,7 @@ from sqlalchemy import func, select, text
 
 from jorgex_social.access.tokens import create_token
 from jorgex_social.clock import ManualClock
-from jorgex_social.instagram.errors import AuthError, RateLimited, Refused
+from jorgex_social.instagram.errors import AccountRestricted, AuthError, RateLimited, Refused
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot
@@ -205,13 +205,18 @@ def test_api_rejects_dates_without_timezone(app, client):
     assert response.status_code == 422
 
 
-def test_rate_limit_stops_the_sweep_and_keeps_what_was_saved(sessions, ig, clock):
+@pytest.mark.parametrize(
+    "stop", [RateLimited("slow down", code=4), AccountRestricted("no", code=4, subcode=2207051)]
+)
+def test_rate_limit_or_restriction_stops_the_sweep_and_keeps_what_was_saved(
+    sessions, ig, clock, stop
+):
     for _ in range(3):
         publish(ig, clock, IMAGE)
     ig.fail_next("media_insights", Refused("first fails", code=100))
-    ig.fail_next("media_insights", RateLimited("slow down", code=4))
+    ig.fail_next("media_insights", stop)
 
-    with pytest.raises(RateLimited):
+    with pytest.raises(type(stop)):
         SnapshotTask(ig, clock)(sessions)
 
     assert count(sessions, AccountSnapshot) == BACKFILL_DAYS

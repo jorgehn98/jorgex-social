@@ -6,7 +6,13 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from jorgex_social.instagram.client import InstagramClient
-from jorgex_social.instagram.errors import AuthError, RateLimited, Refused, Unavailable
+from jorgex_social.instagram.errors import (
+    AccountRestricted,
+    AuthError,
+    RateLimited,
+    Refused,
+    Unavailable,
+)
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest, ProductType
 
 TOKEN = "test-token-not-real"
@@ -114,6 +120,74 @@ def test_error_classification(response, error):
 
     with pytest.raises(error):
         ig.publish("1")
+
+
+@pytest.mark.parametrize(
+    ("code", "subcode"),
+    [
+        (10, 1893063),
+        (100, 2534029),
+        (613, 2018338),
+        (4, 2207051),
+        (9, 2018352),
+        (25, 2207050),
+        (368, 1404078),
+        (368, None),
+    ],
+)
+def test_a_restricted_account_is_told_apart_and_never_looks_retryable(code, subcode):
+    error = {"message": "restricted", "code": code, "error_subcode": subcode, "is_transient": True}
+    ig, _ = client((400, {"error": error}))
+
+    with pytest.raises(AccountRestricted) as caught:
+        ig.reply_public("1", "hi")
+
+    assert (caught.value.code, caught.value.subcode) == (code, subcode)
+    assert not caught.value.transient
+
+
+def test_a_non_integer_subcode_is_dropped_and_the_restriction_still_stands():
+    error = {"message": "no", "code": 368, "error_subcode": "see https://x.test/person"}
+    ig, _ = client((400, {"error": error}))
+
+    with pytest.raises(AccountRestricted) as caught:
+        ig.reply_public("1", "hi")
+
+    assert (caught.value.code, caught.value.subcode) == (368, None)
+
+
+@pytest.mark.parametrize("code", ["368", 368.0, True, {"a": 1}])
+def test_a_non_integer_code_is_dropped(code):
+    ig, _ = client((400, {"error": {"message": "no", "code": code}}))
+
+    with pytest.raises(Refused) as caught:
+        ig.reply_public("1", "hi")
+
+    assert type(caught.value) is Refused
+    assert caught.value.code is None
+
+
+@pytest.mark.parametrize(
+    ("code", "subcode", "expected"),
+    [
+        (4, None, RateLimited),
+        (4, 1234, RateLimited),
+        (613, None, RateLimited),
+        (613, 1234, RateLimited),
+        (80002, None, RateLimited),
+        (9, 2207042, Refused),  # the daily publishing limit
+        (10, None, Refused),
+        (190, 2207050, AuthError),
+    ],
+)
+def test_codes_near_a_restriction_keep_their_own_meaning(code, subcode, expected):
+    error = {"message": "no", "code": code, "error_subcode": subcode}
+    ig, _ = client((400, {"error": error}))
+
+    with pytest.raises(Refused) as caught:
+        ig.reply_public("1", "hi")
+
+    assert type(caught.value) is expected
 
 
 def test_refusal_keeps_meta_codes():

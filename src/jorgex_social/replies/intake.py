@@ -94,6 +94,7 @@ class Intake:
                 type=Channel.COMMENT,
                 external_ref=comment.id,
                 media_ref=media_ref,
+                author_ref=comment.author_id,
                 occurred_at=comment.timestamp,
                 received_at=now,
                 rule_id=rule.id if rule else None,

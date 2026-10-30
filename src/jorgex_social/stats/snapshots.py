@@ -6,7 +6,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from jorgex_social.clock import Clock
-from jorgex_social.instagram.errors import AuthError, InstagramError, RateLimited
+from jorgex_social.instagram.errors import (
+    AccountRestricted,
+    AuthError,
+    InstagramError,
+    RateLimited,
+)
 from jorgex_social.instagram.types import Instagram, Media, ProductType
 from jorgex_social.publishing.models import Post, PostStatus, PostType
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot, RecentMedia
@@ -35,7 +40,7 @@ STORY_INTERVAL = timedelta(hours=6)
 RECENT_MEDIA_KEPT = 25
 
 # The sweep stops on these: retrying item by item would only repeat the failure.
-_STOP_SWEEP = (AuthError, RateLimited)
+_STOP_SWEEP = (AccountRestricted, AuthError, RateLimited)
 
 
 def _day_start(moment: datetime) -> datetime:

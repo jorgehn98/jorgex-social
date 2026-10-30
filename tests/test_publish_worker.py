@@ -4,9 +4,11 @@ import pytest
 from sqlalchemy import select, text
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account import kill_switch
+from jorgex_social.account.models import AuditEntry, ChannelIncident
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
-from jorgex_social.instagram.errors import Refused, Unavailable
+from jorgex_social.instagram.errors import AccountRestricted, Refused, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerStatus, ProductType
 from jorgex_social.publishing.models import Media
@@ -313,6 +315,35 @@ def test_refusal_checks_the_container_before_failing(api, task, sessions, ig):
         2207001,
     )
     assert published(ig) == []
+
+
+@pytest.mark.parametrize("operation", ["create_container", "publish"])
+def test_a_restriction_fails_the_post_as_refused_and_stops_the_next_ones(
+    api, task, sessions, ig, operation
+):
+    restricted, waiting = api.post(), api.post()
+    api.publish_now(restricted)
+    api.publish_now(waiting)
+    ig.fail_next(operation, AccountRestricted("restricted", code=613, subcode=2018338))
+
+    task(sessions)
+    task(sessions)
+
+    post = api.get(restricted)
+    assert (post["status"], post["failure"]) == ("failed", "refused")
+    assert (post["attempts"][0]["error_code"], post["attempts"][0]["error_subcode"]) == (
+        613,
+        2018338,
+    )
+    assert api.get(waiting)["status"] == "scheduled"
+    assert published(ig) == []
+    with sessions() as session:
+        assert kill_switch.is_on(session)
+        incident = session.scalar(select(ChannelIncident))
+        entry = session.scalar(select(AuditEntry).where(AuditEntry.action == "kill_switch.on"))
+    assert (incident.type, incident.closed_at) == ("account_restricted", None)
+    assert incident.detail == {"code": 613, "subcode": 2018338}
+    assert entry.detail == {"code": 613, "subcode": 2018338}
 
 
 def test_refusal_on_a_live_container_is_not_a_failure(api, task, sessions, ig):

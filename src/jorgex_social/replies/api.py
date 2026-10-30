@@ -327,7 +327,11 @@ def list_deliveries(
     limit: Limit = 100,
     offset: Offset = 0,
 ):
-    """Replies, newest first, with what was sent or why not."""
+    """Replies, newest first, with what was sent or why not. A reply stays `pending` while the
+    per-minute pace holds it back. `reason` is one of: `kill_switch`, `paused`, `window_closed`
+    (past the private reply's 7 days, the message's 24 hours or the public reply's 24 hours),
+    `cooldown`, `already_answered` (this rule already answered this person on this post),
+    `hourly_cap` (the overall cap, or the lower one on public replies), `refused` or `unknown`."""
     query = select(Delivery).join(Event).where(Event.network == network)
     for column, value in (
         (Delivery.status, status),
@@ -384,7 +388,9 @@ def pause_conversation(
     conversation_id: str, body: PauseIn, request: Request, session: SessionDep, network: Network
 ):
     """Stop automatic messages to this person, until a time or for good, for example while a
-    human answers. Messages already queued are skipped as `paused`."""
+    human answers. Messages already queued are skipped as `paused`. Replies to this person's
+    comments are too, but only if Instagram uses the same id for a comment's author and a
+    message's sender, which is not verified."""
     if body.forever == (body.until is not None):
         raise _error(422, "invalid_value", "Give either until or forever=true.")
     now = request.app.state.clock.now()

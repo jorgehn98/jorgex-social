@@ -12,11 +12,11 @@ from sqlalchemy.exc import IntegrityError
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account import kill_switch
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import Connection
+from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.client import InstagramClient
-from jorgex_social.instagram.errors import RateLimited, Refused, Unavailable
+from jorgex_social.instagram.errors import AccountRestricted, RateLimited, Refused, Unavailable
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.logs import JsonFormatter
@@ -26,6 +26,8 @@ from jorgex_social.replies.task import ReplyTask
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 PERSON = "17900000000000042"
+OTHER_PERSON = "17900000000000043"
+PRIVATE_ONLY = {"keywords": ["precio"], "private_replies": ["DM"]}
 PRICE_RULE = {
     "keywords": ["precio", "how much"],
     "public_replies": ["Sent you a DM!", "Check your inbox"],
@@ -646,8 +648,8 @@ def test_the_hourly_cap_skips_the_excess(client, headers, ig, sessions, clock):
     capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_cap=1)
     make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
     media = publish(ig)
-    ig.add_comment(media, "precio")
-    ig.add_comment(media, "precio")
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.add_comment(media, "precio", author_id=OTHER_PERSON)
 
     capped(sessions)
 
@@ -986,3 +988,265 @@ def test_a_message_that_is_one_of_our_sends_never_fires_a_rule(client, headers, 
     assert [op for op, _, _ in ig.sent] == ["reply_private"]
     with sessions() as session:
         assert session.scalars(select(Event.type)).all() == ["comment"]
+
+
+# Protecting the account
+
+RESTRICTED = AccountRestricted("restricted", code=10, subcode=1893063)
+
+
+def refuse_every_send(ig, error):
+    """The fake refuses every write from now on; returns the calls that reached it."""
+    calls = []
+
+    def refuse(target, text):
+        calls.append(target)
+        raise error
+
+    ig.reply_public = ig.reply_private = ig.send_message = refuse
+    return calls
+
+
+def restriction_incidents(sessions):
+    with sessions() as session:
+        return session.scalars(
+            select(ChannelIncident)
+            .where(ChannelIncident.type == "account_restricted")
+            .order_by(ChannelIncident.opened_at)
+        ).all()
+
+
+def kill_switch_is_on(sessions):
+    with sessions() as session:
+        return kill_switch.is_on(session)
+
+
+@pytest.fixture
+def operator(app):
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "operator", {"account": "write"})
+    return {"Authorization": f"Bearer {secret}"}
+
+
+def test_a_restriction_stops_everything_after_one_call(client, headers, ig, sessions, task):
+    make_rule(client, headers)
+    media = publish(ig)
+    for number in range(20):
+        ig.add_comment(media, "precio", author_id=f"179000000000001{number:02}")
+    calls = refuse_every_send(ig, RESTRICTED)
+
+    task(sessions)
+
+    assert len(calls) == 1
+    [failed] = [d for d in deliveries(sessions) if d.status != "pending"]
+    assert (failed.status, failed.reason) == ("failed", "refused")
+    assert (failed.error_code, failed.error_subcode) == (10, 1893063)
+    assert len(deliveries(sessions)) == 40
+    assert kill_switch_is_on(sessions)
+    [incident] = restriction_incidents(sessions)
+    assert incident.closed_at is None
+    assert incident.detail == {"code": 10, "subcode": 1893063}
+    with sessions() as session:
+        entry = session.scalar(select(AuditEntry).where(AuditEntry.action == "kill_switch.on"))
+    assert (entry.actor_type, entry.detail) == ("system", {"code": 10, "subcode": 1893063})
+
+    task(sessions)
+
+    assert len(calls) == 1
+    rest = [d for d in deliveries(sessions) if d.id != failed.id]
+    assert {(d.status, d.reason) for d in rest} == {("skipped", "kill_switch")}
+
+
+def test_only_turning_the_switch_off_closes_the_incident_and_a_new_refusal_reopens_it(
+    client, headers, operator, ig, sessions, task, clock
+):
+    make_rule(client, headers)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    refuse_every_send(ig, RESTRICTED)
+    task(sessions)
+
+    task(sessions)
+    client.put("/v1/account/kill-switch", json={"enabled": True}, headers=operator)
+    assert restriction_incidents(sessions)[0].closed_at is None
+
+    client.put("/v1/account/kill-switch", json={"enabled": False}, headers=operator)
+    assert restriction_incidents(sessions)[0].closed_at is not None
+    assert not kill_switch_is_on(sessions)
+
+    clock.advance(seconds=1)
+    ig.add_comment(media, "precio", author_id=OTHER_PERSON)
+    task(sessions)
+
+    first, second = restriction_incidents(sessions)
+    assert first.closed_at is not None
+    assert second.closed_at is None
+    assert kill_switch_is_on(sessions)
+
+
+def test_a_restriction_found_while_polling_stops_the_poll_and_the_writes(
+    client, headers, ig, sessions, task
+):
+    make_rule(client, headers)
+    publish(ig)
+    publish(ig)
+    calls = []
+    original = ig.list_comments
+
+    def list_comments(media_id):
+        calls.append(media_id)
+        ig.fail_next("list_comments", RESTRICTED)
+        return original(media_id)
+
+    ig.list_comments = list_comments
+
+    task(sessions)
+
+    assert len(calls) == 1
+    assert kill_switch_is_on(sessions)
+    assert len(restriction_incidents(sessions)) == 1
+
+
+def test_a_person_is_answered_once_per_rule_and_post(client, headers, ig, sessions, task):
+    make_rule(client, headers)
+    media, other_media = publish(ig), publish(ig)
+    first = ig.add_comment(media, "precio", author_id=PERSON)
+    for _ in range(4):
+        ig.add_comment(media, "precio", author_id=PERSON)
+
+    task(sessions)
+
+    assert {target for _, target, _ in ig.sent} == {first}
+    assert len(ig.sent) == 2
+    reasons = [d.reason for d in deliveries(sessions) if d.status == "skipped"]
+    assert reasons == ["already_answered"] * 8
+
+    on_another_post = ig.add_comment(other_media, "precio", author_id=PERSON)
+    from_someone_else = ig.add_comment(media, "precio", author_id=OTHER_PERSON)
+    task(sessions)
+
+    assert {target for _, target, _ in ig.sent} == {first, on_another_post, from_someone_else}
+    assert len(ig.sent) == 6
+    assert all("author_ref" not in e for e in client.get("/v1/events", headers=headers).json())
+
+
+def test_a_refused_reply_does_not_count_as_answered(client, headers, ig, sessions, task):
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.fail_next("reply_private", Refused("comment is gone", code=100))
+    task(sessions)
+    assert ig.sent == []
+
+    again = ig.add_comment(media, "precio", author_id=PERSON)
+    task(sessions)
+
+    assert [target for _, target, _ in ig.sent] == [again]
+
+
+def test_a_reply_that_may_have_gone_out_counts_as_answered(client, headers, ig, sessions, task):
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.fail_next("reply_private", Unavailable("lost connection"))
+    task(sessions)
+
+    ig.add_comment(media, "precio", author_id=PERSON)
+    task(sessions)
+
+    assert ig.sent == []
+    assert sorted((d.status, d.reason) for d in deliveries(sessions)) == [
+        ("failed", "unknown"),
+        ("skipped", "already_answered"),
+    ]
+
+
+def test_a_second_rule_still_answers_the_same_person_on_the_same_post(
+    client, headers, ig, sessions, task
+):
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    make_rule(client, headers, content={"keywords": ["info"], "private_replies": ["Info"]})
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.add_comment(media, "info", author_id=PERSON)
+
+    task(sessions)
+
+    assert sorted(text for _, _, text in ig.sent) == ["DM", "Info"]
+
+
+def test_a_pause_reaches_the_comments_of_the_same_id(client, headers, ig, sessions, task, clock):
+    make_rule(client, headers)
+    ig.add_message(PERSON, "hola")
+    task.poll_messages(sessions, ACCOUNT_ID, clock.now())
+    [conversation] = client.get("/v1/conversations", headers=headers).json()
+    client.post(
+        f"/v1/conversations/{conversation['id']}/pause", json={"forever": True}, headers=headers
+    )
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    other = ig.add_comment(media, "precio", author_id=OTHER_PERSON)
+
+    task(sessions)
+
+    assert {target for _, target, _ in ig.sent} == {other}
+    skipped = [(d.action, d.reason) for d in deliveries(sessions) if d.status == "skipped"]
+    assert sorted(skipped) == [("private_reply", "paused"), ("public_reply", "paused")]
+
+
+def test_pacing_leaves_the_rest_pending_and_the_next_passes_continue(
+    client, headers, ig, sessions, task, clock
+):
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    media = publish(ig)
+    comments = [
+        ig.add_comment(media, "precio", author_id=f"179000000000001{number:02}")
+        for number in range(13)
+    ]
+
+    task(sessions)
+
+    assert [target for _, target, _ in ig.sent] == comments[:12]
+    last = deliveries(sessions)[-1]
+    assert (last.status, last.reason, last.attempted_at) == ("pending", None, None)
+
+    task(sessions)
+    assert len(ig.sent) == 12
+
+    clock.advance(seconds=61)
+    task(sessions)
+
+    assert [target for _, target, _ in ig.sent] == comments
+    assert {d.status for d in deliveries(sessions)} == {"sent"}
+
+
+def test_a_public_reply_expires_after_a_day_and_the_private_one_does_not(
+    client, headers, ig, sessions, task, clock
+):
+    make_rule(client, headers)
+    ig.add_comment(publish(ig), "precio")
+    task.poll_comments(sessions, ACCOUNT_ID, clock.now())
+
+    clock.advance(hours=24, seconds=1)
+    task.deliver(sessions)
+
+    assert by_action(sessions) == {
+        "public_reply": ("skipped", "window_closed"),
+        "private_reply": ("sent", None),
+    }
+
+
+def test_the_public_cap_lets_the_private_reply_through(client, headers, ig, sessions, clock):
+    ConnectionTask(ig, clock, None)(sessions)
+    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_public_cap=1)
+    make_rule(client, headers)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    second = ig.add_comment(media, "precio", author_id=OTHER_PERSON)
+
+    capped(sessions)
+
+    assert sorted(op for op, _, _ in ig.sent) == ["reply_private", "reply_private", "reply_public"]
+    assert ("reply_private", second) in {(op, target) for op, target, _ in ig.sent}
+    skipped = [(d.action, d.reason) for d in deliveries(sessions) if d.status == "skipped"]
+    assert skipped == [("public_reply", "hourly_cap")]
