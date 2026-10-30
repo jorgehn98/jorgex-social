@@ -212,6 +212,17 @@ def _counts_the_proxy(request: Request) -> bool:
     return host not in {entry.strip() for entry in forwarded.split(",")}
 
 
+def _end_presented_session(request: Request) -> None:
+    session_id = request.cookies.get(COOKIE)
+    if session_id:
+        # Looked up first in a read transaction, so a made-up cookie never takes the write lock.
+        with request.app.state.read_sessionmaker() as session, session.begin():
+            stored = operator.is_stored(session, session_id)
+        if stored:
+            with request.app.state.sessionmaker() as session, session.begin():
+                operator.log_out(session, session_id)
+
+
 @public.post("/login")
 async def login(request: Request):
     state = request.app.state
@@ -249,6 +260,12 @@ async def login(request: Request):
         return render(request, "login.html", 503, error=BUSY, next=next_page)
     if session_id is None:
         return render(request, "login.html", 401, error=INVALID, next=next_page)
+    try:
+        # The cookie it replaces would otherwise stay valid for days, unseen.
+        await run_in_threadpool(_end_presented_session, request)
+    except OperationalError:
+        # A lock timeout must not cost the sign-in, whose code is already spent: it lapses alone.
+        log.warning("could not end the session this sign-in replaces", exc_info=True)
     response = RedirectResponse(next_page, status_code=303, headers=HEADERS)
     response.set_cookie(
         COOKIE,
@@ -264,14 +281,7 @@ async def login(request: Request):
 
 @public.post("/logout")
 def logout(request: Request):
-    session_id = request.cookies.get(COOKIE)
-    if session_id:
-        # Looked up first in a read transaction, so a made-up cookie never takes the write lock.
-        with request.app.state.read_sessionmaker() as session, session.begin():
-            stored = operator.is_stored(session, session_id)
-        if stored:
-            with request.app.state.sessionmaker() as session, session.begin():
-                operator.log_out(session, session_id)
+    _end_presented_session(request)
     response = RedirectResponse("/ui/login", status_code=303, headers=HEADERS)
     response.delete_cookie(COOKIE, path="/ui")
     return response
