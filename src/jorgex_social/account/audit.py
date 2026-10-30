@@ -1,5 +1,6 @@
-"""Append-only audit log: every API request that writes, and the transitions the worker makes
-on its own. Entries carry identifiers only: never a request body, a secret or third-party text."""
+"""Append-only audit log: every authenticated API request that writes, and the transitions the
+worker makes on its own. Entries carry identifiers only: never a request body, a secret or
+third-party text."""
 
 import logging
 from datetime import datetime
@@ -70,8 +71,9 @@ def set_detail(request: Request, detail: dict[str, Any]) -> None:
 
 
 class AuditMiddleware:
-    """Records every request that writes, after the response, in its own transaction. Plain ASGI
-    rather than BaseHTTPMiddleware so large uploads stream through untouched."""
+    """Records every authenticated request that writes, after the response, in its own
+    transaction. Plain ASGI rather than BaseHTTPMiddleware so large uploads stream through
+    untouched."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -98,6 +100,12 @@ class AuditMiddleware:
         if route is None:
             return  # no such endpoint: nothing was acted on, and the raw path may hold anything
         state = scope.get("state", {})
+        action = f"{scope['method']} {route.path}"
+        if state.get("audit_actor") is None:
+            # No valid token (401, or 405 before authentication): writing a row would let anyone
+            # take the database write lock at will. Logged instead, without body or credentials.
+            log.info("unauthenticated %s answered %s", action, status_code)
+            return
         object_type, object_id = _object(scope.get("path_params", {}))
         app = scope["app"]
         try:
@@ -105,7 +113,7 @@ class AuditMiddleware:
                 record(
                     session,
                     app.state.clock.now(),
-                    f"{scope['method']} {route.path}",
+                    action,
                     outcome_of(status_code),
                     actor_type=ActorType.TOKEN,
                     actor_ref=state.get("audit_actor"),

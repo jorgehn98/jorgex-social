@@ -648,16 +648,39 @@ def test_denied_and_failed_requests_are_audited(app, client, headers):
     reader = headers_for(app, account="read")
 
     client.put("/v1/account/kill-switch", json={"enabled": True}, headers=reader)
-    client.put("/v1/account/kill-switch", json={"enabled": True})
     client.post("/v1/account/incidents/missing/acknowledge", headers=headers)
 
     entries = audit(client, headers)
     assert [(e["outcome"], e["actor_ref"] is not None) for e in entries] == [
         ("error", True),  # 404
-        ("denied", False),  # no token
         ("denied", True),  # a token without account:write
     ]
     assert entries[0]["object_id"] == "missing"
+
+
+def test_unauthenticated_writes_are_logged_not_audited(client, headers, caplog):
+    caplog.set_level(logging.INFO, logger="jorgex_social.account.audit")
+
+    client.put("/v1/account/kill-switch", json={"enabled": True})
+    client.put("/v1/account/kill-switch", headers={"Authorization": "Bearer jxs_made_up"})
+    client.delete("/v1/account/kill-switch")  # 405
+
+    assert audit(client, headers) == []
+    assert "PUT /v1/account/kill-switch" in caplog.text
+    assert "jxs_made_up" not in caplog.text
+
+
+def test_write_flood_with_made_up_tokens_does_not_wait_for_the_write_lock(client, sessions):
+    with sessions() as writer, writer.begin():
+        writer.execute(select(AuditEntry.id)).all()
+        statuses = {
+            client.post(
+                "/v1/posts", json={}, headers={"Authorization": f"Bearer jxs_fake{i}"}
+            ).status_code
+            for i in range(20)
+        }
+
+    assert statuses == {401}
 
 
 def test_unknown_routes_are_not_audited(client, headers):

@@ -36,6 +36,7 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.state.read_sessionmaker = make_sessionmaker(make_engine(settings, write=False))
 
     @app.get("/health", tags=["system"])
+    @app.head("/health", include_in_schema=False)  # for proxies and uptime checks
     def health(request: Request) -> JSONResponse:
         try:
             with request.app.state.read_sessionmaker() as session:

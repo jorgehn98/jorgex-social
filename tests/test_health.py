@@ -13,6 +13,10 @@ def test_health_reports_ok_and_simulation(client):
     assert response.json() == {"status": "ok", "simulation": True}
 
 
+def test_health_answers_head(client):
+    assert client.head("/health").status_code == 200
+
+
 def test_api_docs_are_served_in_simulation(client):
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == 200

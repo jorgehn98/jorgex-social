@@ -1,8 +1,10 @@
+import logging
 from collections.abc import Callable, Iterator
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from jorgex_social.access.models import ApiToken
@@ -15,6 +17,8 @@ from jorgex_social.access.tokens import (
     record_use,
 )
 from jorgex_social.account.audit import set_actor
+
+log = logging.getLogger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -54,8 +58,12 @@ def _authenticate(request: Request, credentials: HTTPAuthorizationCredentials | 
     set_actor(request, token.prefix)  # before authorizing, so a denied call names its token
     now = request.app.state.clock.now()
     if needs_use_recorded(token, now):
-        with request.app.state.sessionmaker() as session, session.begin():
-            record_use(session, token, now)
+        try:
+            with request.app.state.sessionmaker() as session, session.begin():
+                record_use(session, token, now)
+        except OperationalError:
+            # Only bookkeeping (a lock timeout): the request goes on; the next use retries.
+            log.warning("could not record the last use of token %s", token.prefix, exc_info=True)
     return token
 
 

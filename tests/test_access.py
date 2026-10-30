@@ -4,7 +4,9 @@ import pytest
 from fastapi import Depends
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
+from jorgex_social.access import deps
 from jorgex_social.access.deps import require
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token
@@ -141,3 +143,16 @@ def test_token_use_is_recorded_at_most_once_a_minute(settings):
     assert first == clock.now() - timedelta(seconds=61)
     assert throttled == first
     assert last_used() == clock.now()
+
+
+def test_token_use_bookkeeping_never_fails_the_request(app, client, monkeypatch, caplog):
+    def locked(*_):
+        raise OperationalError("UPDATE api_tokens", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(deps, "record_use", locked)
+    secret = make_token(app)
+
+    response = client.get("/v1/token", headers=auth(secret))
+
+    assert response.status_code == 200
+    assert "last use" in caplog.text
