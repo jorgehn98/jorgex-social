@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, computed_field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -100,16 +100,6 @@ def _rule(session: Session, network: str, rule_id: str) -> Rule:
     return rule
 
 
-def _stored_content(rule: Rule) -> RuleContent:
-    # What an older version accepted may not pass today's checks: refused like new content, so
-    # the caller learns what to fix instead of getting a server error.
-    try:
-        return RuleContent.model_validate(rule.content)
-    except ValidationError as exc:
-        message = exc.errors()[0]["msg"].removeprefix("Value error, ")
-        raise _error(422, "invalid_rule", f"The stored content needs fixing: {message}") from None
-
-
 def _not_archived(rule: Rule) -> None:
     if rule.archived_at is not None:
         raise _error(409, "invalid_state", "The rule is archived.")
@@ -176,8 +166,8 @@ def update_rule(
     post. An active rule stays active and answers with the new content from now on.
     `public_replies` needs at least 3 variants that differ in more than case, accents or spacing,
     or none at all: this service's own floor, not a Meta rule. A rule stored with fewer keeps
-    answering, but any edit is refused until `content` fixes that. `warnings` lists what automation
-    users report as risky; it blocks nothing."""
+    answering, but any edit, even of its name alone, gets that same refusal until `content` fixes
+    it. `warnings` lists what automation users report as risky; it blocks nothing."""
     rule = _rule(session, network, rule_id)
     _not_archived(rule)
     fields = body.model_fields_set
@@ -185,7 +175,7 @@ def update_rule(
         if required in fields and getattr(body, required) is None:
             raise _error(422, "invalid_value", f"{required} cannot be null.")
     media_ref = body.media_ref if "media_ref" in fields else rule.media_ref
-    content = body.content if "content" in fields else _stored_content(rule)
+    content = body.content if "content" in fields else RuleContent.model_validate(rule.content)
     _check(Channel(rule.channel), media_ref, content)
     if "name" in fields:
         rule.name = body.name

@@ -168,6 +168,11 @@ def test_first_match_follows_priority_media_and_activation():
             },
             "media_ref",
         ),
+        # The channel is checked first: more variants would not help.
+        (
+            {"channel": "message", "content": {"keywords": ["x"], "public_replies": ["a"]}},
+            "cannot have public_replies",
+        ),
         # 501 characters, 1,002 bytes: the message limit is in bytes.
         (
             {"channel": "comment", "content": {"keywords": ["x"], "private_replies": ["é" * 501]}},
@@ -233,22 +238,25 @@ def test_public_replies_need_three_distinct_variants_or_none(client, headers, va
 def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edited(
     app, client, headers, ig, sessions, task, clock
 ):
-    now = clock.now()
-    with sessions() as session, session.begin():
-        rule = Rule(
-            network=app.state.network,
-            name="old",
-            channel="comment",
-            priority=1,
-            active=True,
-            activated_at=now,
-            content={"keywords": ["precio"], "public_replies": ["One", "Two"]},
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(rule)
-        session.flush()
-        rule_id = rule.id
+    def stored_rule() -> str:
+        now = clock.now()
+        with sessions() as session, session.begin():
+            rule = Rule(
+                network=app.state.network,
+                name="old",
+                channel="comment",
+                priority=1,
+                active=True,
+                activated_at=now,
+                content={"keywords": ["precio"], "public_replies": ["One", "Two"]},
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(rule)
+            session.flush()
+            return rule.id
+
+    rule_id = stored_rule()
     media = publish(ig)
     clock.advance(minutes=1)
     comment = ig.add_comment(media, "precio")
@@ -265,8 +273,19 @@ def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edit
     assert "at least 3" in refused.json()["detail"]["message"]
     assert client.get(f"/v1/rules/{rule_id}", headers=headers).json()["priority"] == 1
 
+    tested = client.post(
+        "/v1/rules/test",
+        json={"channel": "comment", "text": "precio", "rule_id": rule_id},
+        headers=headers,
+    )
+    assert tested.status_code == 200
+    assert tested.json()["public_replies"] == ["One", "Two"]
+    for action in ("deactivate", "activate", "archive"):
+        answer = client.post(f"/v1/rules/{rule_id}/{action}", headers=headers)
+        assert answer.status_code == 200, action
+
     fixed = client.patch(
-        f"/v1/rules/{rule_id}",
+        f"/v1/rules/{stored_rule()}",
         json={
             "priority": 5,
             "content": {"keywords": ["precio"], "public_replies": PUBLIC_VARIANTS},

@@ -467,9 +467,10 @@ Too many automatic replies can get an Instagram account restricted, so they are 
   pause with `until` is refused. An empty value turns this off.
 - A rule that replies publicly needs at least 3 public variants that differ in more than case, accents
   or spacing; anything less is refused with a 422. This is this service's own floor, not a Meta rule:
-  Meta publishes no number, and automation tools and their users advise 3 to 5. Private replies have
-  no minimum. A rule stored earlier with fewer keeps answering, but any edit to it is refused until
-  its content is fixed.
+  an automation tool's interface asks for 3 and users of these tools suggest 3 to 5, with no number
+  from Meta. Private replies have no minimum. A rule stored earlier with fewer keeps answering, but
+  any edit to it, even of its name alone, is refused with that same message until its content is
+  fixed.
 - Rules get `warnings` in the API, the MCP and the web interface: public replies on every post, a link
   in a comment's first private message, or a variant with no letter or digit. These are reported by
   automation users, not published by Meta, so a rule with warnings can still be activated.

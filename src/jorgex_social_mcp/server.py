@@ -114,7 +114,7 @@ delivery means Instagram accepted the reply, not that it was delivered.
 A rule that replies publicly needs at least 3 public variants that differ in more than case, \
 accents or spacing. That is this service's own floor, not a Meta rule, and it is refused with \
 status 422, not warned about. A rule stored earlier with fewer keeps answering, but any edit to \
-it is refused until its content is fixed.
+it, even of its name alone, gets that same refusal until its content is fixed.
 
 A rule's warnings list what automation users report as risky (public replies on every post, a \
 link in the first private message, replies with no words). They are \
@@ -576,8 +576,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         new content from now on. Archived rules cannot be edited. public_replies needs at least
         3 variants that differ in more than case, accents or spacing, or none at all: this
         service's own floor, not a Meta rule. A rule stored with fewer keeps answering, but any
-        edit is refused until content fixes that. The answer's warnings list what automation users
-        report as risky; they block nothing."""
+        edit, even of its name alone, gets that same refusal until content fixes it. The answer's
+        warnings list what automation users report as risky; they block nothing."""
         given = {"name": name, "content": content, "media_ref": media_ref, "priority": priority}
         given = {k: v for k, v in given.items() if v is not None}
         both = sorted(set(clear or []) & set(given))
