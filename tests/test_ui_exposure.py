@@ -4,6 +4,7 @@ to whatever comes through the proxy. The real proxy headers are in test_proxy_he
 
 import logging
 import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -13,7 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from jorgex_social.access import operator
-from jorgex_social.access.limits import client_key
+from jorgex_social.access.limits import RateLimiter, client_key
 from jorgex_social.account import crypto
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
@@ -141,6 +142,48 @@ def test_ipv6_addresses_of_one_64_share_the_limit(app, clock):
     assert attempt(browser(app, "2001:db8:1:3::1"), clock).status_code == 401
 
 
+def test_the_limiter_forgets_the_least_recent_client_past_its_cap():
+    limiter = RateLimiter([(1, timedelta(minutes=1))], max_keys=3)
+    for key in ("a", "b", "c", "d"):
+        assert limiter.hit(key, START) is None
+
+    assert len(limiter) == 3
+    assert limiter.hit("c", START) is not None  # still remembered, still over its limit
+    assert limiter.hit("a", START) is None  # forgotten: "a" was the least recent
+
+
+def test_the_limiter_drops_idle_clients():
+    limiter = RateLimiter([(5, timedelta(minutes=1)), (20, timedelta(hours=1))])
+    for n in range(100):
+        limiter.hit(f"198.51.100.{n}", START)
+
+    limiter.hit("192.0.2.1", START + timedelta(hours=1, seconds=1))
+
+    assert len(limiter) == 1
+
+
+@pytest.mark.parametrize(
+    ("address", "headers", "warned"),
+    [
+        ("198.51.100.250", {}, True),  # the trusted proxy sent no X-Forwarded-For
+        ("198.51.100.9", {"x-forwarded-for": "203.0.113.7"}, True),  # a header not believed
+        ("203.0.113.7", {"x-forwarded-for": "203.0.113.7"}, False),  # believed: a visitor
+        ("198.51.100.9", {}, False),  # a visitor straight to the port
+    ],
+)
+def test_a_limit_on_the_proxys_own_address_is_flagged(
+    settings, clock, caplog, address, headers, warned
+):
+    exposed = replace(settings, public_url=PUBLIC, forwarded_allow_ips="198.51.100.250")
+    client = TestClient(create_app(exposed, clock), base_url=LOCAL, client=(address, 50000))
+    headers = {"origin": PUBLIC, **headers}
+
+    for _ in range(6):
+        client.post("/ui/login", data={"password": "x", "code": "123456"}, headers=headers)
+
+    assert ("every visitor shares one count" in caplog.text) is warned
+
+
 def test_limits_are_configurable(settings, clock):
     app = create_app(replace(settings, login_limit_per_minute=2), clock)
     client = browser(app)
@@ -171,6 +214,24 @@ def test_a_sign_in_waits_briefly_for_a_password_check_then_gives_up(app, clock, 
     assert response.status_code == 503
     assert BUSY in response.text
     assert COOKIE not in response.headers.get("set-cookie", "")
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_past_eight_sign_ins_in_flight_the_next_is_refused_at_once(app, clock, monkeypatch):
+    """Waiting sign-ins hold server threads; past the bound they are not allowed to wait."""
+    monkeypatch.setattr(operator, "PASSWORD_CHECK_WAIT", 5.0)
+    assert all(operator._password_attempts.acquire(timeout=1) for _ in range(8))
+    try:
+        started = time.monotonic()
+        response = attempt(browser(app), clock, password=PASSWORD)
+        elapsed = time.monotonic() - started
+    finally:
+        for _ in range(8):
+            operator._password_attempts.release()
+
+    assert response.status_code == 503
+    assert BUSY in response.text
+    assert elapsed < 1.0
 
 
 def test_a_free_slot_is_waited_for(monkeypatch):

@@ -36,6 +36,10 @@ TOTP_CODE = re.compile(r"[0-9]{6}")  # ASCII only: \d would also take other scri
 # every worker thread either.
 _password_checks = threading.BoundedSemaphore(2)
 PASSWORD_CHECK_WAIT = 2.0  # seconds
+# Each sign-in in flight holds one of the server's worker threads (40 in all) while it checks or
+# waits. Past this many, a sign-in is refused at once instead of waiting, so a burst cannot take
+# the threads every other synchronous endpoint (/health, the pages, the API) needs.
+_password_attempts = threading.BoundedSemaphore(8)
 
 # argon2id with the library's defaults (RFC 9106's low-memory profile).
 _hasher = PasswordHasher()
@@ -138,14 +142,19 @@ def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datet
 
 
 def _password_matches(password_hash: str, password: str) -> bool:
-    if not _password_checks.acquire(timeout=PASSWORD_CHECK_WAIT):
+    if not _password_attempts.acquire(blocking=False):
         raise Busy
     try:
-        return _hasher.verify(password_hash, password)
-    except VerificationError, InvalidHashError:
-        return False
+        if not _password_checks.acquire(timeout=PASSWORD_CHECK_WAIT):
+            raise Busy
+        try:
+            return _hasher.verify(password_hash, password)
+        except VerificationError, InvalidHashError:
+            return False
+        finally:
+            _password_checks.release()
     finally:
-        _password_checks.release()
+        _password_attempts.release()
 
 
 def log_in(

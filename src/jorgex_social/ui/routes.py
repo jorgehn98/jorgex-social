@@ -15,7 +15,7 @@ from starlette.concurrency import run_in_threadpool
 
 from jorgex_social.access import operator
 from jorgex_social.access.deps import ReadSessionDep
-from jorgex_social.access.limits import client_key
+from jorgex_social.access.limits import client_key, is_listed
 from jorgex_social.access.proxy import via_proxy
 from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
@@ -191,6 +191,17 @@ async def _form(request: Request) -> dict[str, str]:
     return {name: values[0] for name, values in fields.items()}
 
 
+def _counts_the_proxy(request: Request) -> bool:
+    """Whether the address counted is the proxy's rather than a visitor's: either it is a
+    trusted proxy that sent no X-Forwarded-For, or a header was sent and not believed (uvicorn
+    then leaves the client as the peer, which appears nowhere in the header)."""
+    host = request.client.host if request.client else None
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded is None:
+        return is_listed(host, request.app.state.settings.forwarded_allow_ips)
+    return host not in {entry.strip() for entry in forwarded.split(",")}
+
+
 @public.post("/login")
 async def login(request: Request):
     state = request.app.state
@@ -199,6 +210,13 @@ async def login(request: Request):
     if wait is not None:
         # Turned away before the body, argon2 or the database: only this line records it.
         log.warning("sign-in refused: too many attempts", extra={"client": client})
+        if _counts_the_proxy(request):
+            log.warning(
+                "the sign-in limit is counting the reverse proxy's address, so every visitor "
+                "shares one count: check JORGEX_SOCIAL_FORWARDED_ALLOW_IPS and that the proxy "
+                "sets X-Forwarded-For (ignore this if it was the SSH tunnel)",
+                extra={"client": client},
+            )
         response = render(request, "login.html", 429, error=TOO_MANY, next=HOME)
         response.headers["Retry-After"] = str(int(wait.total_seconds()) + 1)
         return response
