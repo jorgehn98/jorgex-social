@@ -35,6 +35,6 @@ WORKDIR /data
 VOLUME /data
 EXPOSE 8000
 # The slim image has no curl; a failed request or a non-2xx answer exits non-zero.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --start-interval=2s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
 CMD ["jorgex-social", "serve", "--host", "0.0.0.0"]

@@ -39,9 +39,13 @@ services:
   worker:
     <<: *service
     command: ["jorgex-social", "worker"]
+    # restart: when Compose recreates or restarts `api` (an upgrade), it stops this worker first
+    # and starts it again once the new `api` has migrated and is healthy. Only one worker may run:
+    # it holds a file lock next to the database, and a second one exits and restarts in a loop.
     depends_on:
       api:
         condition: service_healthy
+        restart: true
     healthcheck:
       disable: true
     # On SIGTERM the worker finishes the attempt in progress before exiting. A single post (one

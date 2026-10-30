@@ -23,6 +23,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Builds the image without pushing it, and checks compose.yaml, so neither can rot.
-      - run: docker build --pull --tag jorgex-social:ci .
-      - run: cp .env.example .env && docker compose config --quiet
+      # Builds the image without pushing it and starts the stack in simulation, so neither the
+      # Dockerfile nor compose.yaml can rot.
+      - run: cp .env.example .env
+      - run: docker compose build --pull
+      - run: docker compose up -d --wait --wait-timeout 180
+      - run: curl -fsS http://127.0.0.1:8000/health
+      - if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down -v

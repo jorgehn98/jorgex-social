@@ -35,6 +35,10 @@ key on the first run. The `worker` starts only once `api` is healthy, so it neve
 database that is still being migrated. The API listens on `127.0.0.1:8000` only; put a reverse proxy
 in front of it (see below).
 
+Run exactly one worker: two would both publish what is due. The worker holds a lock file next to the
+database, so a second one (`--scale worker=2`) exits with an error and restarts in a loop. The lock is
+reliable on a local Docker volume, not necessarily on a network filesystem; keep `/data` local.
+
 A fresh install runs in simulation mode: a fake Instagram with synthetic data, and no call ever
 reaches Meta. Create an API token, granting only the groups the client needs:
 
@@ -72,7 +76,15 @@ social.example.com {
    docker compose run --rm -e JORGEX_SOCIAL_SIMULATION=false api jorgex-social connect-instagram
    ```
 
-   To pipe it from a file instead, add `-T` after `run` and end the command with `< token.txt`.
+   Without an interactive terminal, paste the token into a shell variable and pipe it, so it is
+   never written to a file:
+
+   ```sh
+   read -rs IG_TOKEN
+   printf '%s\n' "$IG_TOKEN" | docker compose run --rm -T -e JORGEX_SOCIAL_SIMULATION=false \
+     api jorgex-social connect-instagram
+   unset IG_TOKEN
+   ```
 2. In `.env`, set `JORGEX_SOCIAL_PUBLIC_URL=https://social.example.com` (your domain) and
    `JORGEX_SOCIAL_SIMULATION=false`.
 3. Apply the change with `docker compose up -d`. `GET /v1/account` reports the connection, open
@@ -84,19 +96,25 @@ In real mode the worker refuses to start without a connected account, so connect
 
 Back up the database and the secret key, and keep them apart: the key decrypts the Instagram
 credential stored in the database, so one without the other is useless to a thief, and the database
-is useless to you without its key. Copy the database with SQLite's online backup, which is consistent
-while both services keep running:
+is useless to you without its key. Keep both outside the clone, so neither can end up in a commit or in an image.
+
+Copy the database with SQLite's online backup, which is consistent while both services keep running:
 
 ```sh
+install -d -m 700 ~/jorgex-social-backups
 docker compose exec api python -c "import sqlite3; sqlite3.connect('/data/jorgex-social.db').backup(sqlite3.connect('/data/backup.db'))"
-docker compose cp api:/data/backup.db ./jorgex-social-$(date +%F).db
+docker compose cp api:/data/backup.db ~/jorgex-social-backups/jorgex-social-$(date +%F).db
+chmod 600 ~/jorgex-social-backups/*.db
 docker compose exec api rm /data/backup.db
 ```
 
-Copy the key once, and again only if you replace it, to somewhere other than the database backups:
+Copy the key once, and again only if you replace it. Take it off the server to a separate secure
+place (a password manager or an encrypted drive), never next to the database backups:
 
 ```sh
-docker compose cp api:/data/secret.key ./secret.key
+install -d -m 700 ~/jorgex-social-key
+docker compose cp api:/data/secret.key ~/jorgex-social-key/secret.key
+# move it to its secure place, then delete the local copy
 ```
 
 Media are not backed up: they are deleted seven days after they are published.
@@ -110,10 +128,14 @@ git pull
 docker compose up -d --build
 ```
 
+Compose stops the old worker before it replaces `api`, so the new version migrates with no worker
+running, and starts the new worker once `api` is healthy again. On stop, the worker finishes the
+publication in progress before exiting, so an upgrade or `docker compose down` can take up to
+15 minutes while one is running.
+
 To roll back, check out the previous version and run the same command; if its migrations are
-incompatible with the newer database, restore the backup as well. On stop, the worker finishes the
-publication in progress before exiting, so `docker compose down` can take up to 15 minutes while one
-is running. You are responsible for keeping your installation updated.
+incompatible with the newer database, restore the backup as well. You are responsible for keeping
+your installation updated.
 
 ## Development
 
