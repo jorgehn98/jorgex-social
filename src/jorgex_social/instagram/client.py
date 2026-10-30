@@ -101,6 +101,11 @@ def urllib_transport(
         return exc.code, exc.read()
 
 
+def _int_or_none(value: Any) -> int | None:
+    # `type`, not isinstance: a JSON true is not a code.
+    return value if type(value) is int else None
+
+
 def _error(status: int, raw: bytes) -> Exception:
     try:
         error = json.loads(raw).get("error")
@@ -108,7 +113,8 @@ def _error(status: int, raw: bytes) -> Exception:
         error = None
     if not isinstance(error, dict):
         error = {}
-    code, subcode = error.get("code"), error.get("error_subcode")
+    # These reach the audit log and incident details, which hold identifiers only.
+    code, subcode = _int_or_none(error.get("code")), _int_or_none(error.get("error_subcode"))
     message = f"Instagram API {status}: {str(error.get('message') or raw[:200])[:300]}"
     if status >= 500:
         return Unavailable(message, code=code, subcode=subcode)

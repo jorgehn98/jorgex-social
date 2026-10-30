@@ -394,7 +394,8 @@ class PublishTask:
         now = self.clock.now()
         with sessions() as session, session.begin():
             if isinstance(error, AccountRestricted):
-                # The post ends like any refused one; the switch keeps the next ones from starting.
+                # The attempt ends as it would without this (rejected, or unknown if it may be
+                # live); the switch keeps the next posts from starting.
                 kill_switch.trip(session, self.instagram.network, error, now)
             attempt = session.get_one(PublishAttempt, attempt_id)
             if attempt.result != AttemptResult.IN_PROGRESS:
