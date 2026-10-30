@@ -223,8 +223,9 @@ With the proxy above, open `https://social.example.com/ui/`. `JORGEX_SOCIAL_PUBL
 same origin: every form the interface posts (signing in and out) must come from it, which is what
 stops another site from posting on your behalf. Through the SSH tunnel, `http://localhost:8000/ui/`
 works too. The session cookie is `Secure` for every host except a loopback one (`localhost`,
-`127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it. Sessions last 12 hours at
-most and end after an hour without activity.
+`127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it. Sessions last 7 days at
+most and end after 24 hours without activity. The OAuth consent page alone asks for your password
+and code again when you signed in over an hour ago; the rest of the interface stays signed in.
 
 Each client address (IPv6: each `/64`) gets 5 sign-in attempts a minute and 20 an hour
 (`JORGEX_SOCIAL_LOGIN_LIMIT_PER_MINUTE`, `JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR`); beyond that the
@@ -265,10 +266,10 @@ or, in a `.mcp.json`:
 }
 ```
 
-The first time, the client opens your browser on this service: sign in, and a consent page shows
-the name the client gives itself (unverified: anyone can claim any name), where the answer goes back
-to (the client's own machine, `localhost` or `127.0.0.1` with a port) and the six groups, each with
-write, read or deny. Approve only a connection you started yourself, and only the groups the agent
+The first time, the client opens your browser on this service: sign in (even if you are already
+signed in, when that was over an hour ago), and a consent page shows the name the client gives
+itself (unverified: anyone can claim any name), where the answer goes back to (the client's own
+machine, `localhost` or `127.0.0.1` with a port) and the six groups, each with write, read or deny. Approve only a connection you started yourself, and only the groups the agent
 needs. The client then keeps and renews its tokens on its own (access tokens last an hour; the
 renewal token thirty days and changes on every use).
 

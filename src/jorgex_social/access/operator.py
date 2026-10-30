@@ -24,8 +24,10 @@ from jorgex_social.oauth import store as oauth
 
 log = logging.getLogger(__name__)
 
-SESSION_LIFETIME = timedelta(hours=12)
-IDLE_TIMEOUT = timedelta(hours=1)
+SESSION_LIFETIME = timedelta(days=7)
+IDLE_TIMEOUT = timedelta(hours=24)
+# OAuth consent can grant a client full control, so a long session alone is not enough for it.
+CONSENT_MAX_SIGN_IN_AGE = timedelta(hours=1)
 # last_activity_at is only as precise as this, so browsing does not write on every page.
 ACTIVITY_RESOLUTION = timedelta(minutes=1)
 LOGIN = "operator.login"

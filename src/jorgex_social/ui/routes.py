@@ -66,6 +66,10 @@ class LoginRequired(Exception):
     pass
 
 
+class SignInTooOld(LoginRequired):
+    """The session is valid but too old for this page: its cookie still serves the others."""
+
+
 def _is_loopback(host: str | None) -> bool:
     if host == "localhost":
         return True
@@ -153,13 +157,14 @@ def render(request: Request, name: str, status_code: int = 200, **context) -> Re
     )
 
 
-def _login_redirect(request: Request, _: LoginRequired) -> Response:
+def _login_redirect(request: Request, reason: LoginRequired) -> Response:
     location = "/ui/login"
     back = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     if request.method == "GET" and safe_next(back) == back != HOME:
         location += "?" + urlencode({"next": back})
     response = RedirectResponse(location, status_code=303, headers=HEADERS)
-    if COOKIE in request.cookies:  # expired or unknown: no use keeping it
+    # Expired or unknown: no use keeping it.
+    if COOKIE in request.cookies and not isinstance(reason, SignInTooOld):
         response.delete_cookie(COOKIE, path="/ui")
     return response
 
@@ -207,6 +212,17 @@ def _counts_the_proxy(request: Request) -> bool:
     return host not in {entry.strip() for entry in forwarded.split(",")}
 
 
+def _end_presented_session(request: Request) -> None:
+    session_id = request.cookies.get(COOKIE)
+    if session_id:
+        # Looked up first in a read transaction, so a made-up cookie never takes the write lock.
+        with request.app.state.read_sessionmaker() as session, session.begin():
+            stored = operator.is_stored(session, session_id)
+        if stored:
+            with request.app.state.sessionmaker() as session, session.begin():
+                operator.log_out(session, session_id)
+
+
 @public.post("/login")
 async def login(request: Request):
     state = request.app.state
@@ -244,6 +260,12 @@ async def login(request: Request):
         return render(request, "login.html", 503, error=BUSY, next=next_page)
     if session_id is None:
         return render(request, "login.html", 401, error=INVALID, next=next_page)
+    try:
+        # The cookie it replaces would otherwise stay valid for days, unseen.
+        await run_in_threadpool(_end_presented_session, request)
+    except OperationalError:
+        # A lock timeout must not cost the sign-in, whose code is already spent: it lapses alone.
+        log.warning("could not end the session this sign-in replaces", exc_info=True)
     response = RedirectResponse(next_page, status_code=303, headers=HEADERS)
     response.set_cookie(
         COOKIE,
@@ -259,14 +281,7 @@ async def login(request: Request):
 
 @public.post("/logout")
 def logout(request: Request):
-    session_id = request.cookies.get(COOKIE)
-    if session_id:
-        # Looked up first in a read transaction, so a made-up cookie never takes the write lock.
-        with request.app.state.read_sessionmaker() as session, session.begin():
-            stored = operator.is_stored(session, session_id)
-        if stored:
-            with request.app.state.sessionmaker() as session, session.begin():
-                operator.log_out(session, session_id)
+    _end_presented_session(request)
     response = RedirectResponse("/ui/login", status_code=303, headers=HEADERS)
     response.delete_cookie(COOKIE, path="/ui")
     return response

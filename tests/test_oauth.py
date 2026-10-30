@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import html
 import json
 import logging
 import re
@@ -7,7 +8,7 @@ import secrets
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
 import pyotp
@@ -26,6 +27,7 @@ from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
 from jorgex_social.oauth import store
 from jorgex_social.oauth.models import OAuthGrant, OAuthToken
+from jorgex_social.ui.routes import COOKIE
 
 PUBLIC = "http://localhost"
 RESOURCE = f"{PUBLIC}/mcp"
@@ -425,6 +427,73 @@ def test_consent_needs_the_operator_signed_in(agent):
 
     assert response.status_code == 303
     assert response.headers["location"].startswith("/ui/login?next=")
+
+
+def test_consent_works_with_a_sign_in_under_an_hour_old(agent, browser, clock):
+    clock.advance(minutes=58, seconds=30)  # sign_in already advanced 30 s
+    client_id = register(agent).json()["client_id"]
+    location = start(agent, client_id, pkce()[1]).headers["location"]
+
+    page, fields = open_consent(browser, location)
+
+    assert page.status_code == 200
+    assert answer(browser, fields).headers["location"].startswith(REDIRECT)
+
+
+def test_consent_with_an_old_sign_in_asks_for_credentials_and_then_finishes(agent, browser, clock):
+    clock.advance(minutes=61)
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    location = start(agent, client_id, challenge).headers["location"].removeprefix(PUBLIC)
+    old_cookie = browser.cookies[COOKIE]
+
+    response = browser.get(location, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/login?" + urlencode({"next": location})
+    assert "set-cookie" not in response.headers
+    assert browser.cookies[COOKIE] == old_cookie
+    assert browser.get("/ui/", follow_redirects=False).status_code == 200
+
+    # The sign-in form opens with the old session still valid, and carries the page to return to.
+    form = browser.get(response.headers["location"], follow_redirects=False)
+    assert form.status_code == 200
+    next_page = html.unescape(re.search(r'name="next" value="([^"]+)"', form.text)[1])
+    signed_in = browser.post(
+        "/ui/login",
+        data={
+            "password": PASSWORD,
+            "code": pyotp.TOTP(TOTP_SECRET).at(clock.now()),
+            "next": next_page,
+        },
+        follow_redirects=False,
+    )
+    assert signed_in.headers["location"] == location
+    assert browser.cookies[COOKIE] != old_cookie
+
+    # The redirect bound nothing to the old session, so the new one can open and answer it.
+    page, fields = open_consent(browser, signed_in.headers["location"])
+    assert page.status_code == 200
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    assert exchange(agent, client_id, code, verifier).status_code == 200
+
+
+@pytest.mark.parametrize("decision", ["allow", "deny"])
+def test_an_old_sign_in_decides_nothing(app, agent, browser, clock, decision):
+    clock.advance(minutes=55)
+    client_id = register(agent).json()["client_id"]
+    _, fields = open_consent(browser, start(agent, client_id, pkce()[1]).headers["location"])
+    clock.advance(minutes=6)  # the request is still open; the sign-in is no longer recent
+
+    response = answer(browser, fields, decision)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/login"
+    assert "set-cookie" not in response.headers
+    assert browser.get("/ui/", follow_redirects=False).status_code == 200
+    assert audit_actions(app) == []
+    assert rows(app, "SELECT count(*) FROM oauth_codes") == [(0,)]
+    assert rows(app, "SELECT count(*) FROM oauth_grants") == [(0,)]
 
 
 def test_the_consent_page_shows_the_client_as_unverified_and_allows_only_its_origin(agent, browser):
