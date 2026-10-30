@@ -8,7 +8,7 @@
   {% for r in found %}
     <tr>
       <td class="num">{{ r.priority }}</td>
-      <td>{{ r.name }}</td>
+      <td>{{ r.name }}{% for w in r.warnings %}<p class="muted">{{ w.message }}</p>{% endfor %}</td>
       <td>{% if r.archived_at %}{{ pill("archived", "draft") }}{% elif r.active %}{{ pill("active") }}{% else %}{{ pill("inactive", "draft") }}{% endif %}</td>
       <td class="mono">{{ r.channel }}</td>
       <td class="mono">{{ r.media_ref or "every post" }}</td>

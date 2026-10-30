@@ -21,7 +21,7 @@ from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.logs import JsonFormatter
 from jorgex_social.replies.models import Conversation, Delivery, Event, Rule
-from jorgex_social.replies.rules import first_match, matches
+from jorgex_social.replies.rules import first_match, matches, rule_warnings
 from jorgex_social.replies.task import ReplyTask
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
@@ -1250,3 +1250,177 @@ def test_the_public_cap_lets_the_private_reply_through(client, headers, ig, sess
     assert ("reply_private", second) in {(op, target) for op, target, _ in ig.sent}
     skipped = [(d.action, d.reason) for d in deliveries(sessions) if d.status == "skipped"]
     assert skipped == [("public_reply", "hourly_cap")]
+
+
+# Opt-out
+
+INFO_RULE = {"keywords": ["info", "stop"], "private_replies": ["Hi"]}
+
+
+def conversations(client, headers):
+    return client.get("/v1/conversations", headers=headers).json()
+
+
+@pytest.mark.parametrize("text", ["stop", "STOP", "  Stop ", "unsubscribe", "baja", "BÁJA"])
+def test_an_opt_out_word_pauses_for_good_and_sends_nothing(
+    client, headers, ig, sessions, task, text
+):
+    # The rule's keyword is the opt-out word too: the opt-out wins and nothing goes out.
+    make_rule(client, headers, channel="message", content={**INFO_RULE, "keywords": [text]})
+
+    ig.add_message(PERSON, text)
+    task(sessions)
+
+    [conversation] = conversations(client, headers)
+    assert (conversation["paused_forever"], conversation["paused_until"]) == (True, None)
+    assert ig.sent == []
+    assert deliveries(sessions) == []
+    with sessions() as session:
+        [event] = session.scalars(select(Event)).all()
+    assert event.rule_id is None
+
+
+def test_a_sentence_with_the_word_is_no_opt_out_and_rules_still_fire(
+    client, headers, ig, sessions, task
+):
+    make_rule(client, headers, channel="message", content=INFO_RULE)
+
+    ig.add_message(PERSON, "please stop by the store")
+    task(sessions)
+
+    [conversation] = conversations(client, headers)
+    assert conversation["paused_forever"] is False
+    assert [text for _, _, text in ig.sent] == ["Hi"]
+
+
+def test_an_opt_out_skips_what_is_pending_for_that_person(
+    client, headers, ig, sessions, task, clock
+):
+    make_rule(client, headers)
+    make_rule(client, headers, channel="message", content=INFO_RULE)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.add_message(PERSON, "info")
+    task.poll_comments(sessions, ACCOUNT_ID, clock.now())
+    task.poll_messages(sessions, ACCOUNT_ID, clock.now())
+
+    clock.advance(seconds=1)
+    ig.add_message(PERSON, "stop")
+    task.poll_messages(sessions, ACCOUNT_ID, clock.now())
+    task.deliver(sessions)
+
+    assert ig.sent == []
+    assert by_action(sessions) == {
+        "message": ("skipped", "paused"),
+        "private_reply": ("skipped", "paused"),
+        "public_reply": ("skipped", "paused"),
+    }
+
+
+def test_an_empty_list_turns_opt_out_off(client, headers, ig, sessions, clock):
+    ConnectionTask(ig, clock, None)(sessions)
+    make_rule(client, headers, channel="message", content=INFO_RULE)
+    task = ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=())
+
+    ig.add_message(PERSON, "stop")
+    task(sessions)
+
+    [conversation] = conversations(client, headers)
+    assert conversation["paused_forever"] is False
+    assert [text for _, _, text in ig.sent] == ["Hi"]
+
+
+def test_resume_lifts_an_opt_out_and_seeing_the_message_again_does_not_undo_it(
+    client, headers, ig, sessions, task, clock
+):
+    make_rule(client, headers, channel="message", content=INFO_RULE)
+    ig.add_message(PERSON, "stop")
+    task(sessions)
+    [conversation] = conversations(client, headers)
+
+    resumed = client.post(f"/v1/conversations/{conversation['id']}/resume", headers=headers)
+    # A new task reads every recent conversation again, as after a restart.
+    clock.advance(seconds=1)
+    ig.add_message(PERSON, "info")
+    ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
+
+    assert resumed.json()["paused_forever"] is False
+    assert conversations(client, headers)[0]["paused_forever"] is False
+    assert [text for _, _, text in ig.sent] == ["Hi"]
+
+
+def test_an_opt_out_is_audited_without_its_text(client, headers, ig, sessions, clock):
+    ConnectionTask(ig, clock, None)(sessions)
+    marker = "QZX-opt-out-5521"
+    ig.add_message(PERSON, marker)
+
+    ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=[marker])(sessions)
+
+    [conversation] = conversations(client, headers)
+    with sessions() as session:
+        [entry] = session.scalars(
+            select(AuditEntry).where(AuditEntry.action == "conversation.opted_out")
+        ).all()
+    assert (entry.object_type, entry.object_id) == ("conversation", conversation["id"])
+    assert entry.detail is None
+
+
+# Rule warnings
+
+CLEAN_PUBLIC = ["One", "Two", "Three"]
+
+
+@pytest.mark.parametrize(
+    ("channel", "media_ref", "content", "codes"),
+    [
+        ("comment", "m1", {"public_replies": CLEAN_PUBLIC, "private_replies": ["DM"]}, []),
+        ("comment", None, {"private_replies": ["DM"]}, []),
+        ("message", None, {"private_replies": ["See https://x.test"]}, []),
+        ("comment", "m1", {"public_replies": ["One", "Two"]}, ["few_public_variants"]),
+        ("comment", None, {"public_replies": CLEAN_PUBLIC}, ["public_on_every_post"]),
+        (
+            "comment",
+            None,
+            {"public_replies": ["One"]},
+            ["few_public_variants", "public_on_every_post"],
+        ),
+        ("comment", "m1", {"private_replies": ["See http://x.test"]}, ["link_in_first_message"]),
+        ("comment", "m1", {"private_replies": ["See HTTPS://x.test"]}, ["link_in_first_message"]),
+        ("comment", "m1", {"private_replies": ["See Www.x.test"]}, ["link_in_first_message"]),
+        ("comment", "m1", {"private_replies": ["See x.test"]}, []),
+        ("comment", "m1", {"private_replies": ["\U0001f525\U0001f525"]}, ["no_words"]),
+        ("message", None, {"private_replies": ["ok", "!!!"]}, ["no_words"]),
+        ("comment", "m1", {"public_replies": [*CLEAN_PUBLIC, "..."]}, ["no_words"]),
+        ("comment", "m1", {"private_replies": ["Thanks \U0001f525"]}, []),
+        ("comment", "m1", {"private_replies": ["1 \U0001f525"]}, []),
+    ],
+)
+def test_rule_warnings(channel, media_ref, content, codes):
+    assert [w["code"] for w in rule_warnings(channel, media_ref, content)] == codes
+
+
+def test_warnings_come_with_every_answer_and_block_nothing(client, headers):
+    created = make_rule(client, headers, activate=False)
+    rule_id = created["id"]
+    codes = ["few_public_variants", "public_on_every_post"]
+
+    def answers():
+        yield created
+        yield client.get(f"/v1/rules/{rule_id}", headers=headers).json()
+        yield client.get("/v1/rules", headers=headers).json()[0]
+        yield client.patch(f"/v1/rules/{rule_id}", json={"priority": 5}, headers=headers).json()
+        activated = client.post(f"/v1/rules/{rule_id}/activate", headers=headers).json()
+        assert activated["active"] is True
+        yield activated
+        yield client.post(f"/v1/rules/{rule_id}/deactivate", headers=headers).json()
+
+    for answer in answers():
+        assert [w["code"] for w in answer["warnings"]] == codes
+    assert "not a published Meta rule" in created["warnings"][0]["message"]
+
+    fixed = client.patch(
+        f"/v1/rules/{rule_id}",
+        json={"media_ref": "m1", "content": {**PRICE_RULE, "public_replies": CLEAN_PUBLIC}},
+        headers=headers,
+    ).json()
+    assert fixed["warnings"] == []

@@ -841,3 +841,48 @@ def test_third_party_text_from_notifications_never_reaches_the_database_or_the_l
     for marker in MARKERS:
         assert marker not in stored
         assert marker not in logs
+
+
+# Opt-out
+
+
+def test_an_opt_out_word_by_webhook_pauses_and_sends_nothing(
+    client, headers, ig, sessions, task, clock
+):
+    make_rule(client, headers, channel="message", content=MESSAGE_RULE)
+    first = ig.add_message(PERSON, "precio")
+    notify(client, message_payload(first, "precio"))
+
+    clock.advance(seconds=1)
+    notify(client, message_payload("mid-stop", "STOP", at=clock.now()))
+    task.deliver(sessions)
+
+    paused = conversation(sessions)
+    assert paused.paused_forever is True
+    assert ig.sent == []
+    assert [(d.status, d.reason) for d in deliveries(sessions)] == [("skipped", "paused")]
+    assert events(sessions)[-1].rule_id is None
+
+
+def test_the_webhook_uses_the_configured_opt_out_words_and_stores_none(settings, clock, ig):
+    marker = "QZX-opt-out-3307"
+    app = create_app(replace(settings, opt_out_words=(marker,)), clock)
+    sessions = app.state.sessionmaker
+    ConnectionTask(ig, clock, None)(sessions)
+
+    notify(TestClient(app), message_payload("mid-1", marker))
+    notify(TestClient(app), message_payload("mid-2", "stop", sender=OTHERS[0]))
+
+    assert conversation(sessions).paused_forever is True
+    assert conversation(sessions, OTHERS[0]).paused_forever is False
+    assert marker not in dump(settings)
+
+
+def test_an_empty_list_turns_opt_out_off_by_webhook(settings, clock, ig):
+    app = create_app(replace(settings, opt_out_words=()), clock)
+    sessions = app.state.sessionmaker
+    ConnectionTask(ig, clock, None)(sessions)
+
+    notify(TestClient(app), message_payload("mid-1", "stop"))
+
+    assert conversation(sessions).paused_forever is False

@@ -29,6 +29,10 @@ MAX_MESSAGE_BYTES = 1000
 MAX_PUBLIC_CHARS = 2200
 MAX_VARIANTS = 20
 MAX_KEYWORDS = 50
+MIN_PUBLIC_VARIANTS = 3
+LINK_MARKS = ("http://", "https://", "www.")
+# The evidence behind every warning is community reports, so none of them blocks a rule.
+_REPORTED = "Reported practice, not a published Meta rule: "
 
 
 def _not_blank(value: str) -> str:
@@ -86,6 +90,30 @@ def check(channel: Channel, media_ref: str | None, content: RuleContent) -> None
             raise ValueError("media_ref only applies to comment rules")
         if content.public_replies:
             raise ValueError("message rules cannot have public_replies")
+
+
+def rule_warnings(channel: str, media_ref: str | None, content: dict) -> list[dict[str, str]]:
+    """What automation users report as risky in a rule. A rule with warnings is still valid."""
+    public = content.get("public_replies") or []
+    private = content.get("private_replies") or []
+    found = []
+
+    def warn(code: str, message: str) -> None:
+        found.append({"code": code, "message": _REPORTED + message})
+
+    if public and len(public) < MIN_PUBLIC_VARIANTS:
+        warn(
+            "few_public_variants",
+            f"fewer than {MIN_PUBLIC_VARIANTS} public reply variants repeat the same text often.",
+        )
+    if channel == Channel.COMMENT:
+        if public and media_ref is None:
+            warn("public_on_every_post", "public replies on every post can look like spam.")
+        if any(mark in text.casefold() for text in private for mark in LINK_MARKS):
+            warn("link_in_first_message", "a link in the first private message can look like spam.")
+    if any(not any(c.isalnum() for c in text) for text in [*public, *private]):
+        warn("no_words", "a reply of only emoji or punctuation can look like spam.")
+    return found
 
 
 def normalize(text: str) -> str:

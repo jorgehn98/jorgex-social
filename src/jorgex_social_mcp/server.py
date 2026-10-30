@@ -84,7 +84,10 @@ may be null), failed (see failure; schedule it again once its cause is fixed) or
 outcome_unknown.
 Editing a scheduled post returns it to draft. Only draft and scheduled posts can be edited or \
 cancelled; to change a failed post, create a new one. A post not published within the grace \
-window after its time (kill switch on, service down) fails as missed_schedule.
+window after its time (kill switch on, service down) fails as missed_schedule. With 50 posts \
+published in the last 24 hours, the next due post fails as daily_limit without reaching Instagram; \
+schedule it again for later. Do not write a caption that requires following, liking or \
+commenting to receive promised content: Meta's spam policy lists engagement gating.
 
 outcome_unknown: the service cannot tell whether Instagram published the post and keeps \
 checking; after an hour it opens a publish_unresolved incident. Never schedule it again to \
@@ -104,7 +107,21 @@ what arrives afterwards. The first matching active rule wins, lowest priority nu
 while a human answers, and reaches their comments only when Instagram uses the same id for a \
 comment's author and a message's sender, which is not verified. Each rule answers a person once \
 per post. Replies go out at a limited pace per minute, so a pending one may simply be waiting; \
-public replies expire 24 hours after the comment and have their own, lower hourly cap.
+public replies expire 24 hours after the comment and have their own, lower hourly cap. A sent \
+delivery means Instagram accepted the reply, not that it was delivered.
+
+A rule's warnings list what automation users report as risky (few public variants, public \
+replies on every post, a link in the first private message, replies with no words). They are \
+reported practice, not Meta's published rules, and block nothing: tell the operator and fix them \
+if you can. Do not write rule copy that requires following, liking or commenting to receive \
+promised content either.
+
+Opt-out: a direct message that is exactly one of the operator's opt-out words pauses that person \
+for good and fires no rule, and nothing is sent back. `list_conversations` shows it as \
+paused_forever, and `audit_log` as conversation.opted_out. It reaches their comments under the \
+same condition as a pause. Never `resume_conversation` or `pause_conversation` a paused_forever \
+conversation unless a human asks: either one lifts the opt-out, a pause with until once that time \
+passes. `test_rules` does not apply opt-out words.
 
 Kill switch (`set_kill_switch`): on, nothing is written to Instagram. Scheduled posts wait, \
 and replies due meanwhile are skipped for good. Off, publishing resumes; posts past their grace \
@@ -113,7 +130,9 @@ fails with failure kill_switch; both must be scheduled again. It also turns on b
 Instagram reports the account as restricted, with an account_restricted incident holding Meta's \
 code and subcode. Never turn it off on your own after that: ask a human to check the account \
 first. Turning it off closes that incident, and if Instagram refuses again both come back. Open \
-incidents (`list_incidents`) need a human; acknowledging one does not close it.
+incidents (`list_incidents`) need a human; acknowledging one does not close it. After a \
+restriction the API can keep answering while the account is limited, so calls that succeed prove \
+nothing: a human must check Account Status in the Instagram app.
 
 Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
 a page comes back shorter than limit; tools without offset say how to page in their \
@@ -490,7 +509,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ] = None,
     ) -> str:
         """Which rule a sample text would fire and which variants it could send. Stores nothing
-        and sends nothing."""
+        and sends nothing. Opt-out words are not applied: a direct message that is exactly one of
+        them fires no rule, whatever this says."""
         body = {"channel": channel, "text": text, "media_ref": media_ref, "rule_id": rule_id}
         return call(
             "POST", "/v1/rules/test", json_body={k: v for k, v in body.items() if v is not None}
@@ -508,7 +528,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             int | None, Field(description="Lower is tried first; default 100.")
         ] = None,
     ) -> str:
-        """Create an inactive rule. It answers nothing until activate_rule."""
+        """Create an inactive rule. It answers nothing until activate_rule. The answer's warnings
+        list what automation users report as risky; they block nothing."""
         body = {
             "name": name,
             "channel": channel,
@@ -532,7 +553,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ] = None,
     ) -> str:
         """Edit a rule; only the fields given change. An active rule keeps answering, with the
-        new content from now on. Archived rules cannot be edited."""
+        new content from now on. Archived rules cannot be edited. The answer's warnings list what
+        automation users report as risky; they block nothing."""
         given = {"name": name, "content": content, "media_ref": media_ref, "priority": priority}
         given = {k: v for k, v in given.items() if v is not None}
         both = sorted(set(clear or []) & set(given))
@@ -543,7 +565,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
 
     def activate_rule(rule_id: RuleId) -> str:
         """Start answering with this rule on the real account, unless the service runs in
-        simulation. Only comments and messages written from now on fire it."""
+        simulation. Only comments and messages written from now on fire it. A rule with warnings
+        activates all the same; read them first."""
         return call("POST", "/v1/rules/{}/activate", rule_id)
 
     def deactivate_rule(rule_id: RuleId) -> str:
@@ -576,7 +599,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         )
 
     def resume_conversation(conversation_id: ConversationId) -> str:
-        """Lift a pause. What was skipped while paused is not sent afterwards."""
+        """Lift a pause, or an opt-out (a person who sent an opt-out word), which only a human
+        should decide. What was skipped while paused is not sent afterwards."""
         return call("POST", "/v1/conversations/{}/resume", conversation_id)
 
     # events
@@ -632,7 +656,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         paused: bool | None = None, limit: Limit = None, offset: Offset = None
     ) -> str:
         """People who wrote by direct message, most recent first, with their 24-hour window and
-        pause."""
+        pause. Someone who sent an opt-out word shows as paused_forever."""
         return call(
             "GET",
             "/v1/conversations",

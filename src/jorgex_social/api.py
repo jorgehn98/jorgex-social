@@ -44,7 +44,11 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.state.sessionmaker = make_sessionmaker(make_engine(settings))
     app.state.read_sessionmaker = make_sessionmaker(make_engine(settings, write=False))
     # The webhook records events through the same intake as the worker's polling.
-    app.state.intake = Intake(app.state.network, retention=timedelta(days=settings.retention_days))
+    app.state.intake = Intake(
+        app.state.network,
+        retention=timedelta(days=settings.retention_days),
+        opt_out_words=settings.opt_out_words,
+    )
     app.state.human_pause = timedelta(minutes=settings.human_pause_minutes)
     app.state.login_limiter = RateLimiter(
         [
