@@ -125,6 +125,14 @@ def test_a_login_limit_of_zero_is_refused():
         Settings.from_env({"JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR": "0"})
 
 
+@pytest.mark.parametrize("name", ["REPLIES_PER_MINUTE", "HOURLY_PUBLIC_REPLY_CAP"])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_a_reply_limit_below_one_is_refused(name, value):
+    # Zero would silently stop the replies it limits.
+    with pytest.raises(ValueError, match=f"JORGEX_SOCIAL_{name} must be at least 1"):
+        Settings.from_env({f"JORGEX_SOCIAL_{name}": value})
+
+
 def test_oauth_redirect_uris_are_https_only():
     listed = {"JORGEX_SOCIAL_OAUTH_REDIRECT_URIS": "https://a.example/cb, https://b.example/cb"}
 

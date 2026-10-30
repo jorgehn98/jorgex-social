@@ -331,7 +331,8 @@ class ReplyTask:
                 return Reason.COOLDOWN
         if event.author_ref is not None:
             # One person repeating the keyword on a post is answered once by each rule. Lasts as
-            # long as the rows are retained.
+            # long as the rows are retained. A refused reply proves nothing went out, so it does
+            # not count; an unknown one may have.
             answered = session.scalar(
                 select(Delivery.id)
                 .join(Event)
@@ -343,6 +344,8 @@ class ReplyTask:
                     Delivery.action == delivery.action,
                     Delivery.id != delivery.id,
                     Delivery.attempted_at.is_not(None),
+                    # Not `!=`: a reply sent or in flight has no reason, and NULL would not match.
+                    Delivery.reason.is_distinct_from(Reason.REFUSED),
                 )
             )
             if answered is not None:

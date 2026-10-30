@@ -1130,6 +1130,37 @@ def test_a_person_is_answered_once_per_rule_and_post(client, headers, ig, sessio
     assert all("author_ref" not in e for e in client.get("/v1/events", headers=headers).json())
 
 
+def test_a_refused_reply_does_not_count_as_answered(client, headers, ig, sessions, task):
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.fail_next("reply_private", Refused("comment is gone", code=100))
+    task(sessions)
+    assert ig.sent == []
+
+    again = ig.add_comment(media, "precio", author_id=PERSON)
+    task(sessions)
+
+    assert [target for _, target, _ in ig.sent] == [again]
+
+
+def test_a_reply_that_may_have_gone_out_counts_as_answered(client, headers, ig, sessions, task):
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.fail_next("reply_private", Unavailable("lost connection"))
+    task(sessions)
+
+    ig.add_comment(media, "precio", author_id=PERSON)
+    task(sessions)
+
+    assert ig.sent == []
+    assert sorted((d.status, d.reason) for d in deliveries(sessions)) == [
+        ("failed", "unknown"),
+        ("skipped", "already_answered"),
+    ]
+
+
 def test_a_second_rule_still_answers_the_same_person_on_the_same_post(
     client, headers, ig, sessions, task
 ):

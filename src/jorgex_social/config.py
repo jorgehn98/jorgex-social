@@ -125,12 +125,10 @@ class Settings:
             hourly_reply_cap=int(
                 env.get(f"{ENV_PREFIX}HOURLY_REPLY_CAP", defaults.hourly_reply_cap)
             ),
-            hourly_public_reply_cap=int(
-                env.get(f"{ENV_PREFIX}HOURLY_PUBLIC_REPLY_CAP", defaults.hourly_public_reply_cap)
+            hourly_public_reply_cap=_positive(
+                env, "HOURLY_PUBLIC_REPLY_CAP", defaults.hourly_public_reply_cap
             ),
-            replies_per_minute=int(
-                env.get(f"{ENV_PREFIX}REPLIES_PER_MINUTE", defaults.replies_per_minute)
-            ),
+            replies_per_minute=_positive(env, "REPLIES_PER_MINUTE", defaults.replies_per_minute),
             retention_days=retention_days,
             reply_cooldown_minutes=int(
                 env.get(f"{ENV_PREFIX}REPLY_COOLDOWN_MINUTES", defaults.reply_cooldown_minutes)
