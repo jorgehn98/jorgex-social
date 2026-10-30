@@ -454,15 +454,17 @@ Until the post is published the rule shows `waiting_for_post` and answers nothin
 the worker or `POST /v1/posts/{id}/resolve` marks the post published, the rule gets the post's
 `media_ref` by itself. A comment written in the moments before that is answered at the next poll, up
 to `JORGEX_SOCIAL_REPLY_POLL_SECONDS` (120) later, with the usual reply windows counted from the
-comment.
+comment. After an `outcome_unknown` settled later, comments from hours or days earlier are answered
+too, within the 24-hour public and 7-day private windows.
 
 - It does not work for a post published by hand in the Instagram app: add `media_ref` to the rule
   afterwards.
 - Comments from before the rule's activation are never answered.
 - `post_id` applies to comment rules only, and is refused for stories and cancelled posts. A rule whose
-  post is later cancelled, or fails, keeps waiting and gets the warning `post_not_going_out`.
+  post is later cancelled, or fails, keeps waiting and gets the warning `post_not_going_out`. One whose
+  draft is later edited into a story gets `post_is_a_story`, and answers nothing on it.
 - A post the service marks as published without knowing its media id (`external_ref` stays empty)
-  leaves the rule waiting; set `media_ref` by hand.
+  leaves the rule waiting with the warning `post_without_media_id`; set `media_ref` by hand.
 - Setting `media_ref` on a rule ends the link to the post; `media_ref: null` makes the rule apply to
   every post.
 

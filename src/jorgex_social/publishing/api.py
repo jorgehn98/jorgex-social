@@ -489,7 +489,7 @@ class ResolveIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outcome: Literal["published", "not_published"]
-    media_ref: str | None = Field(None, max_length=64)
+    media_ref: str | None = Field(None, min_length=1, max_length=64)
 
 
 @router.post("/posts/{post_id}/resolve", response_model=PostDetail, dependencies=SchedulingWrite)

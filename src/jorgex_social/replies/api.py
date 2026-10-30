@@ -81,8 +81,9 @@ class RuleOut(BaseModel):
     media_ref: str | None
     post_id: str | None
     waiting_for_post: bool
-    # Read from the rule's post to work out `warnings`; `GET /v1/posts/{id}` is where it is shown.
+    # Read from the rule's post to work out `warnings`; `GET /v1/posts/{id}` is where they show.
     post_status: str | None = Field(exclude=True)
+    post_type: str | None = Field(exclude=True)
     priority: int
     active: bool
     activated_at: datetime | None
@@ -95,12 +96,31 @@ class RuleOut(BaseModel):
     @property
     def warnings(self) -> list[dict[str, str]]:
         found = rules.rule_warnings(self.channel, self.media_ref, self.content, self.post_id)
+        is_story = self.post_type == PostType.STORY
+        if is_story:
+            # A draft's type can change after the rule was linked; the link itself is refused.
+            found.append(
+                {
+                    "code": "post_is_a_story",
+                    "message": "The post is now a story and Instagram never lists stories: this "
+                    "rule answers nothing until the post's type or the rule is changed.",
+                }
+            )
         if self.waiting_for_post and self.post_status in NOT_GOING_OUT:
             found.append(
                 {
                     "code": "post_not_going_out",
                     "message": f"The post is {self.post_status}: this rule answers nothing until "
                     "the post is published or the rule is changed.",
+                }
+            )
+        # Not for a story: setting media_ref could not help, and post_is_a_story already says so.
+        if self.waiting_for_post and self.post_status == PostStatus.PUBLISHED and not is_story:
+            found.append(
+                {
+                    "code": "post_without_media_id",
+                    "message": "The post is published but the service does not know its media id: "
+                    "this rule answers nothing until you set its media_ref.",
                 }
             )
         return found

@@ -116,9 +116,13 @@ A rule for a post that is not out yet: `create_post`, `create_rule` with its pos
 published the rule is waiting_for_post and answers nothing; a rule waiting for a post that is \
 cancelled or failed has the warning post_not_going_out. When the post is published the rule gets \
 its media_ref, and a comment written in the moments before that is answered at the next poll, up \
-to JORGEX_SOCIAL_REPLY_POLL_SECONDS later. This does not work for a post published by hand in the \
+to JORGEX_SOCIAL_REPLY_POLL_SECONDS later. After an outcome_unknown settled later, comments from \
+hours or days earlier are answered too, within the 24-hour public and 7-day private windows. A \
+post published with no media id leaves the rule waiting with the warning post_without_media_id: \
+set its media_ref with `update_rule`. This does not work for a post published by hand in the \
 Instagram app: add its media_ref to the rule afterwards with `update_rule`. Comments from before \
-activation are not answered either way, and stories cannot have a rule.
+activation are not answered either way. A story cannot be linked, and a linked post edited into a \
+story gets the warning post_is_a_story, because the rule answers nothing on it.
 
 A rule that replies publicly needs at least 3 public variants that differ in more than case, \
 accents or spacing. That is this service's own floor, not a Meta rule, and it is refused with \

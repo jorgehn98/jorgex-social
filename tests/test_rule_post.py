@@ -509,7 +509,7 @@ def test_a_person_repeating_the_keyword_before_the_binding_is_answered_once(
     ]
 
 
-def test_a_comment_from_before_activation_stays_unanswered(
+def test_a_comment_from_before_activation_keeps_its_event_and_stays_unanswered(
     client, headers, ig, sessions, clock, replies
 ):
     post_id = make_post(client, headers)
@@ -517,31 +517,41 @@ def test_a_comment_from_before_activation_stays_unanswered(
     media = other_media(ig)
     ig.add_comment(media, "precio", author_id=PERSON)
     replies(sessions)
+    [before] = events_of(sessions, media)
     clock.advance(minutes=1)
     client.post(f"/v1/rules/{rule['id']}/activate", headers=headers)
+    clock.advance(minutes=1)
+    after = ig.add_comment(media, "precio", author_id=OTHER_PERSON)
+    replies(sessions)
+    assert ig.sent == []
 
     bind(sessions, post_id, media, clock.now())
+
+    assert [e.id for e in events_of(sessions, media)] == [before.id]
     replies(sessions)
-
-    assert ig.sent == []
-    assert [e.rule_id for e in events_of(sessions, media)] == [None]
+    assert [target for _, target, _ in ig.sent] == [after]
 
 
-def test_a_rule_never_activated_answers_nothing_and_events_come_back_with_no_rule(
-    client, headers, ig, sessions, clock, replies
+@pytest.mark.parametrize("state", ["never_activated", "deactivated", "archived"])
+def test_a_rule_that_cannot_answer_is_bound_but_forgets_nothing(
+    client, headers, ig, sessions, clock, replies, state
 ):
     post_id = make_post(client, headers)
-    make_rule(client, headers, post_id=post_id, activate=False)
+    rule = make_rule(client, headers, post_id=post_id, activate=state != "never_activated")
+    if state != "never_activated":
+        action = "deactivate" if state == "deactivated" else "archive"
+        client.post(f"/v1/rules/{rule['id']}/{action}", headers=headers)
     media = other_media(ig)
     ig.add_comment(media, "precio", author_id=PERSON)
     replies(sessions)
+    [kept] = events_of(sessions, media)
 
     bind(sessions, post_id, media, clock.now())
-    assert events_of(sessions, media) == []
-    replies(sessions)
 
+    assert get_rule(client, headers, rule["id"])["media_ref"] == media
+    assert [e.id for e in events_of(sessions, media)] == [kept.id]
+    replies(sessions)
     assert ig.sent == []
-    assert [e.rule_id for e in events_of(sessions, media)] == [None]
 
 
 def test_reading_again_does_not_widen_the_reply_windows(
@@ -643,6 +653,34 @@ def test_a_warning_shows_when_the_post_is_not_going_out(client, headers, session
 
     set_status(sessions, post_id, "scheduled")
     assert codes() == []
+
+
+def test_a_warning_says_to_set_media_ref_when_the_post_has_no_media_id(client, headers, sessions):
+    post_id = make_post(client, headers)
+    set_status(sessions, post_id, "published")
+
+    rule = make_rule(client, headers, post_id=post_id, activate=False)
+
+    [warning] = rule["warnings"]
+    assert warning["code"] == "post_without_media_id"
+    assert "media_ref" in warning["message"]
+    fixed = client.patch(f"/v1/rules/{rule['id']}", json={"media_ref": "m1"}, headers=headers)
+    assert fixed.json()["warnings"] == []
+
+
+def test_a_warning_shows_when_the_post_becomes_a_story(client, headers, sessions):
+    post_id = make_post(client, headers)
+    rule = make_rule(client, headers, post_id=post_id, activate=False)
+
+    edited = client.patch(f"/v1/posts/{post_id}", json={"type": "story"}, headers=headers)
+
+    assert edited.status_code == 200, edited.text
+    codes = [w["code"] for w in get_rule(client, headers, rule["id"])["warnings"]]
+    assert codes == ["post_is_a_story"]
+    # Stories are never found once live, and a media_ref would not help, so it is not suggested.
+    set_status(sessions, post_id, "published")
+    codes = [w["code"] for w in get_rule(client, headers, rule["id"])["warnings"]]
+    assert codes == ["post_is_a_story"]
 
 
 def test_a_waiting_rule_is_not_warned_as_public_on_every_post(client, headers):

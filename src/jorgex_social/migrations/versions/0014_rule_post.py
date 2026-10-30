@@ -26,6 +26,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Without post_id a waiting rule would read as a rule for every post, so it stops for good.
+    op.execute(
+        "UPDATE rules SET active = 0, archived_at = COALESCE(archived_at, updated_at) "
+        "WHERE post_id IS NOT NULL AND media_ref IS NULL"
+    )
     with op.batch_alter_table("rules", schema=None) as batch_op:
         batch_op.drop_constraint("fk_rules_post_id_posts", type_="foreignkey")
         batch_op.drop_column("post_id")

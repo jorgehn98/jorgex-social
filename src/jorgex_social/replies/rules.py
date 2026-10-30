@@ -227,6 +227,13 @@ def bind_to_published(session: Session, post: Post, now: datetime) -> None:
             object_id=rule.id,
             detail={"post_id": post.id, "media_ref": post.external_ref},
         )
+    # Only what a bound rule could answer: no active rule, or older than all their activations,
+    # and reading it again could only fire some other rule.
+    floors = [
+        r.activated_at for r in waiting if r.active and r.archived_at is None and r.activated_at
+    ]
+    if not floors:
+        return
     # Comments seen while the rule waited cannot be evaluated again here: their text was never
     # stored. Forgetting them makes the next poll read them as new. rule_id NULL means no
     # deliveries (Intake._record), so no foreign key stops this and nothing answered is forgotten.
@@ -237,5 +244,6 @@ def bind_to_published(session: Session, post: Post, now: datetime) -> None:
             Event.type == Channel.COMMENT,
             Event.media_ref == post.external_ref,
             Event.rule_id.is_(None),
+            Event.occurred_at >= min(floors),
         )
     )

@@ -77,11 +77,30 @@ def test_the_rule_post_column_keeps_existing_rows(settings):
         references = db.execute("PRAGMA foreign_key_list(rules)").fetchall()
         assert [(f[2], f[3], f[4]) for f in references] == [("posts", "post_id", "id")]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        db.execute(
+            "INSERT INTO posts (id, network, type, status, caption, content_hash, created_at,"
+            " updated_at) VALUES ('p', 'n', 'image', 'draft', '', 'h', 't', 't')"
+        )
+        for rule_id, media_ref in (("waiting", None), ("bound", "m2")):
+            db.execute(
+                "INSERT INTO rules (id, network, name, channel, media_ref, post_id, priority,"
+                " active, activated_at, content, created_at, updated_at) VALUES"
+                " (?, 'n', 'x', 'comment', ?, 'p', 1, 1, 't', '{}', 't', 'edited')",
+                (rule_id, media_ref),
+            )
 
     command.downgrade(config, "0013")
 
     with sqlite3.connect(settings.database_path) as db:
-        assert db.execute("SELECT id, media_ref FROM rules").fetchall() == [("r", "m1")]
+        found = db.execute(
+            "SELECT id, media_ref, active, archived_at FROM rules ORDER BY id"
+        ).fetchall()
+        # The waiting rule must not come back as a rule for every post.
+        assert found == [
+            ("bound", "m2", 1, None),
+            ("r", "m1", 0, None),
+            ("waiting", None, 0, "edited"),
+        ]
         assert "post_id" not in [c[1] for c in db.execute("PRAGMA table_info(rules)")]
         assert db.execute("PRAGMA foreign_key_list(rules)").fetchall() == []
         assert db.execute("SELECT id FROM deliveries").fetchall() == [("d",)]

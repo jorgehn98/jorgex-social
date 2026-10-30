@@ -88,6 +88,10 @@ class Rule(Base):
     def post_status(self) -> str | None:
         return self.post.status if self.post else None
 
+    @property
+    def post_type(self) -> str | None:
+        return self.post.type if self.post else None
+
 
 class Conversation(Base):
     """A person who wrote to the account by direct message. `external_id` is their Instagram id,
