@@ -101,6 +101,35 @@ class Renewal:
     expires_in: timedelta
 
 
+@dataclass(frozen=True)
+class Comment:
+    """A top-level comment by anyone on one of the account's media. Its text is third-party
+    data: it lives only in memory to evaluate rules, never in the database or the logs, and it
+    stays out of repr. The author's username is never read."""
+
+    id: str
+    author_id: str | None  # None when Instagram does not say who wrote it
+    timestamp: datetime
+    text: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class Conversation:
+    id: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class Message:
+    """A direct message in a conversation, sent by the other person or by the account. Its text
+    follows the same rule as a comment's."""
+
+    id: str
+    sender_id: str | None
+    created_at: datetime
+    text: str = field(repr=False)
+
+
 class Instagram(Protocol):
     """What the service needs from Instagram so far. It grows with each build step."""
 
@@ -116,6 +145,16 @@ class Instagram(Protocol):
     def list_media(self, max_items: int | None = None) -> list[Media]: ...
     def media_insights(self, media_id: str, product_type: ProductType) -> dict[str, Any]: ...
     def account_insights(self, since: datetime, until: datetime) -> dict[str, Any]: ...
+    # Automatic replies. Only top-level comments; texts never leave memory.
+    def list_comments(self, media_id: str) -> list[Comment]: ...
+    # Newest activity first; stops at conversations not updated since `since`.
+    def list_conversations(self, since: datetime | None = None) -> list[Conversation]: ...
+    # Instagram returns at most the 20 most recent messages of a conversation.
+    def list_messages(self, conversation_id: str) -> list[Message]: ...
+    # Each returns the id Instagram gives the reply or message.
+    def reply_public(self, comment_id: str, text: str) -> str: ...
+    def reply_private(self, comment_id: str, text: str) -> str: ...
+    def send_message(self, recipient_id: str, text: str) -> str: ...
     # Meta renews a long-lived token that is at least 24 hours old and has not expired.
     def refresh_token(self) -> Renewal: ...
     # Raises CredentialUnavailable if the stored credential cannot be read; calls nothing remote.

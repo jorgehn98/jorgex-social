@@ -4,7 +4,7 @@ import pytest
 
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.errors import Refused, Unavailable
-from jorgex_social.instagram.fake import FakeInstagram
+from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import (
     ContainerKind,
     ContainerRequest,
@@ -219,3 +219,67 @@ def test_revoked_credential_fails_every_call(ig):
         ig.account()
     with pytest.raises(AuthError):
         ig.create_container(IMAGE)
+
+
+PERSON = "17900000000000042"
+
+
+def test_one_private_reply_per_comment_within_seven_days(ig, clock):
+    media = publish(ig, IMAGE)
+    first, second = ig.add_comment(media, "a"), ig.add_comment(media, "b", author_id=PERSON)
+
+    ig.reply_private(first, "hi")
+    with pytest.raises(Refused, match="one private reply"):
+        ig.reply_private(first, "again")
+    clock.advance(days=7, seconds=1)
+    with pytest.raises(Refused, match="7 days"):
+        ig.reply_private(second, "late")
+
+    assert [target for _, target, _ in ig.sent] == [first]
+
+
+def test_a_private_reply_opens_a_conversation_with_the_author(ig):
+    comment = ig.add_comment(publish(ig, IMAGE), "a", author_id=PERSON)
+
+    ig.reply_private(comment, "hi")
+
+    [conversation] = ig.list_conversations()
+    [message] = ig.list_messages(conversation.id)
+    assert (message.sender_id, message.text) == (ACCOUNT_ID, "hi")
+
+
+def test_messages_need_the_24_hour_window_and_fit_in_1000_bytes(ig, clock):
+    with pytest.raises(Refused, match="window"):
+        ig.send_message(PERSON, "first")  # the account cannot start a conversation
+    ig.add_message(PERSON, "hello")
+    with pytest.raises(Refused, match="1000 bytes"):
+        ig.send_message(PERSON, "é" * 501)
+
+    ig.send_message(PERSON, "hi")
+    clock.advance(hours=24, seconds=1)
+    with pytest.raises(Refused, match="window"):
+        ig.send_message(PERSON, "late")
+
+    assert ig.sent == [("send_message", PERSON, "hi")]
+
+
+def test_only_the_20_most_recent_messages_are_readable(ig, clock):
+    for n in range(25):
+        ig.add_message(PERSON, f"m{n}")
+        clock.advance(seconds=1)
+
+    [conversation] = ig.list_conversations()
+    messages = ig.list_messages(conversation.id)
+
+    assert [m.text for m in messages] == [f"m{n}" for n in range(24, 4, -1)]
+    assert ig.list_conversations(since=clock.now()) == []
+
+
+def test_public_replies_fit_in_2200_characters(ig):
+    comment = ig.add_comment(publish(ig, IMAGE), "a")
+
+    with pytest.raises(Refused):
+        ig.reply_public(comment, "x" * 2201)
+    with pytest.raises(Refused, match="unknown comment"):
+        ig.reply_public("nope", "x")
+    ig.reply_public(comment, "x" * 2200)

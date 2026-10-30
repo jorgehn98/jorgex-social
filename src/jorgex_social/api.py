@@ -13,6 +13,7 @@ from jorgex_social.db import make_engine, make_sessionmaker
 from jorgex_social.instagram import network_for
 from jorgex_social.publishing.api import public_router as media_files_router
 from jorgex_social.publishing.api import router as publishing_router
+from jorgex_social.replies.api import router as replies_router
 from jorgex_social.stats.api import router as stats_router
 
 log = logging.getLogger(__name__)
@@ -47,4 +48,5 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.include_router(stats_router)
     app.include_router(publishing_router)
     app.include_router(media_files_router)
+    app.include_router(replies_router)
     return app

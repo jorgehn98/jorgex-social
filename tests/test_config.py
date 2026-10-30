@@ -34,3 +34,27 @@ def test_reads_publishing_settings():
     assert settings.public_url == "https://social.example.com"
     assert settings.publish_grace_minutes == 45
     assert Settings.from_env({}).public_url is None
+
+
+def test_reads_reply_settings():
+    defaults = Settings.from_env({})
+    settings = Settings.from_env(
+        {
+            "JORGEX_SOCIAL_REPLY_POLL_SECONDS": "60",
+            "JORGEX_SOCIAL_HOURLY_REPLY_CAP": "50",
+            "JORGEX_SOCIAL_RETENTION_DAYS": "30",
+            "JORGEX_SOCIAL_REPLY_COOLDOWN_MINUTES": "15",
+        }
+    )
+    assert (defaults.reply_cooldown_minutes, settings.reply_cooldown_minutes) == (60, 15)
+
+    assert (defaults.reply_poll_seconds, defaults.hourly_reply_cap, defaults.retention_days) == (
+        120,
+        200,
+        90,
+    )
+    assert (settings.reply_poll_seconds, settings.hourly_reply_cap, settings.retention_days) == (
+        60,
+        50,
+        30,
+    )

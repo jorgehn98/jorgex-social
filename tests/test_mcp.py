@@ -25,7 +25,7 @@ pytestmark = pytest.mark.anyio
 BASE = "http://api.test"
 JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
 MP4 = b"\x00\x00\x00\x18ftypisom" + b"v" * 64
-ALL_WRITE = {g: "write" for g in ("posts", "scheduling", "stats", "account")}
+ALL_WRITE = {g: "write" for g in ("posts", "scheduling", "stats", "account", "rules", "events")}
 
 READ_POSTS = {"get_catalog", "list_posts", "get_post"}
 WRITE_POSTS = {"upload_media", "create_post", "update_post"}
@@ -33,6 +33,17 @@ SCHEDULING = {"schedule_post", "publish_now", "cancel_post", "resolve_post"}
 STATS = {"account_stats", "media_stats", "media_history"}
 READ_ACCOUNT = {"get_account", "list_incidents", "audit_log"}
 WRITE_ACCOUNT = {"acknowledge_incident", "set_kill_switch"}
+READ_RULES = {"list_rules", "get_rule", "test_rules"}
+WRITE_RULES = {
+    "create_rule",
+    "update_rule",
+    "activate_rule",
+    "deactivate_rule",
+    "archive_rule",
+    "pause_conversation",
+    "resume_conversation",
+}
+EVENTS = {"list_events", "list_deliveries", "list_conversations"}
 
 
 @pytest.fixture
@@ -77,7 +88,7 @@ async def tool_names(server):
         return {tool.name for tool in (await client.list_tools()).tools}
 
 
-async def call(client, name, **arguments):
+async def call(client, name, /, **arguments):
     result = await client.call_tool(name, arguments)
     text = result.content[0].text if result.content else "null"
     if result.is_error:
@@ -99,9 +110,19 @@ async def call(client, name, **arguments):
         ({"scheduling": "write", "stats": "read"}, SCHEDULING | STATS),
         ({"account": "read", "stats": "write"}, READ_ACCOUNT | STATS),
         ({"account": "write"}, READ_ACCOUNT | WRITE_ACCOUNT),
+        ({"rules": "read", "events": "read"}, READ_RULES | EVENTS),
+        ({"rules": "write"}, READ_RULES | WRITE_RULES),
         (
             ALL_WRITE,
-            READ_POSTS | WRITE_POSTS | SCHEDULING | STATS | READ_ACCOUNT | WRITE_ACCOUNT,
+            READ_POSTS
+            | WRITE_POSTS
+            | SCHEDULING
+            | STATS
+            | READ_ACCOUNT
+            | WRITE_ACCOUNT
+            | READ_RULES
+            | WRITE_RULES
+            | EVENTS,
         ),
     ],
 )
@@ -189,6 +210,65 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
         "error",
         {"status": 404, "code": "not_found", "message": "No such incident."},
     )
+
+
+async def test_reply_tools_reach_their_endpoints_end_to_end(app, transport):
+    server = server_for(app, transport, rules="write", events="read")
+    content = {"keywords": ["price"], "private_replies": ["See the website."]}
+
+    async with Client(server) as client:
+        transport.calls.clear()
+        _, rule = await call(
+            client, "create_rule", name="price", channel="comment", content=content
+        )
+        rid = rule["id"]
+        r = {
+            "listed": await call(client, "list_rules", channel="comment", active=False),
+            "detail": await call(client, "get_rule", rule_id=rid),
+            "edited": await call(
+                client, "update_rule", rule_id=rid, priority=5, clear=["media_ref"]
+            ),
+            "tested": await call(
+                client, "test_rules", channel="comment", text="the PRICE?", rule_id=rid
+            ),
+            "active": await call(client, "activate_rule", rule_id=rid),
+            "inactive": await call(client, "deactivate_rule", rule_id=rid),
+            "archived": await call(client, "archive_rule", rule_id=rid),
+            "events": await call(client, "list_events", matched=True, limit=5),
+            "deliveries": await call(client, "list_deliveries", status="sent", reason="paused"),
+            "conversations": await call(client, "list_conversations", paused=True),
+            "pause": await call(client, "pause_conversation", conversation_id="c1", forever=True),
+            "resume": await call(client, "resume_conversation", conversation_id="c1"),
+        }
+
+    sent = [(method, path) for method, path, _, _ in transport.calls]
+    assert sent == [
+        ("POST", "/v1/rules"),
+        ("GET", "/v1/rules?channel=comment&active=false"),
+        ("GET", f"/v1/rules/{rid}"),
+        ("PATCH", f"/v1/rules/{rid}"),
+        ("POST", "/v1/rules/test"),
+        ("POST", f"/v1/rules/{rid}/activate"),
+        ("POST", f"/v1/rules/{rid}/deactivate"),
+        ("POST", f"/v1/rules/{rid}/archive"),
+        ("GET", "/v1/events?matched=true&limit=5"),
+        ("GET", "/v1/deliveries?status=sent&reason=paused"),
+        ("GET", "/v1/conversations?paused=true"),
+        ("POST", "/v1/conversations/c1/pause"),
+        ("POST", "/v1/conversations/c1/resume"),
+    ]
+    bodies = {(m, path): json.loads(body) for m, path, _, body in transport.calls if body}
+    assert bodies[("PATCH", f"/v1/rules/{rid}")] == {"media_ref": None, "priority": 5}
+    assert bodies[("POST", "/v1/conversations/c1/pause")] == {"forever": True}
+
+    assert [x["id"] for x in r["listed"][1]] == [rid]
+    assert r["detail"][1]["content"]["keywords"] == ["price"]
+    assert r["edited"][1]["priority"] == 5
+    assert r["tested"][1]["private_replies"] == ["See the website."]
+    assert (r["active"][1]["active"], r["inactive"][1]["active"]) == (True, False)
+    assert r["archived"][1]["archived_at"] is not None
+    assert r["events"] == r["deliveries"] == r["conversations"] == ("ok", [])
+    assert r["pause"][1]["code"] == r["resume"][1]["code"] == "not_found"
 
 
 async def test_api_errors_come_back_as_they_are(app, transport):

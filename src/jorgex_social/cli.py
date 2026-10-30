@@ -28,6 +28,7 @@ from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import InstagramError
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask
+from jorgex_social.replies.task import ReplyTask
 from jorgex_social.stats.snapshots import SnapshotTask
 
 log = logging.getLogger(__name__)
@@ -183,6 +184,15 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
         ),
         SnapshotTask(instagram, clock),
         ConnectionTask(instagram, clock, key),
+        # After the connection check, which in simulation is what records the account's id.
+        ReplyTask(
+            instagram,
+            clock,
+            poll_every=timedelta(seconds=settings.reply_poll_seconds),
+            hourly_cap=settings.hourly_reply_cap,
+            retention=timedelta(days=settings.retention_days),
+            cooldown=timedelta(minutes=settings.reply_cooldown_minutes),
+        ),
     ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the
