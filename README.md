@@ -80,7 +80,8 @@ without echoing it (`--token` arguments would end up in the shell history, so th
 is stored encrypted with AES-GCM under the key in `JORGEX_SOCIAL_SECRET_KEY_FILE`, which `migrate`
 creates with mode 600. Back that key up separately from the database. The worker renews the token
 before it expires, and `GET /v1/account` reports the connection status, open incidents and the kill
-switch.
+switch. If Instagram reports the account as restricted, the kill switch turns on by itself and stays
+on until you turn it off (see [Protecting the account](INSTALL.md#protecting-the-account)).
 
 ## MCP server
 

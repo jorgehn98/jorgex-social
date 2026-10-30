@@ -50,6 +50,7 @@ class Reason(StrEnum):
     WINDOW_CLOSED = "window_closed"
     HOURLY_CAP = "hourly_cap"
     COOLDOWN = "cooldown"  # the rule already answered this person a moment ago
+    ALREADY_ANSWERED = "already_answered"  # the rule already answered this person on this post
     REFUSED = "refused"  # Instagram said no; nothing was sent
     UNKNOWN = "unknown"  # no usable answer: it may have been sent, so it is never retried
 
@@ -97,13 +98,18 @@ class Event(Base):
     discarded; what remains is which rule, if any, it fired."""
 
     __tablename__ = "events"
-    __table_args__ = (UniqueConstraint("network", "type", "external_ref"),)
+    __table_args__ = (
+        UniqueConstraint("network", "type", "external_ref"),
+        Index("ix_events_network_media_ref_author_ref", "network", "media_ref", "author_ref"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     network: Mapped[str] = mapped_column(String(32))
     type: Mapped[str] = mapped_column(String(16))  # comment / message
     external_ref: Mapped[str] = mapped_column(String(64))
     media_ref: Mapped[str | None] = mapped_column(String(64))  # comments
+    # Comments: the author's Instagram id, as pseudonymous as `Conversation.external_id`.
+    author_ref: Mapped[str | None] = mapped_column(String(64))
     conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"))  # messages
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime)  # Instagram's timestamp
     received_at: Mapped[datetime] = mapped_column(UTCDateTime, index=True)

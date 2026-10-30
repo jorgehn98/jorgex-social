@@ -535,6 +535,7 @@ def test_pages_render_sample_data_without_writing_or_showing_secrets(app, client
     assert '<svg class="chart chart--primary"' in bodies["/ui/stats"]
     assert "Price question" in bodies["/ui/events"]
     assert "Here is the price list" in bodies["/ui/rules"]
+    assert "not a published Meta rule" in bodies["/ui/rules"]  # one public variant: a warning
     assert "credential_expiring" in bodies["/ui/incidents"]
 
 

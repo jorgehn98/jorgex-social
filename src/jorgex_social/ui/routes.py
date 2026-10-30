@@ -22,7 +22,7 @@ from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
 from jorgex_social.publishing.models import Media, MediaType, PostStatus
-from jorgex_social.replies.api import list_deliveries, list_events, list_rules
+from jorgex_social.replies.api import RuleOut, list_deliveries, list_events, list_rules
 from jorgex_social.stats.api import account_history, latest_per_media, media_history
 from jorgex_social.ui.chart import line_chart
 
@@ -385,11 +385,15 @@ def media_stats(media_ref: str, request: Request, session: ReadSessionDep):
 @pages.get("/rules")
 def rules(request: Request, session: ReadSessionDep):
     network = _network(request)
+
+    def out(found) -> list[RuleOut]:
+        return [RuleOut.model_validate(rule, from_attributes=True) for rule in found]
+
     return render(
         request,
         "rules.html",
-        rules=list_rules(session, network, limit=1000),
-        archived=list_rules(session, network, archived=True, limit=1000),
+        rules=out(list_rules(session, network, limit=1000)),
+        archived=out(list_rules(session, network, archived=True, limit=1000)),
     )
 
 

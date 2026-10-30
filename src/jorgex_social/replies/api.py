@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -80,6 +80,11 @@ class RuleOut(BaseModel):
     updated_at: datetime
     archived_at: datetime | None
 
+    @computed_field
+    @property
+    def warnings(self) -> list[dict[str, str]]:
+        return rules.rule_warnings(self.channel, self.media_ref, self.content)
+
 
 def _check(channel: Channel, media_ref: str | None, content: RuleContent) -> None:
     try:
@@ -105,7 +110,7 @@ def _not_archived(rule: Rule) -> None:
 )
 def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Network):
     """Create a rule, inactive. Activate it to make it answer; only what arrives after that
-    is answered."""
+    is answered. `warnings` lists what automation users report as risky; it blocks nothing."""
     _check(body.channel, body.media_ref, body.content)
     now = request.app.state.clock.now()
     rule = Rule(
@@ -156,7 +161,8 @@ def update_rule(
     rule_id: str, body: RulePatch, request: Request, session: SessionDep, network: Network
 ):
     """Edit a rule; only the fields given change, and `media_ref: null` makes it apply to every
-    post. An active rule stays active and answers with the new content from now on."""
+    post. An active rule stays active and answers with the new content from now on. `warnings`
+    lists what automation users report as risky; it blocks nothing."""
     rule = _rule(session, network, rule_id)
     _not_archived(rule)
     fields = body.model_fields_set
@@ -178,7 +184,8 @@ def update_rule(
 
 @router.post("/rules/{rule_id}/activate", response_model=RuleOut, dependencies=RulesWrite)
 def activate_rule(rule_id: str, request: Request, session: SessionDep, network: Network):
-    """Start answering. Only comments and messages written from now on fire the rule."""
+    """Start answering. Only comments and messages written from now on fire the rule. A rule
+    with `warnings` activates all the same."""
     rule = _rule(session, network, rule_id)
     _not_archived(rule)
     if not rule.active:
@@ -227,7 +234,8 @@ class RuleTestOut(BaseModel):
 @router.post("/rules/test", response_model=RuleTestOut, dependencies=RulesRead)
 def test_rules(body: RuleTestIn, session: SessionDep, network: Network):
     """Which rule a sample text would fire and what it could answer. Stores nothing and calls
-    nothing on Instagram."""
+    nothing on Instagram. Opt-out words are not applied: a direct message that is exactly one of
+    them fires no rule, whatever this says."""
     if body.rule_id is not None:
         candidates = [_rule(session, network, body.rule_id)]
         if candidates[0].channel != body.channel:
@@ -327,7 +335,11 @@ def list_deliveries(
     limit: Limit = 100,
     offset: Offset = 0,
 ):
-    """Replies, newest first, with what was sent or why not."""
+    """Replies, newest first, with what was sent or why not. A reply stays `pending` while the
+    per-minute pace holds it back. `reason` is one of: `kill_switch`, `paused`, `window_closed`
+    (past the private reply's 7 days, the message's 24 hours or the public reply's 24 hours),
+    `cooldown`, `already_answered` (this rule already answered this person on this post),
+    `hourly_cap` (the overall cap, or the lower one on public replies), `refused` or `unknown`."""
     query = select(Delivery).join(Event).where(Event.network == network)
     for column, value in (
         (Delivery.status, status),
@@ -351,7 +363,9 @@ def list_conversations(
     limit: Limit = 100,
     offset: Offset = 0,
 ):
-    """People who wrote by direct message, most recent first, with their window and pause."""
+    """People who wrote by direct message, most recent first, with their window and pause. A
+    person who sent an opt-out word shows as `paused_forever`; the audit log has
+    `conversation.opted_out` for them."""
     query = select(Conversation).where(Conversation.network == network)
     if paused is not None:
         now = request.app.state.clock.now()
@@ -384,13 +398,18 @@ def pause_conversation(
     conversation_id: str, body: PauseIn, request: Request, session: SessionDep, network: Network
 ):
     """Stop automatic messages to this person, until a time or for good, for example while a
-    human answers. Messages already queued are skipped as `paused`."""
+    human answers. Messages already queued are skipped as `paused`. Replies to this person's
+    comments are too, but only if Instagram uses the same id for a comment's author and a
+    message's sender, which is not verified. A conversation paused for good, as an opt-out is,
+    refuses `until` with `invalid_state`, so it cannot lift by itself: only resume ends it."""
     if body.forever == (body.until is not None):
         raise _error(422, "invalid_value", "Give either until or forever=true.")
     now = request.app.state.clock.now()
     if body.until is not None and body.until <= now:
         raise _error(422, "in_the_past", "until is in the past.")
     conversation = _conversation(session, network, conversation_id)
+    if conversation.paused_forever and body.until is not None:
+        raise _error(409, "invalid_state", "Paused for good; resume it first.")
     conversation.paused_forever = body.forever
     conversation.paused_until = body.until
     conversation.updated_at = now
@@ -405,7 +424,8 @@ def pause_conversation(
 def resume_conversation(
     conversation_id: str, request: Request, session: SessionDep, network: Network
 ):
-    """Lift a pause. Messages skipped while paused are not sent afterwards."""
+    """Lift a pause, or an opt-out, which is a pause for good. Messages skipped while paused are
+    not sent afterwards."""
     conversation = _conversation(session, network, conversation_id)
     conversation.paused_forever = False
     conversation.paused_until = None

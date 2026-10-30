@@ -25,6 +25,12 @@ class RateLimited(Refused):
     """Too many calls; retry later. A write did not happen."""
 
 
+class AccountRestricted(Refused):
+    """Instagram has restricted the account or warned it about its behaviour. Unlike a rate limit,
+    waiting and trying again is the wrong answer: everything that writes must stop until a human
+    has looked at the account (kill_switch.trip)."""
+
+
 class AuthError(Refused):
     """The credential is invalid or expired (code 190). Missing permissions arrive as Refused."""
 

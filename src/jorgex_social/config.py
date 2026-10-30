@@ -30,11 +30,15 @@ def _positive(env, name: str, default: int) -> int:
 _URL = TypeAdapter(AnyUrl, config=ConfigDict(url_preserve_empty_path=True))
 
 
+def _list(value: str) -> tuple[str, ...]:
+    return tuple(filter(None, (part.strip() for part in value.split(","))))
+
+
 def _https_uris(value: str) -> tuple[str, ...]:
     """Normalised as the OAuth SDK parses the redirect URIs a client registers (lower-case scheme
     and host, no default port; an empty path kept empty), so the exact comparison can match."""
     uris = []
-    for entry in filter(None, (part.strip() for part in value.split(","))):
+    for entry in _list(value):
         uri = _URL.validate_python(entry)
         if uri.scheme != "https":
             raise ValueError(f"{ENV_PREFIX}OAUTH_REDIRECT_URIS takes https URIs only")
@@ -59,10 +63,14 @@ class Settings:
     # out of the database backups, or a stolen backup carries everything needed to read the token.
     secret_key_file: Path = Path("data/secret.key")
     # Automatic replies: how often comments and messages are polled, the most replies sent in any
-    # hour (Meta allows 750 private replies an hour; this stays well below), and how long events,
-    # deliveries and conversations are kept.
+    # hour (Meta allows 750 private replies an hour; this stays well below), the most of those that
+    # may be public (reported to be the riskier kind, on community evidence only), the most replies
+    # sent in any minute (the rest wait for a later pass), and how long events, deliveries and
+    # conversations are kept.
     reply_poll_seconds: float = 120.0
     hourly_reply_cap: int = 200
+    hourly_public_reply_cap: int = 30
+    replies_per_minute: int = 12
     retention_days: int = 90
     # A message rule answers the same person at most once in this many minutes.
     reply_cooldown_minutes: int = 60
@@ -77,6 +85,10 @@ class Settings:
     # A direct message the account sent by hand (not one of our replies) pauses automatic replies
     # to that person for this long.
     human_pause_minutes: int = 30
+    # A direct message that is exactly one of these, ignoring case, accents and punctuation or
+    # symbols at its ends, silences that person for good (Meta's Developer Policies 5.2b ask to
+    # respect opt-outs immediately). Empty: off.
+    opt_out_words: tuple[str, ...] = ("stop", "unsubscribe", "baja")
     # Peers whose X-Forwarded-For uvicorn believes (comma-separated addresses or networks): the
     # reverse proxy, as seen from the service. Behind Docker that is the network's gateway
     # (compose.yaml). Anyone else's header is ignored, so nobody can pick their own address.
@@ -121,6 +133,10 @@ class Settings:
             hourly_reply_cap=int(
                 env.get(f"{ENV_PREFIX}HOURLY_REPLY_CAP", defaults.hourly_reply_cap)
             ),
+            hourly_public_reply_cap=_positive(
+                env, "HOURLY_PUBLIC_REPLY_CAP", defaults.hourly_public_reply_cap
+            ),
+            replies_per_minute=_positive(env, "REPLIES_PER_MINUTE", defaults.replies_per_minute),
             retention_days=retention_days,
             reply_cooldown_minutes=int(
                 env.get(f"{ENV_PREFIX}REPLY_COOLDOWN_MINUTES", defaults.reply_cooldown_minutes)
@@ -131,6 +147,9 @@ class Settings:
             meta_app_secret=(env.get(f"{ENV_PREFIX}META_APP_SECRET") or "").strip() or None,
             human_pause_minutes=int(
                 env.get(f"{ENV_PREFIX}HUMAN_PAUSE_MINUTES", defaults.human_pause_minutes)
+            ),
+            opt_out_words=_list(
+                env.get(f"{ENV_PREFIX}OPT_OUT_WORDS", ",".join(defaults.opt_out_words))
             ),
             forwarded_allow_ips=(env.get(f"{ENV_PREFIX}FORWARDED_ALLOW_IPS") or "").strip()
             or defaults.forwarded_allow_ips,

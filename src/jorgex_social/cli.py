@@ -251,9 +251,12 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
             clock,
             poll_every=timedelta(seconds=settings.reply_poll_seconds),
             hourly_cap=settings.hourly_reply_cap,
+            hourly_public_cap=settings.hourly_public_reply_cap,
+            per_minute=settings.replies_per_minute,
             retention=timedelta(days=settings.retention_days),
             cooldown=timedelta(minutes=settings.reply_cooldown_minutes),
             webhook=settings.webhook_enabled,
+            opt_out_words=settings.opt_out_words,
         ),
     ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the

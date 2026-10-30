@@ -35,6 +35,9 @@ class IncidentType(StrEnum):
     # The password was right and the code wrong, repeatedly: the password may have leaked. Closes
     # only when the credentials change.
     SIGN_IN_PASSWORD_ACCEPTED = "sign_in_password_accepted"
+    # Instagram reported the account as restricted and the kill switch turned on by itself. Nothing
+    # tells when that is over, so only the operator turning the switch off closes this one.
+    ACCOUNT_RESTRICTED = "account_restricted"
 
 
 class ActorType(StrEnum):
@@ -75,7 +78,8 @@ class Connection(Base):
 
 class ChannelIncident(Base):
     """Something the operator or the agent should know about. Opens once while its cause lasts
-    and closes on its own when the cause is gone; acknowledging it does not close it."""
+    and closes when the cause is gone (on its own, except account_restricted); acknowledging it
+    does not close it."""
 
     __tablename__ = "channel_incidents"
     __table_args__ = (
