@@ -12,7 +12,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 COPY . .
 # --no-editable puts the package itself in the virtualenv, so the runtime image needs no source.
-# The `mcp` extra stays out: the MCP server runs on the agent's machine, not here.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 

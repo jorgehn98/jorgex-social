@@ -1,7 +1,5 @@
 import json
 import logging
-import subprocess
-import sys
 import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -9,16 +7,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 
 import pytest
+from mcp import Client
 
-pytest.importorskip("mcp", reason="install the mcp extra: uv sync --extra mcp")
-
-from mcp import Client  # noqa: E402
-
-from jorgex_social.access.tokens import create_token, revoke_token  # noqa: E402
-from jorgex_social.publishing import media as storage  # noqa: E402
-from jorgex_social_mcp import client as http_client  # noqa: E402
-from jorgex_social_mcp.client import Api, ApiError, check_url, urllib_transport  # noqa: E402
-from jorgex_social_mcp.server import build_server, main  # noqa: E402
+from jorgex_social.access.tokens import create_token, revoke_token
+from jorgex_social.publishing import media as storage
+from jorgex_social_mcp import client as http_client
+from jorgex_social_mcp.client import Api, ApiError, check_url, urllib_transport
+from jorgex_social_mcp.server import build_server, main
 
 pytestmark = pytest.mark.anyio
 
@@ -416,14 +411,6 @@ def test_main_refuses_a_url_that_would_send_the_token_in_the_clear(monkeypatch, 
 
     assert "https" in str(exit_.value.code)
     assert secret not in str(exit_.value.code)
-
-
-def test_the_service_does_not_import_mcp():
-    code = (
-        "import sys, jorgex_social.api, jorgex_social.cli, jorgex_social.worker; "
-        "sys.exit('mcp' in sys.modules)"
-    )
-    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
 
 
 @contextmanager
