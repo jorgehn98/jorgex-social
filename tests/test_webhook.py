@@ -821,8 +821,8 @@ def test_third_party_text_from_notifications_never_reaches_the_database_or_the_l
     comment_id = ig.add_comment(media, f"precio {MARKERS[0]}")
     mid = ig.add_message(PERSON, f"precio {MARKERS[1]}")
     valid = [
-        comment_payload(comment_id, media, f"precio {MARKERS[0]}"),
-        comment_payload("910", media, f"no keyword {MARKERS[0]}"),
+        comment_payload(comment_id, media, f"precio {MARKERS[0]}", author=OTHERS[0]),
+        comment_payload("910", media, f"no keyword {MARKERS[0]}", author=OTHERS[0]),
         message_payload(mid, f"precio {MARKERS[1]}"),
         message_payload("911", MARKERS[1], sender=ACCOUNT_ID, recipient=PERSON, echo=True),
     ]

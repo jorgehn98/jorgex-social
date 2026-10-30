@@ -59,10 +59,14 @@ class Settings:
     # out of the database backups, or a stolen backup carries everything needed to read the token.
     secret_key_file: Path = Path("data/secret.key")
     # Automatic replies: how often comments and messages are polled, the most replies sent in any
-    # hour (Meta allows 750 private replies an hour; this stays well below), and how long events,
-    # deliveries and conversations are kept.
+    # hour (Meta allows 750 private replies an hour; this stays well below), the most of those that
+    # may be public (reported to be the riskier kind, on community evidence only), the most replies
+    # sent in any minute (the rest wait for a later pass), and how long events, deliveries and
+    # conversations are kept.
     reply_poll_seconds: float = 120.0
     hourly_reply_cap: int = 200
+    hourly_public_reply_cap: int = 30
+    replies_per_minute: int = 12
     retention_days: int = 90
     # A message rule answers the same person at most once in this many minutes.
     reply_cooldown_minutes: int = 60
@@ -120,6 +124,12 @@ class Settings:
             ),
             hourly_reply_cap=int(
                 env.get(f"{ENV_PREFIX}HOURLY_REPLY_CAP", defaults.hourly_reply_cap)
+            ),
+            hourly_public_reply_cap=int(
+                env.get(f"{ENV_PREFIX}HOURLY_PUBLIC_REPLY_CAP", defaults.hourly_public_reply_cap)
+            ),
+            replies_per_minute=int(
+                env.get(f"{ENV_PREFIX}REPLIES_PER_MINUTE", defaults.replies_per_minute)
             ),
             retention_days=retention_days,
             reply_cooldown_minutes=int(

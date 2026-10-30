@@ -101,13 +101,19 @@ Rules: `create_rule` makes an inactive rule. `test_rules` with its rule_id and s
 shows what it would match and send, sending nothing. `activate_rule` makes it answer, only to \
 what arrives afterwards. The first matching active rule wins, lowest priority number first. \
 `list_deliveries` shows what was sent or why not; `pause_conversation` silences one person \
-while a human answers.
+while a human answers, and reaches their comments only when Instagram uses the same id for a \
+comment's author and a message's sender, which is not verified. Each rule answers a person once \
+per post. Replies go out at a limited pace per minute, so a pending one may simply be waiting; \
+public replies expire 24 hours after the comment and have their own, lower hourly cap.
 
 Kill switch (`set_kill_switch`): on, nothing is written to Instagram. Scheduled posts wait, \
 and replies due meanwhile are skipped for good. Off, publishing resumes; posts past their grace \
 window fail as missed_schedule, and a post whose containers were being made when it turned on \
-fails with failure kill_switch; both must be scheduled again. Open incidents (`list_incidents`) \
-need a human; acknowledging one does not close it.
+fails with failure kill_switch; both must be scheduled again. It also turns on by itself when \
+Instagram reports the account as restricted, with an account_restricted incident holding Meta's \
+code and subcode. Never turn it off on your own after that: ask a human to check the account \
+first. Turning it off closes that incident, and if Instagram refuses again both come back. Open \
+incidents (`list_incidents`) need a human; acknowledging one does not close it.
 
 Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
 a page comes back shorter than limit; tools without offset say how to page in their \
@@ -417,7 +423,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         limit: Limit = None,
         offset: Offset = None,
     ) -> str:
-        """Channel incidents, newest first. An open incident's cause is still there."""
+        """Channel incidents, newest first. An open incident's cause is still there, except
+        account_restricted, which stays open until the kill switch is turned off."""
         return call(
             "GET",
             "/v1/account/incidents",
@@ -437,7 +444,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     def acknowledge_incident(
         incident_id: Annotated[str, Field(description="Incident id, from list_incidents.")],
     ) -> str:
-        """Mark an incident as seen. It stays open until its cause is gone."""
+        """Mark an incident as seen. It stays open until its cause is gone, or for
+        account_restricted until the kill switch is turned off."""
         return call("POST", "/v1/account/incidents/{}/acknowledge", incident_id)
 
     def set_kill_switch(enabled: bool) -> str:
@@ -445,7 +453,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         posts stay scheduled and replies due meanwhile are skipped for good. Off: due posts
         publish and active rules answer again on the real account, unless the service runs in
         simulation; posts past their grace window fail as missed_schedule and can be
-        rescheduled."""
+        rescheduled. It also turns on by itself when Instagram reports the account as restricted
+        (account_restricted incident); turning it off closes that incident, so a human should
+        check the account first."""
         return call("PUT", "/v1/account/kill-switch", json_body={"enabled": enabled})
 
     # rules
@@ -553,9 +563,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         forever: Annotated[bool | None, Field(description="true: until resumed.")] = None,
     ) -> str:
         """Stop automatic messages to one person, until a time or until resumed; give exactly
-        one of until or forever. Queued messages to them are skipped. With the webhook
-        configured, a conversation also pauses for a while on its own when the account answers
-        it by hand."""
+        one of until or forever. Queued messages to them are skipped. Replies to their comments
+        are too, but only when Instagram uses the same id for a comment's author and a message's
+        sender, which is not verified. With the webhook configured, a conversation also pauses
+        for a while on its own when the account answers it by hand."""
         body = {"until": until, "forever": forever}
         return call(
             "POST",
@@ -592,7 +603,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             str | None,
             Field(
                 description="Why skipped or failed: kill_switch, paused, window_closed, "
-                "cooldown, hourly_cap, refused or unknown."
+                "cooldown, already_answered, hourly_cap, refused or unknown."
             ),
         ] = None,
         action: Annotated[
@@ -603,7 +614,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         limit: Limit = None,
         offset: Offset = None,
     ) -> str:
-        """Automatic replies, newest first: what was sent, or why not."""
+        """Automatic replies, newest first: what was sent, or why not. pending may mean waiting
+        for the per-minute pace. already_answered: this rule already answered this person on this
+        post. window_closed includes public replies 24 hours after the comment. hourly_cap is the
+        overall cap or the lower one on public replies."""
         query = {
             "status": status,
             "reason": reason,

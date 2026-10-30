@@ -423,7 +423,31 @@ and are never logged or stored. `GET /v1/account` shows when the last valid noti
 A direct message you send by hand from Instagram pauses automatic replies to that person for
 `JORGEX_SOCIAL_HUMAN_PAUSE_MINUTES` (30), so a rule does not talk over you. Meta echoes messages sent
 from the Instagram app as webhook notifications, which is what triggers the pause; without the
-webhook, `POST /v1/conversations/{id}/pause` does the same by hand.
+webhook, `POST /v1/conversations/{id}/pause` does the same by hand. A pause also holds back replies
+to that person's comments, but only when Instagram uses the same id for a comment's author and a
+message's sender, which has not been verified.
+
+## Protecting the account
+
+Too many automatic replies can get an Instagram account restricted, so they are held back on purpose:
+
+- A rule answers one person once per post, however many times they repeat the keyword. A later
+  comment on another post, or one matching another rule, is answered.
+- At most `JORGEX_SOCIAL_REPLIES_PER_MINUTE` (12) replies go out in any minute. The rest stay pending
+  and the worker continues on later passes, oldest first.
+- At most `JORGEX_SOCIAL_HOURLY_REPLY_CAP` (200) replies go out in any hour, and at most
+  `JORGEX_SOCIAL_HOURLY_PUBLIC_REPLY_CAP` (30) of them public. Public replies are reported to be the
+  riskier kind, on community evidence only. A reply over a cap is skipped for good; when only the
+  public cap is reached, the private reply to the same comment still goes out.
+- A public reply not sent within 24 hours of the comment is skipped.
+
+If Instagram reports the account as restricted (error code 368, or code and subcode 10/1893063,
+100/2534029, 613/2018338, 4/2207051, 9/2018352 or 25/2207050), the service stops on its own: the kill
+switch turns on and the incident
+`account_restricted` opens with the code and subcode. Scheduled posts wait and replies due meanwhile
+are skipped for good. Check the account in Instagram, deal with the cause, and only then turn the
+switch off with `PUT /v1/account/kill-switch`, which closes the incident. If Instagram refuses again,
+both come back.
 
 ## Backups
 

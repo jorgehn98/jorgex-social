@@ -47,11 +47,15 @@ def test_reads_reply_settings():
         {
             "JORGEX_SOCIAL_REPLY_POLL_SECONDS": "60",
             "JORGEX_SOCIAL_HOURLY_REPLY_CAP": "50",
+            "JORGEX_SOCIAL_HOURLY_PUBLIC_REPLY_CAP": "5",
+            "JORGEX_SOCIAL_REPLIES_PER_MINUTE": "3",
             "JORGEX_SOCIAL_RETENTION_DAYS": "30",
             "JORGEX_SOCIAL_REPLY_COOLDOWN_MINUTES": "15",
         }
     )
     assert (defaults.reply_cooldown_minutes, settings.reply_cooldown_minutes) == (60, 15)
+    assert (defaults.hourly_public_reply_cap, settings.hourly_public_reply_cap) == (30, 5)
+    assert (defaults.replies_per_minute, settings.replies_per_minute) == (12, 3)
 
     assert (defaults.reply_poll_seconds, defaults.hourly_reply_cap, defaults.retention_days) == (
         120,

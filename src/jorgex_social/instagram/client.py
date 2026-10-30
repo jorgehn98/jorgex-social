@@ -8,7 +8,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from jorgex_social.instagram.errors import AuthError, RateLimited, Refused, Unavailable
+from jorgex_social.instagram.errors import (
+    AccountRestricted,
+    AuthError,
+    RateLimited,
+    Refused,
+    Unavailable,
+)
 from jorgex_social.instagram.types import (
     Account,
     Comment,
@@ -53,7 +59,19 @@ MEDIA_FIELDS = "id,caption,media_product_type,media_type,permalink,timestamp"
 # Only the author's id is asked for: the username is third-party data the service has no use for.
 COMMENT_FIELDS = "id,text,timestamp,from{id}"
 MESSAGE_FIELDS = "messages{id,created_time,from{id},message}"
-RATE_LIMIT_CODES = {4, 17, 32, 613}
+RATE_LIMIT_CODES = {4, 17, 32, 613, 80002}
+# Any subcode: temporarily blocked for policy violations.
+ACCOUNT_RESTRICTED_CODES = {368}
+# (code, subcode) in Meta's error reference. Two share a code with a rate limit, so these are
+# checked first: every other 4 or 613 is a plain rate limit.
+ACCOUNT_RESTRICTED = {
+    (10, 1893063),  # temporarily restricted from sending
+    (100, 2534029),  # business blocked from the Instagram Messaging API
+    (613, 2018338),  # warning about behaviour users may find abusive
+    (4, 2207051),  # activity restricted as suspected spam
+    (9, 2018352),  # the user is performing too many actions
+    (25, 2207050),  # account inactive, checkpointed or restricted
+}
 AUTH_ERROR_CODE = 190
 
 
@@ -96,6 +114,8 @@ def _error(status: int, raw: bytes) -> Exception:
         return Unavailable(message, code=code, subcode=subcode)
     if code == AUTH_ERROR_CODE:
         return AuthError(message, code=code, subcode=subcode)
+    if code in ACCOUNT_RESTRICTED_CODES or (code, subcode) in ACCOUNT_RESTRICTED:
+        return AccountRestricted(message, code=code, subcode=subcode)
     if status == 429 or code in RATE_LIMIT_CODES:
         return RateLimited(message, code=code, subcode=subcode, transient=True)
     return Refused(message, code=code, subcode=subcode, transient=bool(error.get("is_transient")))

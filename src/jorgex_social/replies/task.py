@@ -24,6 +24,7 @@ from jorgex_social.account.credential import connection_of
 from jorgex_social.account.models import IncidentType
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.errors import (
+    AccountRestricted,
     AuthError,
     CredentialUnavailable,
     InstagramError,
@@ -48,7 +49,10 @@ log = logging.getLogger(__name__)
 
 # instagram.md, «Mensajería»: one private reply per comment within 7 days.
 PRIVATE_REPLY_WINDOW = timedelta(days=7)
+# Our own limit, not Meta's, counted from the comment.
+PUBLIC_REPLY_MAX_AGE = timedelta(hours=24)
 HOUR = timedelta(hours=1)
+MINUTE = timedelta(minutes=1)
 # Comments are polled on media up to this old (newest first, at most this many), plus any media
 # an active rule names. The 7-day window for a private reply counts from the comment, not the post.
 RECENT_MEDIA = timedelta(days=30)
@@ -59,6 +63,8 @@ WEBHOOK_SILENCE = timedelta(hours=24)
 
 # Nothing was sent and the cause affects every send: stop and try again on the next poll.
 _RETRY_LATER = (CredentialUnavailable, AuthError, RateLimited)
+# A poll goes through many media and conversations; on these, the rest would only fail the same way.
+_STOP_POLL = (*_RETRY_LATER, AccountRestricted)
 
 
 def _log_failure(what: str, exc: Exception, **extra) -> None:
@@ -97,6 +103,8 @@ class ReplyTask:
         *,
         poll_every: timedelta = timedelta(seconds=120),
         hourly_cap: int = 200,
+        hourly_public_cap: int = 30,
+        per_minute: int = 12,
         retention: timedelta = timedelta(days=90),
         cooldown: timedelta = timedelta(minutes=60),
         choose: Callable[[Sequence[str]], str] = random.choice,
@@ -106,14 +114,16 @@ class ReplyTask:
         self.clock = clock
         self.poll_every = poll_every
         self.hourly_cap = hourly_cap
+        self.hourly_public_cap = hourly_public_cap
+        self.per_minute = per_minute
         self.retention = retention
         self.cooldown = cooldown
         self.webhook = webhook
         self.intake = Intake(instagram.network, retention=retention, choose=choose)
         self._started = clock.now()
         self._last_poll: datetime | None = None
-        # Set when a send failed in a way that affects every send (rate limit, credential):
-        # sending waits for the next poll instead of hitting Instagram on every pass.
+        # Set when a send failed in a way that affects every send (rate limit, credential,
+        # restriction): sending waits for the next poll instead of hitting Instagram on every pass.
         self._hold_sends = False
         # Conversation id -> the activity already read. In memory: after a restart every recent
         # conversation is read once more, and the events' unique key drops what was seen.
@@ -133,7 +143,7 @@ class ReplyTask:
                     ("comments", self.poll_comments),
                     ("messages", self.poll_messages),
                 ):
-                    _isolated(f"{name} poll", step, sessions, own, now)
+                    _isolated(f"{name} poll", self._poll, step, sessions, own, now)
         if not self._hold_sends:
             _isolated("delivery", self.deliver, sessions)
         if polling:
@@ -146,6 +156,20 @@ class ReplyTask:
         return connection.external_account_id if connection else None
 
     # Polling
+
+    def _poll(
+        self,
+        step: Callable[[sessionmaker, str, datetime], None],
+        sessions: sessionmaker,
+        own: str,
+        now: datetime,
+    ) -> None:
+        try:
+            step(sessions, own, now)
+        except AccountRestricted as exc:
+            with sessions() as session, session.begin():
+                kill_switch.trip(session, self.instagram.network, exc, self.clock.now())
+            raise
 
     def poll_comments(self, sessions: sessionmaker, own: str, now: datetime) -> None:
         recent = [
@@ -161,7 +185,7 @@ class ReplyTask:
         for media_ref in recent + sorted(named - {None} - set(recent)):
             try:
                 self._poll_media(sessions, own, now, media_ref)
-            except _RETRY_LATER:
+            except _STOP_POLL:
                 raise
             except Exception as exc:
                 _log_failure("comments poll", exc, media_ref=media_ref)
@@ -177,7 +201,7 @@ class ReplyTask:
                 continue
             try:
                 self._poll_conversation(sessions, own, now, conversation.id)
-            except _RETRY_LATER:
+            except _STOP_POLL:
                 raise
             except Exception as exc:
                 _log_failure("messages poll", exc)
@@ -205,14 +229,31 @@ class ReplyTask:
                 .order_by(Delivery.created_at, Delivery.id)
             ).all()
         for delivery_id in pending:
+            # At the pace limit the rest stay pending, untouched, for a later pass.
+            if self._hold_sends or self._at_pace_limit(sessions):
+                return
             try:
                 send = self._prepare(sessions, delivery_id)
-                if send is not None and not self._send(sessions, send):
-                    self._hold_sends = True
-                    return
+                if send is not None:
+                    self._send(sessions, send)
             except Exception as exc:
                 # Left as it was: if attempted_at was written, the next pass fails it as unknown.
                 _log_failure("delivery", exc, delivery_id=delivery_id)
+
+    def _at_pace_limit(self, sessions: sessionmaker) -> bool:
+        with sessions() as session:
+            return self._attempted_since(session, self.clock.now() - MINUTE) >= self.per_minute
+
+    def _attempted_since(
+        self, session: Session, since: datetime, action: Action | None = None
+    ) -> int:
+        query = (
+            select(func.count())
+            .select_from(Delivery)
+            .join(Event)
+            .where(Event.network == self.instagram.network, Delivery.attempted_at > since)
+        )
+        return session.scalar(query if action is None else query.where(Delivery.action == action))
 
     def _prepare(self, sessions: sessionmaker, delivery_id: str) -> _Send | None:
         """Checks, right before the call, everything that can forbid it, and marks the delivery
@@ -251,12 +292,23 @@ class ReplyTask:
     ) -> Reason | None:
         if kill_switch.is_on(session):
             return Reason.KILL_SWITCH
-        if conversation is not None and (
-            conversation.paused_forever
-            or (conversation.paused_until is not None and conversation.paused_until > now)
+        person = conversation
+        if event.author_ref is not None:
+            # Finds the pause only if Instagram names a comment's author and a message's sender
+            # with the same id, which is not verified: if it does not, this finds nobody.
+            person = session.scalar(
+                select(Conversation).where(
+                    Conversation.network == event.network,
+                    Conversation.external_id == event.author_ref,
+                )
+            )
+        if person is not None and (
+            person.paused_forever or (person.paused_until is not None and person.paused_until > now)
         ):
             return Reason.PAUSED
         match delivery.action:
+            case Action.PUBLIC_REPLY:
+                delivery.window_until_at_send = event.occurred_at + PUBLIC_REPLY_MAX_AGE
             case Action.PRIVATE_REPLY:
                 delivery.window_until_at_send = event.occurred_at + PRIVATE_REPLY_WINDOW
             case Action.MESSAGE:
@@ -277,20 +329,37 @@ class ReplyTask:
             )
             if recent is not None:
                 return Reason.COOLDOWN
-        sent_last_hour = session.scalar(
-            select(func.count())
-            .select_from(Delivery)
-            .join(Event)
-            .where(Event.network == event.network, Delivery.attempted_at > now - HOUR)
-        )
-        if sent_last_hour >= self.hourly_cap:
+        if event.author_ref is not None:
+            # One person repeating the keyword on a post is answered once by each rule. Lasts as
+            # long as the rows are retained.
+            answered = session.scalar(
+                select(Delivery.id)
+                .join(Event)
+                .where(
+                    Event.network == event.network,
+                    Event.media_ref == event.media_ref,
+                    Event.author_ref == event.author_ref,
+                    Delivery.rule_id == delivery.rule_id,
+                    Delivery.action == delivery.action,
+                    Delivery.id != delivery.id,
+                    Delivery.attempted_at.is_not(None),
+                )
+            )
+            if answered is not None:
+                return Reason.ALREADY_ANSWERED
+        if self._attempted_since(session, now - HOUR) >= self.hourly_cap:
+            return Reason.HOURLY_CAP
+        if (
+            delivery.action == Action.PUBLIC_REPLY
+            and self._attempted_since(session, now - HOUR, Action.PUBLIC_REPLY)
+            >= self.hourly_public_cap
+        ):
             return Reason.HOURLY_CAP
         # No duplicate check here: one rule per event, so a second delivery of the same action
         # cannot be created. The unique indexes on deliveries are the safety net.
         return None
 
-    def _send(self, sessions: sessionmaker, send: _Send) -> bool:
-        """Returns False when sending should stop until the next poll."""
+    def _send(self, sessions: sessionmaker, send: _Send) -> None:
         try:
             match send.action:
                 case Action.PUBLIC_REPLY:
@@ -307,14 +376,17 @@ class ReplyTask:
             )
             with sessions() as session, session.begin():
                 session.get_one(Delivery, send.delivery_id).attempted_at = None
-            return False
+            self._hold_sends = True
+        except AccountRestricted as exc:
+            # Set first: if the commit below fails, the next delivery must still not be sent.
+            self._hold_sends = True
+            self._end(sessions, send, DeliveryStatus.FAILED, Reason.REFUSED, error=exc)
         except Refused as exc:
             self._end(sessions, send, DeliveryStatus.FAILED, Reason.REFUSED, error=exc)
         except InstagramError as exc:
             self._end(sessions, send, DeliveryStatus.FAILED, Reason.UNKNOWN, error=exc)
         else:
             self._end(sessions, send, DeliveryStatus.SENT, result_ref=result)
-        return True
 
     def _end(
         self,
@@ -332,6 +404,8 @@ class ReplyTask:
             if error is not None:
                 delivery.error_code, delivery.error_subcode = error.code, error.subcode
             self._finish(delivery, status, self.clock.now(), reason)
+            if isinstance(error, AccountRestricted):
+                kill_switch.trip(session, self.instagram.network, error, self.clock.now())
 
     def _finish(
         self, delivery: Delivery, status: DeliveryStatus, now: datetime, reason: Reason | None

@@ -18,7 +18,12 @@ from jorgex_social.account import audit, kill_switch
 from jorgex_social.account.models import Outcome
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.client import TIMEOUT_SECONDS
-from jorgex_social.instagram.errors import CredentialUnavailable, InstagramError, Refused
+from jorgex_social.instagram.errors import (
+    AccountRestricted,
+    CredentialUnavailable,
+    InstagramError,
+    Refused,
+)
 from jorgex_social.instagram.types import (
     ContainerKind,
     ContainerRequest,
@@ -388,6 +393,9 @@ class PublishTask:
         any more (another worker took it for dead), in which case nothing changes."""
         now = self.clock.now()
         with sessions() as session, session.begin():
+            if isinstance(error, AccountRestricted):
+                # The post ends like any refused one; the switch keeps the next ones from starting.
+                kill_switch.trip(session, self.instagram.network, error, now)
             attempt = session.get_one(PublishAttempt, attempt_id)
             if attempt.result != AttemptResult.IN_PROGRESS:
                 log.error(
