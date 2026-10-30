@@ -179,8 +179,9 @@ def login_form(request: Request):
 
 
 async def read_form(request: Request) -> dict[str, str]:
-    # Parsed by hand: FastAPI's Form needs python-multipart, a dependency the service otherwise
-    # does without. The body is capped, as nothing legitimate here is large.
+    # Parsed by hand, with a cap on the body (nothing legitimate here is large) and on the number
+    # of fields. python-multipart is installed now (the mcp SDK needs it), but this needs nothing
+    # from it.
     body = b""
     async for chunk in request.stream():
         body += chunk

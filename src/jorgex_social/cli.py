@@ -105,7 +105,7 @@ def cmd_list_grants(_: argparse.Namespace, settings: Settings) -> None:
 
 def cmd_revoke_grant(args: argparse.Namespace, settings: Settings) -> None:
     """Ends grants and their tokens. Clients stay registered: a client that still holds its id
-    would otherwise be stuck until it is logged out by hand (`claude mcp logout`)."""
+    would otherwise be stuck until it is logged out by hand (`claude mcp logout <name>`)."""
     sessions = make_sessionmaker(make_engine(settings))
     now = SystemClock().now()
     with sessions() as session, session.begin():
@@ -144,7 +144,7 @@ def cmd_set_password(_: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
         operator.set_password(session, password, SystemClock().now())
-    print("Password changed; every browser was signed out.")
+    print("Password changed; every browser was signed out and every OAuth grant revoked.")
 
 
 def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
@@ -158,7 +158,7 @@ def cmd_enroll_totp(_: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
         operator.enroll_totp(session, key, secret, code, SystemClock().now())
-    print("Second factor enrolled; every browser was signed out.")
+    print("Second factor enrolled; every browser was signed out and every OAuth grant revoked.")
 
 
 def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:

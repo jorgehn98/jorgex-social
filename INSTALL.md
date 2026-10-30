@@ -277,13 +277,14 @@ docker compose exec api jorgex-social revoke-grant --id <id>   # or --all
 Ending a grant ends its tokens and upload URLs; the client stays registered, so it can ask for your
 consent again. Changing the password (`set-password`) or the second factor (`enroll-totp`) ends every
 grant. If a client keeps failing to connect after that, clear what it stored and start again; with
-Claude Code, `claude mcp logout`.
+Claude Code, `claude mcp logout jorgex-social` (the name you gave it in `claude mcp add`).
 
 Clients may only register redirect URIs on the loopback address, so an approved code always goes
 back to the machine that asked. A client that needs an https redirect must be listed in
-`JORGEX_SOCIAL_OAUTH_REDIRECT_URIS`. The OAuth endpoints are limited per client address (`/register`
-10 a minute and 30 an hour; `/authorize`, `/token`, `/revoke` and `/upload` 30 a minute and 300 an
-hour), and clients nobody approved are forgotten after an hour.
+`JORGEX_SOCIAL_OAUTH_REDIRECT_URIS`. The OAuth endpoints are limited per client address: `/register`
+to 10 a minute and 30 an hour, and `/authorize`, `/token`, `/revoke` and `/upload` to 30 a minute
+and 300 an hour between the four of them, one budget they share. Clients nobody approved are
+forgotten after an hour.
 
 ## Create your Meta app
 
