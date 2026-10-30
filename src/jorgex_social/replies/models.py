@@ -22,6 +22,13 @@ class Channel(StrEnum):
     MESSAGE = "message"
 
 
+class Source(StrEnum):
+    """How an event reached the service first; the unique key drops it if it comes again."""
+
+    POLL = "poll"
+    WEBHOOK = "webhook"
+
+
 class Action(StrEnum):
     PUBLIC_REPLY = "public_reply"
     PRIVATE_REPLY = "private_reply"
@@ -101,6 +108,8 @@ class Event(Base):
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime)  # Instagram's timestamp
     received_at: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
     rule_id: Mapped[str | None] = mapped_column(ForeignKey("rules.id"))  # null: no rule matched
+    # Existing rows (before the webhook) came by polling.
+    source: Mapped[str] = mapped_column(String(16), server_default=Source.POLL.value)
 
 
 class Delivery(Base):

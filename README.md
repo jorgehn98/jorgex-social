@@ -54,8 +54,9 @@ same way. The API reference is at `/docs` in simulation; in real mode it answers
 
 ### Reverse proxy
 
-Only two paths need to be public: `/m/*`, the short-lived media URLs Instagram downloads from to
-publish, and `/health`. The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an
+Only three paths need to be public: `/m/*`, the short-lived media URLs Instagram downloads from to
+publish, `/health`, and `/webhook`, where Meta notifies new comments and messages (see
+[Webhook](#webhook)). The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an
 SSH tunnel (below). A [Caddy](https://caddyserver.com/) site on the same host, which also obtains the
 HTTPS certificate; replace the domain with yours:
 
@@ -81,7 +82,17 @@ social.example.com {
 		}
 		reverse_proxy 127.0.0.1:8000
 	}
-	# handle /webhook { reverse_proxy 127.0.0.1:8000 }
+	@webhook {
+		path /webhook
+		method GET POST
+	}
+	handle @webhook {
+		# Meta's notifications are small; the service refuses bodies over 1 MB in any case.
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy 127.0.0.1:8000
+	}
 
 	handle {
 		respond 404
@@ -122,9 +133,36 @@ then add a rate limit at the proxy so nobody can hammer it with guessed tokens.
 2. In `.env`, set `JORGEX_SOCIAL_PUBLIC_URL=https://social.example.com` (your domain) and
    `JORGEX_SOCIAL_SIMULATION=false`.
 3. Apply the change with `docker compose up -d`. `GET /v1/account` reports the connection, open
-   incidents and the kill switch.
+   incidents, the kill switch and the webhook.
 
 In real mode the worker refuses to start without a connected account, so connect before switching.
+
+### Webhook
+
+Without it, automatic replies still work: the worker polls comments and messages every two minutes.
+With it, Meta notifies each new comment and message as it happens and the reply goes out within
+seconds (Meta's messaging policy asks bots to answer within 30 seconds). Polling keeps running and
+catches anything a notification missed; a comment seen both ways is answered once.
+
+1. Generate a random verify token, for example `openssl rand -hex 32`.
+2. In `.env`, set `JORGEX_SOCIAL_WEBHOOK_VERIFY_TOKEN` to it and `JORGEX_SOCIAL_META_APP_SECRET` to
+   your Meta app's secret (App settings > Basic). Keep `.env` readable only by you (`chmod 600 .env`).
+   Apply with `docker compose up -d`. Until both are set, `/webhook` answers 404.
+3. Make `/webhook` public at the proxy (above).
+4. In the Meta app dashboard, Instagram API setup > Configure webhooks, enter
+   `https://social.example.com/webhook` and the verify token, verify, and subscribe to the
+   `comments` and `messages` fields. Your account must also be subscribed to the app (Meta's "Set up Instagram Webhooks" guide: the dashboard's
+   webhook subscription for the account, or `POST /<IG_ID>/subscribed_apps`).
+
+Every notification must carry Meta's signature (`X-Hub-Signature-256`) made with the app secret;
+anything else gets 403 and is not processed. Notification bodies hold other people's text and are
+never logged or stored. `GET /v1/account` shows when the last valid notification arrived, and the
+incident `webhook_silent` opens when polling finds activity the webhook has not reported for a day.
+
+A direct message you send by hand from Instagram pauses automatic replies to that person for
+`JORGEX_SOCIAL_HUMAN_PAUSE_MINUTES` (30), so a rule does not talk over you. This relies on Meta
+echoing messages sent from the app, which is not yet confirmed; `POST /v1/conversations/{id}/pause`
+does the same by hand.
 
 ### Backups
 

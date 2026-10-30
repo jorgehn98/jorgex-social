@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ENV_PREFIX = "JORGEX_SOCIAL_"
@@ -44,6 +44,18 @@ class Settings:
     # /docs, /redoc and /openapi.json are always served in simulation; in real mode only when
     # this is set, so a public deployment does not describe its own API to anyone who asks.
     api_docs: bool = False
+    # Meta webhook (POST /webhook). Both are needed to turn it on: the verify token the operator
+    # generates and types into Meta's dashboard, and the app secret that signs every notification.
+    # Kept out of repr so they never reach a log line or a traceback.
+    webhook_verify_token: str | None = field(default=None, repr=False)
+    meta_app_secret: str | None = field(default=None, repr=False)
+    # A direct message the account sent by hand (not one of our replies) pauses automatic replies
+    # to that person for this long.
+    human_pause_minutes: int = 30
+
+    @property
+    def webhook_enabled(self) -> bool:
+        return bool(self.webhook_verify_token and self.meta_app_secret)
 
     @property
     def database_url(self) -> str:
@@ -79,4 +91,10 @@ class Settings:
                 env.get(f"{ENV_PREFIX}REPLY_COOLDOWN_MINUTES", defaults.reply_cooldown_minutes)
             ),
             api_docs=_flag(env.get(f"{ENV_PREFIX}API_DOCS", str(defaults.api_docs))),
+            webhook_verify_token=(env.get(f"{ENV_PREFIX}WEBHOOK_VERIFY_TOKEN") or "").strip()
+            or None,
+            meta_app_secret=(env.get(f"{ENV_PREFIX}META_APP_SECRET") or "").strip() or None,
+            human_pause_minutes=int(
+                env.get(f"{ENV_PREFIX}HUMAN_PAUSE_MINUTES", defaults.human_pause_minutes)
+            ),
         )

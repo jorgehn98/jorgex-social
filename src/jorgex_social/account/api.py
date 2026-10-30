@@ -28,6 +28,12 @@ class ConnectedAccount(BaseModel):
     account_type: str | None
 
 
+class WebhookOut(BaseModel):
+    configured: bool
+    # Last notification with a valid signature; null if none has arrived yet.
+    last_notification_at: datetime | None
+
+
 class AccountOut(BaseModel):
     """The connection as the service sees it. The credential itself is never part of it."""
 
@@ -39,6 +45,7 @@ class AccountOut(BaseModel):
     limits: dict[str, Any] | None
     kill_switch: bool
     open_incidents: int
+    webhook: WebhookOut
 
 
 class IncidentOut(BaseModel):
@@ -82,7 +89,14 @@ def get_account(request: Request, session: SessionDep):
             ChannelIncident.network == network, ChannelIncident.closed_at.is_(None)
         )
     )
-    common = {"kill_switch": kill_switch.is_on(session), "open_incidents": open_incidents}
+    common = {
+        "kill_switch": kill_switch.is_on(session),
+        "open_incidents": open_incidents,
+        "webhook": WebhookOut(
+            configured=request.app.state.settings.webhook_enabled,
+            last_notification_at=connection and connection.webhook_notified_at,
+        ),
+    }
     if connection is None:
         # The fake needs no credential, so simulation works before the worker's first check.
         simulated = network == FakeInstagram.network

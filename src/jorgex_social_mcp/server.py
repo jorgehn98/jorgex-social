@@ -287,8 +287,9 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
     # account
 
     def get_account() -> str:
-        """Connection status of the account, publishing limits, kill switch and number of open
-        incidents. Never includes the credential."""
+        """Connection status of the account, publishing limits, kill switch, number of open
+        incidents and the webhook (configured, time of the last valid notification). Never
+        includes the credential."""
         return call("GET", "/v1/account")
 
     def list_incidents(

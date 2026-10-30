@@ -192,6 +192,7 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
             hourly_cap=settings.hourly_reply_cap,
             retention=timedelta(days=settings.retention_days),
             cooldown=timedelta(minutes=settings.reply_cooldown_minutes),
+            webhook=settings.webhook_enabled,
         ),
     ]
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
