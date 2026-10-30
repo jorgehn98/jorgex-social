@@ -1,10 +1,15 @@
+from datetime import timedelta
+
 import pytest
 from fastapi import Depends
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from jorgex_social.access.deps import require
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token
+from jorgex_social.api import create_app
+from jorgex_social.clock import ManualClock
 from jorgex_social.db import utcnow
 
 
@@ -100,3 +105,39 @@ def test_rejects_duplicate_name(app):
 
     with pytest.raises(TokenError), app.state.sessionmaker() as session:
         create_token(session, "agent", {})
+
+
+def test_unknown_token_is_rejected_while_the_database_is_being_written(app, client):
+    """Authentication reads in a deferred transaction, so made-up tokens never queue on the write
+    lock (and a flood of them cannot stall the worker)."""
+    with app.state.sessionmaker() as writer, writer.begin():
+        writer.execute(select(ApiToken.id)).all()
+        response = client.get("/v1/token", headers=auth("jxs_unknown"))
+
+    assert response.status_code == 401
+
+
+def test_token_use_is_recorded_at_most_once_a_minute(settings):
+    clock = ManualClock()
+    app = create_app(settings, clock)
+    client = TestClient(app)
+    secret = make_token(app)
+
+    def last_used():
+        with app.state.read_sessionmaker() as session:
+            return session.scalar(select(ApiToken.last_used_at))
+
+    client.get("/v1/token", headers=auth(secret))
+    first = last_used()
+    clock.advance(seconds=30)
+    # Used recently: no write, so it answers even while another connection holds the write lock.
+    with app.state.sessionmaker() as writer, writer.begin():
+        writer.execute(select(ApiToken.id)).all()
+        assert client.get("/v1/token", headers=auth(secret)).status_code == 200
+    throttled = last_used()
+    clock.advance(seconds=31)
+    client.get("/v1/token", headers=auth(secret))
+
+    assert first == clock.now() - timedelta(seconds=61)
+    assert throttled == first
+    assert last_used() == clock.now()

@@ -6,7 +6,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from jorgex_social.access.models import ApiToken
-from jorgex_social.access.tokens import Group, Level, allows, authenticate
+from jorgex_social.access.tokens import (
+    Group,
+    Level,
+    allows,
+    authenticate,
+    needs_use_recorded,
+    record_use,
+)
 from jorgex_social.account.audit import set_actor
 
 _bearer = HTTPBearer(auto_error=False)
@@ -30,10 +37,14 @@ def get_read_session(request: Request) -> Iterator[Session]:
 ReadSessionDep = Annotated[Session, Depends(get_read_session, scope="function")]
 
 
-def _authenticate(
-    request: Request, session: Session, credentials: HTTPAuthorizationCredentials | None
-) -> ApiToken:
-    token = authenticate(session, credentials.credentials) if credentials else None
+def _authenticate(request: Request, credentials: HTTPAuthorizationCredentials | None) -> ApiToken:
+    """Looks the token up in a read (deferred) transaction, so unknown tokens never take the write
+    lock: a flood of made-up tokens cannot stall the worker. Only a valid token writes, briefly,
+    and at most once per LAST_USED_RESOLUTION. Never holds a transaction across the request."""
+    token = None
+    if credentials:
+        with request.app.state.read_sessionmaker() as session, session.begin():
+            token = authenticate(session, credentials.credentials)
     if token is None:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
@@ -41,6 +52,10 @@ def _authenticate(
             headers={"WWW-Authenticate": "Bearer"},
         )
     set_actor(request, token.prefix)  # before authorizing, so a denied call names its token
+    now = request.app.state.clock.now()
+    if needs_use_recorded(token, now):
+        with request.app.state.sessionmaker() as session, session.begin():
+            record_use(session, token, now)
     return token
 
 
@@ -61,8 +76,8 @@ def _authorize(token: ApiToken, group: Group, level: Level) -> ApiToken:
 Credentials = Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]
 
 
-def current_token(request: Request, session: SessionDep, credentials: Credentials) -> ApiToken:
-    return _authenticate(request, session, credentials)
+def current_token(request: Request, credentials: Credentials) -> ApiToken:
+    return _authenticate(request, credentials)
 
 
 TokenDep = Annotated[ApiToken, Depends(current_token)]
@@ -77,13 +92,8 @@ def require(group: Group, level: Level) -> Callable[[ApiToken], ApiToken]:
     return dependency
 
 
-def require_outside_transaction(group: Group, level: Level) -> Callable[..., ApiToken]:
-    """Like `require`, for long requests such as uploads: the token is checked in its own short
-    transaction, so the database write lock is not held while the body streams in."""
-
-    def dependency(request: Request, credentials: Credentials) -> ApiToken:
-        with request.app.state.sessionmaker() as session, session.begin():
-            token = _authenticate(request, session, credentials)
-        return _authorize(token, group, level)
-
-    return dependency
+def require_outside_transaction(group: Group, level: Level) -> Callable[[ApiToken], ApiToken]:
+    """For long requests such as uploads, which must not hold the database write lock while the
+    body streams in. Authentication already runs in its own short transactions, so this is
+    `require`; the name keeps that guarantee explicit where it matters."""
+    return require(group, level)

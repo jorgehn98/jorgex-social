@@ -1,8 +1,9 @@
 import hashlib
 import secrets
+from datetime import datetime, timedelta
 from enum import StrEnum
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from jorgex_social.access.models import ApiToken
@@ -11,6 +12,8 @@ from jorgex_social.db import utcnow
 # Distinct prefix so secret scanners can recognise these tokens (and not confuse them with others).
 TOKEN_PREFIX = "jxs_"
 PREFIX_LENGTH = len(TOKEN_PREFIX) + 8
+# last_used_at is only as precise as this, so authenticated reads do not write on every call.
+LAST_USED_RESOLUTION = timedelta(minutes=1)
 
 
 class Group(StrEnum):
@@ -79,11 +82,31 @@ def revoke_token(session: Session, name: str) -> ApiToken:
 
 
 def authenticate(session: Session, secret: str) -> ApiToken | None:
+    """Only reads, so it can run in a deferred transaction without the write lock."""
     token = session.scalar(select(ApiToken).where(ApiToken.hash == hash_token(secret)))
     if token is None or token.revoked_at is not None:
         return None
-    token.last_used_at = utcnow()
     return token
+
+
+def needs_use_recorded(token: ApiToken, now: datetime) -> bool:
+    return token.last_used_at is None or now - token.last_used_at >= LAST_USED_RESOLUTION
+
+
+def record_use(session: Session, token: ApiToken, now: datetime) -> None:
+    # Guarded, so concurrent requests with the same token write at most once per resolution.
+    session.execute(
+        update(ApiToken)
+        .where(ApiToken.id == token.id)
+        .where(
+            or_(
+                ApiToken.last_used_at.is_(None),
+                ApiToken.last_used_at <= now - LAST_USED_RESOLUTION,
+            )
+        )
+        .values(last_used_at=now)
+    )
+    token.last_used_at = now
 
 
 def allows(token: ApiToken, group: Group, level: Level) -> bool:

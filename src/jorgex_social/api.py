@@ -21,7 +21,14 @@ log = logging.getLogger(__name__)
 
 def create_app(settings: Settings | None = None, clock: Clock | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
-    app = FastAPI(title="jorgex-social", version="0.1.0")
+    docs = settings.simulation or settings.api_docs
+    app = FastAPI(
+        title="jorgex-social",
+        version="0.1.0",
+        openapi_url="/openapi.json" if docs else None,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+    )
     app.state.settings = settings
     app.state.clock = clock or SystemClock()
     app.state.network = network_for(settings)

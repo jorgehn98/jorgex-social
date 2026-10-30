@@ -49,22 +49,56 @@ curl -H "Authorization: Bearer jxs_your_token_here" http://127.0.0.1:8000/v1/tok
 ```
 
 The token is printed once. `jorgex-social list-tokens` and `revoke-token --name ...` manage them the
-same way. The API reference is at `/docs`.
+same way. The API reference is at `/docs` in simulation; in real mode it answers 404 unless
+`JORGEX_SOCIAL_API_DOCS=true`.
 
 ### Reverse proxy
 
-A minimal [Caddy](https://caddyserver.com/) site on the same host, which also obtains the HTTPS
-certificate. Replace the domain with yours; the body limit must stay above 300 MB, the largest video
-Instagram accepts.
+Only two paths need to be public: `/m/*`, the short-lived media URLs Instagram downloads from to
+publish, and `/health`. The API itself (`/v1`) stays on `127.0.0.1:8000` and is reached through an
+SSH tunnel (below). A [Caddy](https://caddyserver.com/) site on the same host, which also obtains the
+HTTPS certificate; replace the domain with yours:
 
 ```caddyfile
 social.example.com {
-	request_body {
-		max_size 400MB
+	header {
+		# Start modest; raise max-age once HTTPS on this domain is known to work.
+		Strict-Transport-Security "max-age=86400"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+		-Server
 	}
-	reverse_proxy 127.0.0.1:8000
+
+	@public {
+		path /m/* /health
+		method GET HEAD
+	}
+	handle @public {
+		# GET requests carry no body; uploads arrive only through the SSH tunnel.
+		request_body {
+			max_size 1KB
+		}
+		reverse_proxy 127.0.0.1:8000
+	}
+	# handle /webhook { reverse_proxy 127.0.0.1:8000 }
+
+	handle {
+		respond 404
+	}
 }
 ```
+
+To use the API from your machine, open a tunnel and talk to `localhost` as if the API ran there:
+
+```sh
+ssh -N -L 8000:127.0.0.1:8000 <server>
+curl -H "Authorization: Bearer jxs_your_token_here" http://localhost:8000/v1/token
+```
+
+Point the MCP server at `http://localhost:8000` while the tunnel is open (see
+[MCP server](#mcp-server)). Exposing `/v1` publicly also works, since every call needs a token, but
+then add a rate limit at the proxy so nobody can hammer it with guessed tokens.
 
 ### Switch to real mode
 
@@ -180,7 +214,7 @@ Most agent clients take a JSON entry like this one (the exact file and key depen
       "command": "uv",
       "args": ["run", "--directory", "/path/to/jorgex-social", "--extra", "mcp", "jorgex-social-mcp"],
       "env": {
-        "JORGEX_SOCIAL_URL": "https://social.example.com",
+        "JORGEX_SOCIAL_URL": "http://localhost:8000",
         "JORGEX_SOCIAL_TOKEN": "jxs_your_token_here"
       }
     }
@@ -189,7 +223,9 @@ Most agent clients take a JSON entry like this one (the exact file and key depen
 ```
 
 Give the agent its own token with only the groups it needs. The URL must use HTTPS unless the API is
-on the same machine (`localhost`, `127.0.0.0/8` or `::1`): the token travels in every request.
+on the same machine (`localhost`, `127.0.0.0/8` or `::1`): the token travels in every request. With
+the recommended proxy the API is not public, so `http://localhost:8000` goes through the SSH tunnel
+described in [Reverse proxy](#reverse-proxy).
 
 ## License
 

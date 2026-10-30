@@ -41,6 +41,9 @@ class Settings:
     retention_days: int = 90
     # A message rule answers the same person at most once in this many minutes.
     reply_cooldown_minutes: int = 60
+    # /docs, /redoc and /openapi.json are always served in simulation; in real mode only when
+    # this is set, so a public deployment does not describe its own API to anyone who asks.
+    api_docs: bool = False
 
     @property
     def database_url(self) -> str:
@@ -75,4 +78,5 @@ class Settings:
             reply_cooldown_minutes=int(
                 env.get(f"{ENV_PREFIX}REPLY_COOLDOWN_MINUTES", defaults.reply_cooldown_minutes)
             ),
+            api_docs=_flag(env.get(f"{ENV_PREFIX}API_DOCS", str(defaults.api_docs))),
         )
