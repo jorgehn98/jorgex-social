@@ -130,7 +130,8 @@ row lock the operator out for 15 minutes; `set-password` lifts the lock.
 Like the API, `/ui` is not public with the recommended proxy. Open the SSH tunnel and browse to
 `http://localhost:8000/ui/`. The session cookie is `Secure` for every host except a loopback one
 (`localhost`, `127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it; if you put
-`/ui` behind a proxy, serve it over HTTPS. Sessions last 12 hours at most and end after an hour
+`/ui` behind a proxy, serve it over HTTPS and rate-limit `POST /ui/login` there: each attempt costs
+an argon2 check, and the lockout protects the password, not the server's CPU. Sessions last 12 hours at most and end after an hour
 without activity.
 
 ### Switch to real mode

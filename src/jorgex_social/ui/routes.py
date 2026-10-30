@@ -17,7 +17,7 @@ from jorgex_social.access import operator
 from jorgex_social.access.deps import ReadSessionDep
 from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
-from jorgex_social.publishing.api import get_post, list_posts
+from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
 from jorgex_social.publishing.models import Media, MediaType, PostStatus
 from jorgex_social.replies.api import list_deliveries, list_events, list_rules
 from jorgex_social.stats.api import account_history, latest_per_media, media_history
@@ -128,7 +128,10 @@ async def _form(request: Request) -> dict[str, str]:
         body += chunk
         if len(body) > MAX_FORM_BYTES:
             raise HTTPException(413)
-    fields = parse_qs(body.decode(errors="replace"), max_num_fields=10)
+    try:
+        fields = parse_qs(body.decode(errors="replace"), max_num_fields=10)
+    except ValueError:  # more fields than any form here has
+        raise HTTPException(400) from None
     return {name: values[0] for name, values in fields.items()}
 
 
@@ -164,8 +167,12 @@ async def login(request: Request):
 def logout(request: Request):
     session_id = request.cookies.get(COOKIE)
     if session_id:
-        with request.app.state.sessionmaker() as session, session.begin():
-            operator.log_out(session, session_id)
+        # Looked up first in a read transaction, so a made-up cookie never takes the write lock.
+        with request.app.state.read_sessionmaker() as session, session.begin():
+            stored = operator.is_stored(session, session_id)
+        if stored:
+            with request.app.state.sessionmaker() as session, session.begin():
+                operator.log_out(session, session_id)
     response = RedirectResponse("/ui/login", status_code=303, headers=HEADERS)
     response.delete_cookie(COOKIE, path="/ui")
     return response
@@ -181,13 +188,12 @@ def _network(request: Request) -> str:
 @pages.get("/")
 def home(request: Request, session: ReadSessionDep):
     network = _network(request)
-    scheduled = list_posts(session, network, status=PostStatus.SCHEDULED, limit=500)
     return render(
         request,
         "home.html",
         account=get_account(request, session),
         incidents=list_incidents(request, session, open=True, limit=20),
-        upcoming=sorted(scheduled, key=lambda p: p["scheduled_for"])[:5],
+        upcoming=next_scheduled(session, network, limit=5),
     )
 
 
@@ -206,9 +212,11 @@ def posts(request: Request, session: ReadSessionDep):
     network, media_dir = _network(request), request.app.state.settings.media_dir
     sections = []
     for status, title in POST_SECTIONS + FOLDED_SECTIONS:
-        found = list_posts(session, network, status=status, limit=100)
-        if status is PostStatus.SCHEDULED:  # soonest first; the rest newest first
-            found.sort(key=lambda post: post["scheduled_for"])
+        # Scheduled ones soonest first; the rest newest first.
+        if status is PostStatus.SCHEDULED:
+            found = next_scheduled(session, network, limit=100)
+        else:
+            found = list_posts(session, network, status=status, limit=100)
         for post in found:
             post["thumbnail"] = _thumbnail(session, media_dir, post)
         sections.append((title, found, (status, title) in FOLDED_SECTIONS))

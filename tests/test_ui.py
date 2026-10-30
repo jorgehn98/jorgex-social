@@ -688,3 +688,111 @@ def test_cli_set_password_lifts_a_lockout(app, cli_env, monkeypatch, clock):
     main(["set-password"])
 
     assert rows(app, "SELECT failed_attempts, locked_until FROM operator") == [(0, None)]
+
+
+# Review fixes
+
+
+@pytest.mark.usefixtures("enrolled")
+@pytest.mark.parametrize("code", ["１２３４５６", "é12345", "12345６", "1234567", " 12 345"])
+def test_a_malformed_code_after_the_right_password_is_a_plain_failure(app, client, clock, code):
+    response = log_in(client, clock, code=code)
+
+    assert response.status_code == 401
+    assert INVALID in response.text
+    assert rows(app, "SELECT failed_attempts FROM operator") == [(1,)]
+
+
+def test_enrolment_refuses_a_non_ascii_code(app, settings, clock):
+    with app.state.sessionmaker() as session, session.begin():
+        operator.create_operator(session, PASSWORD, clock.now())
+    key = crypto.load_key(settings.secret_key_file)
+
+    with (
+        pytest.raises(operator.OperatorError, match="does not match"),
+        app.state.sessionmaker() as session,
+        session.begin(),
+    ):
+        operator.enroll_totp(session, key, TOTP_SECRET, "１２３４５６", clock.now())
+
+
+def test_logout_with_an_unknown_cookie_does_not_take_the_write_lock(app, client, monkeypatch):
+    def no_writes():
+        raise AssertionError("signing out a made-up session opened a write transaction")
+
+    monkeypatch.setattr(app.state, "sessionmaker", no_writes)
+
+    response = client.post(
+        "/ui/logout", headers={"cookie": f"{COOKIE}=made-up"}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/login"
+
+
+def test_password_checks_run_two_at_a_time_at_most(monkeypatch):
+    import threading
+    import time
+
+    running, peak, lock = 0, 0, threading.Lock()
+
+    def slow_verify(password_hash, password):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.05)
+        with lock:
+            running -= 1
+        return True
+
+    class SlowHasher:
+        verify = staticmethod(slow_verify)
+
+    monkeypatch.setattr(operator, "_hasher", SlowHasher())
+    threads = [
+        threading.Thread(target=operator._password_matches, args=("hash", "pw")) for _ in range(6)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert peak == 2
+
+
+def test_next_scheduled_is_ordered_and_limited_by_schedule_in_the_query(app, clock, sample):
+    from jorgex_social.publishing.api import next_scheduled
+
+    with app.state.sessionmaker() as session, session.begin():
+        # Created after the sample's post (due in a day) yet due sooner, and one due later.
+        for hours, caption in ((2, "Due soonest"), (48, "Due last")):
+            session.add(
+                Post(
+                    network=app.state.network,
+                    type="image",
+                    status="scheduled",
+                    caption=caption,
+                    content_hash="e" * 64,
+                    scheduled_for=clock.now() + timedelta(hours=hours),
+                    items=[PostItem(position=0, media_id=sample["media_id"])],
+                )
+            )
+
+    with app.state.read_sessionmaker() as session:
+        found = next_scheduled(session, app.state.network, limit=2)
+
+    assert [post["caption"] for post in found] == ["Due soonest", "Next one"]
+
+
+@pytest.mark.usefixtures("enrolled")
+def test_a_login_form_with_too_many_fields_is_a_bad_request(client):
+    body = "&".join(f"f{i}=x" for i in range(20))
+
+    response = client.post(
+        "/ui/login",
+        content=body.encode(),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400

@@ -3,7 +3,9 @@ sessions, with a lockout after repeated failures (decision 04)."""
 
 import hmac
 import logging
+import re
 import secrets
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -29,6 +31,10 @@ ACTIVITY_RESOLUTION = timedelta(minutes=1)
 MIN_PASSWORD_LENGTH = 12
 TOTP_CONTEXT = "operator/totp"
 TOTP_ISSUER = "jorgex-social"
+TOTP_CODE = re.compile(r"[0-9]{6}")  # ASCII only: \d would also take other scripts' digits
+# Each argon2 check takes 64 MiB and a fraction of a second: at most this many at once, so a
+# burst of sign-ins queues instead of exhausting memory.
+_password_checks = threading.BoundedSemaphore(2)
 
 # argon2id with the library's defaults (RFC 9106's low-memory profile).
 _hasher = PasswordHasher()
@@ -98,12 +104,17 @@ def provisioning_uri(secret: str) -> str:
 def totp_step(secret: str, code: str, now: datetime, after: int | None) -> int | None:
     """The time step `code` belongs to, allowing one step of clock drift either way, or None.
     Steps up to `after` are refused, so a code (or an older one) is never accepted twice."""
+    code = code.strip()
+    if not TOTP_CODE.fullmatch(code):
+        # Anything else is just a wrong code. compare_digest would raise on non-ASCII text, and
+        # an error only after a right password would tell the password apart.
+        return None
     totp = pyotp.TOTP(secret)
     current = totp.timecode(now)
     for step in (current - 1, current, current + 1):
         if after is not None and step <= after:
             continue
-        if hmac.compare_digest(totp.generate_otp(step), code.strip()):
+        if hmac.compare_digest(totp.generate_otp(step), code):
             return step
     return None
 
@@ -124,10 +135,11 @@ def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datet
 
 
 def _password_matches(password_hash: str, password: str) -> bool:
-    try:
-        return _hasher.verify(password_hash, password)
-    except VerificationError, InvalidHashError:
-        return False
+    with _password_checks:
+        try:
+            return _hasher.verify(password_hash, password)
+        except VerificationError, InvalidHashError:
+            return False
 
 
 def _locked(operator: Operator, now: datetime) -> bool:
@@ -216,6 +228,11 @@ def record_activity(session: Session, found: OperatorSession, now: datetime) -> 
         .where(OperatorSession.last_activity_at <= now - ACTIVITY_RESOLUTION)
         .values(last_activity_at=now)
     )
+
+
+def is_stored(session: Session, session_id: str) -> bool:
+    """Only reads; expired sessions count, so signing out still removes them."""
+    return session.get(OperatorSession, hash_token(session_id)) is not None
 
 
 def log_out(session: Session, session_id: str) -> None:
