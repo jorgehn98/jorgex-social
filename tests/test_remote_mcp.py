@@ -4,6 +4,7 @@
 import contextlib
 import json
 import logging
+import re
 import socket
 import threading
 import time
@@ -97,6 +98,19 @@ async def test_an_agent_with_only_the_url_uses_the_tools_its_grant_allows(app, c
     assert sent.status_code == 201 and sent.json()["type"] == "jpeg"
     assert created[0] == "ok" and created[1]["status"] == "draft"
     assert storage.tokens.access_token not in json.dumps(upload)
+
+
+@pytest.mark.anyio
+async def test_the_instructions_name_only_tools_the_remote_server_has(app, clock):
+    oauth, _, _ = await operator_oauth(httpx2.ASGITransport(app=app), clock, posts="read")
+
+    async with mcp_client(app, auth=oauth) as client:
+        names = {tool.name for tool in (await client.list_tools()).tools}
+        referenced = set(re.findall(r"`([a-z_]+)`", client.instructions or ""))
+
+    # A backticked identifier is always a tool name; uploads go through the upload URL here.
+    assert referenced <= names, referenced - names
+    assert {"create_upload_url", "create_post", "publish_now", "resolve_post"} <= referenced
 
 
 @pytest.mark.anyio

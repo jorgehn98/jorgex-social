@@ -38,6 +38,8 @@ class AccountOut(BaseModel):
     """The connection as the service sees it. The credential itself is never part of it."""
 
     network: str
+    # True: publishing, replies and the kill switch act on a fake account, never on Instagram.
+    simulation: bool
     status: ConnectionStatus
     account: ConnectedAccount | None
     credential_expires_at: datetime | None
@@ -90,6 +92,7 @@ def get_account(request: Request, session: SessionDep):
         )
     )
     common = {
+        "simulation": request.app.state.settings.simulation,
         "kill_switch": kill_switch.is_on(session),
         "open_incidents": open_incidents,
         "webhook": WebhookOut(

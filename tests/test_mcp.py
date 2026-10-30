@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -39,6 +40,8 @@ WRITE_RULES = {
     "resume_conversation",
 }
 EVENTS = {"list_events", "list_deliveries", "list_conversations"}
+# In the server instructions, a backticked identifier is always a tool name.
+TOOL_REFERENCE = re.compile(r"`([a-z_]+)`")
 
 
 @pytest.fixture
@@ -123,6 +126,22 @@ async def call(client, name, /, **arguments):
 )
 async def test_tools_follow_the_token_permissions(app, transport, grants, expected):
     assert await tool_names(server_for(app, transport, **grants)) == expected
+
+
+async def test_the_instructions_name_only_tools_this_server_has(app, transport):
+    async with Client(server_for(app, transport, **ALL_WRITE)) as client:
+        names = {tool.name for tool in (await client.list_tools()).tools}
+        referenced = set(TOOL_REFERENCE.findall(client.instructions or ""))
+
+    assert referenced <= names, referenced - names
+    # The steps an agent cannot guess: uploading, publishing safely, unknown outcomes, rules.
+    assert {
+        "upload_media",
+        "create_post",
+        "publish_now",
+        "resolve_post",
+        "test_rules",
+    } <= referenced
 
 
 async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
