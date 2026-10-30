@@ -1,0 +1,24 @@
+# Only what the image build needs: pyproject.toml, uv.lock, README.md, LICENSE and src/.
+.git/
+.github/
+docs/
+work/
+AGENTS.md
+.engram/
+.claude/
+.env
+.env.*
+!.env.example
+data/
+media/
+backups/
+*.db
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+tests/
+Dockerfile
+compose.yaml

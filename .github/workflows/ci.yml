@@ -18,3 +18,11 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Builds the image without pushing it, and checks compose.yaml, so neither can rot.
+      - run: docker build --pull --tag jorgex-social:ci .
+      - run: cp .env.example .env && docker compose config --quiet
