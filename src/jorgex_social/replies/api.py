@@ -110,7 +110,9 @@ def _not_archived(rule: Rule) -> None:
 )
 def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Network):
     """Create a rule, inactive. Activate it to make it answer; only what arrives after that
-    is answered. `warnings` lists what automation users report as risky; it blocks nothing."""
+    is answered. `public_replies` needs at least 3 variants that differ in more than case, accents
+    or spacing, or none at all: this service's own floor, not a Meta rule. `warnings` lists what
+    automation users report as risky; it blocks nothing."""
     _check(body.channel, body.media_ref, body.content)
     now = request.app.state.clock.now()
     rule = Rule(
@@ -161,8 +163,11 @@ def update_rule(
     rule_id: str, body: RulePatch, request: Request, session: SessionDep, network: Network
 ):
     """Edit a rule; only the fields given change, and `media_ref: null` makes it apply to every
-    post. An active rule stays active and answers with the new content from now on. `warnings`
-    lists what automation users report as risky; it blocks nothing."""
+    post. An active rule stays active and answers with the new content from now on.
+    `public_replies` needs at least 3 variants that differ in more than case, accents or spacing,
+    or none at all: this service's own floor, not a Meta rule. A rule stored with fewer keeps
+    answering, but any edit, even of its name alone, gets that same refusal until `content` fixes
+    it. `warnings` lists what automation users report as risky; it blocks nothing."""
     rule = _rule(session, network, rule_id)
     _not_archived(rule)
     fields = body.model_fields_set
@@ -310,8 +315,8 @@ def list_events(
     limit: Limit = 100,
     offset: Offset = 0,
 ):
-    """Comments and messages seen, newest first: identifiers and the rule they fired, never
-    their text or author."""
+    """Comments and messages seen, newest first: identifiers and the rule they fired. Their text
+    and usernames are never stored; a comment's author id is kept, but not returned here."""
     query = select(Event).where(Event.network == network)
     if type is not None:
         query = query.where(Event.type == type)

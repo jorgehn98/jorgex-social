@@ -29,6 +29,9 @@ MAX_MESSAGE_BYTES = 1000
 MAX_PUBLIC_CHARS = 2200
 MAX_VARIANTS = 20
 MAX_KEYWORDS = 50
+# Our own floor, not a Meta rule: an automation tool's interface asks for 3 and users of these
+# tools suggest 3 to 5, with no number from Meta. Checked in `check`, not in `RuleContent`, so
+# content stored with fewer still loads.
 MIN_PUBLIC_VARIANTS = 3
 LINK_MARKS = ("http://", "https://", "www.")
 # The evidence behind every warning is community reports, so none of them blocks a rule.
@@ -84,12 +87,20 @@ class RuleContent(BaseModel):
 
 
 def check(channel: Channel, media_ref: str | None, content: RuleContent) -> None:
-    """What depends on the channel. Raises ValueError with a message for the caller."""
+    """What a rule needs on top of its content's own shape, the channel first. Raises ValueError
+    with a message for the caller."""
     if channel == Channel.MESSAGE:
         if media_ref is not None:
             raise ValueError("media_ref only applies to comment rules")
         if content.public_replies:
             raise ValueError("message rules cannot have public_replies")
+    distinct = {normalize(text) for text in content.public_replies}
+    if content.public_replies and len(distinct) < MIN_PUBLIC_VARIANTS:
+        raise ValueError(
+            f"public_replies needs at least {MIN_PUBLIC_VARIANTS} variants that differ in more "
+            f"than case, accents or spacing, or none at all (found {len(distinct)}); this is "
+            "this service's own floor, not a Meta rule"
+        )
 
 
 def rule_warnings(channel: str, media_ref: str | None, content: dict) -> list[dict[str, str]]:
@@ -101,11 +112,6 @@ def rule_warnings(channel: str, media_ref: str | None, content: dict) -> list[di
     def warn(code: str, message: str) -> None:
         found.append({"code": code, "message": _REPORTED + message})
 
-    if public and len(public) < MIN_PUBLIC_VARIANTS:
-        warn(
-            "few_public_variants",
-            f"fewer than {MIN_PUBLIC_VARIANTS} public reply variants repeat the same text often.",
-        )
     if channel == Channel.COMMENT:
         if public and media_ref is None:
             warn("public_on_every_post", "public replies on every post can look like spam.")

@@ -95,7 +95,8 @@ class Conversation(Base):
 
 class Event(Base):
     """A comment or message by someone else, seen once. Its text was evaluated in memory and
-    discarded; what remains is which rule, if any, it fired."""
+    discarded; what remains is identifiers, a comment's author id among them, and which rule, if
+    any, it fired."""
 
     __tablename__ = "events"
     __table_args__ = (

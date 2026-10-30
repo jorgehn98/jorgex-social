@@ -28,9 +28,10 @@ START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 PERSON = "17900000000000042"
 OTHER_PERSON = "17900000000000043"
 PRIVATE_ONLY = {"keywords": ["precio"], "private_replies": ["DM"]}
+PUBLIC_VARIANTS = ["One", "Two", "Three"]
 PRICE_RULE = {
     "keywords": ["precio", "how much"],
-    "public_replies": ["Sent you a DM!", "Check your inbox"],
+    "public_replies": ["Sent you a DM!", "Check your inbox", "Just wrote to you"],
     "private_replies": ["The price is on the website."],
 }
 
@@ -167,6 +168,11 @@ def test_first_match_follows_priority_media_and_activation():
             },
             "media_ref",
         ),
+        # The channel is checked first: more variants would not help.
+        (
+            {"channel": "message", "content": {"keywords": ["x"], "public_replies": ["a"]}},
+            "cannot have public_replies",
+        ),
         # 501 characters, 1,002 bytes: the message limit is in bytes.
         (
             {"channel": "comment", "content": {"keywords": ["x"], "private_replies": ["é" * 501]}},
@@ -201,6 +207,93 @@ def test_invalid_rules_are_refused(client, headers, body, message):
     assert response.status_code == 422
     assert message in response.text
     assert client.get("/v1/rules", headers=headers).json() == []
+
+
+@pytest.mark.parametrize(
+    ("variants", "accepted"),
+    [
+        (["One", "Two"], False),
+        (PUBLIC_VARIANTS, True),
+        # Copies that differ only in case, accents or spacing are one variant.
+        (["Qué tal", "QUE  TAL", "Hello"], False),
+        (["Qué tal", "QUE  TAL", "Hello", "Bye"], True),
+        ([], True),
+    ],
+)
+def test_public_replies_need_three_distinct_variants_or_none(client, headers, variants, accepted):
+    content = {**PRIVATE_ONLY, "public_replies": variants}
+    existing = make_rule(client, headers, activate=False)
+
+    created = client.post(
+        "/v1/rules", json={"name": "r", "channel": "comment", "content": content}, headers=headers
+    )
+    edited = client.patch(f"/v1/rules/{existing['id']}", json={"content": content}, headers=headers)
+
+    assert (created.status_code, edited.status_code) == ((201, 200) if accepted else (422, 422))
+    if not accepted:
+        assert "at least 3" in created.text
+        assert "at least 3" in edited.text
+
+
+def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edited(
+    app, client, headers, ig, sessions, task, clock
+):
+    def stored_rule() -> str:
+        now = clock.now()
+        with sessions() as session, session.begin():
+            rule = Rule(
+                network=app.state.network,
+                name="old",
+                channel="comment",
+                priority=1,
+                active=True,
+                activated_at=now,
+                content={"keywords": ["precio"], "public_replies": ["One", "Two"]},
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(rule)
+            session.flush()
+            return rule.id
+
+    rule_id = stored_rule()
+    media = publish(ig)
+    clock.advance(minutes=1)
+    comment = ig.add_comment(media, "precio")
+
+    task(sessions)
+
+    [(op, target, text)] = ig.sent
+    assert (op, target) == ("reply_public", comment)
+    assert text in ("One", "Two")
+
+    refused = client.patch(f"/v1/rules/{rule_id}", json={"priority": 5}, headers=headers)
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["code"] == "invalid_rule"
+    assert "at least 3" in refused.json()["detail"]["message"]
+    assert client.get(f"/v1/rules/{rule_id}", headers=headers).json()["priority"] == 1
+
+    tested = client.post(
+        "/v1/rules/test",
+        json={"channel": "comment", "text": "precio", "rule_id": rule_id},
+        headers=headers,
+    )
+    assert tested.status_code == 200
+    assert tested.json()["public_replies"] == ["One", "Two"]
+    for action in ("deactivate", "activate", "archive"):
+        answer = client.post(f"/v1/rules/{rule_id}/{action}", headers=headers)
+        assert answer.status_code == 200, action
+
+    fixed = client.patch(
+        f"/v1/rules/{stored_rule()}",
+        json={
+            "priority": 5,
+            "content": {"keywords": ["precio"], "public_replies": PUBLIC_VARIANTS},
+        },
+        headers=headers,
+    )
+    assert fixed.status_code == 200
+    assert fixed.json()["priority"] == 5
 
 
 def test_rule_lifecycle(client, headers, clock):
@@ -876,9 +969,12 @@ def test_comments_are_polled_on_recent_media_and_on_media_a_rule_names(
     clock.advance(days=15)
     recent = publish(ig)
     clock.advance(days=20)  # old and unnamed are 35 days old, recent 20
-    make_rule(client, headers, content={"keywords": ["precio"], "public_replies": ["A"]})
+    make_rule(client, headers, content={"keywords": ["precio"], "public_replies": PUBLIC_VARIANTS})
     make_rule(
-        client, headers, media_ref=old, content={"keywords": ["info"], "public_replies": ["B"]}
+        client,
+        headers,
+        media_ref=old,
+        content={"keywords": ["info"], "public_replies": PUBLIC_VARIANTS},
     )
     on_old, on_recent = ig.add_comment(old, "precio"), ig.add_comment(recent, "precio")
     ig.add_comment(unnamed, "precio")
@@ -896,7 +992,7 @@ def test_comments_are_polled_on_recent_media_and_on_media_a_rule_names(
 def test_one_failing_media_or_conversation_stops_nothing_else(
     client, headers, ig, sessions, task, caplog
 ):
-    make_rule(client, headers, content={"keywords": ["precio"], "public_replies": ["A"]})
+    make_rule(client, headers, content={"keywords": ["precio"], "public_replies": PUBLIC_VARIANTS})
     make_rule(
         client, headers, channel="message", content={"keywords": ["info"], "private_replies": ["B"]}
     )
@@ -921,7 +1017,7 @@ def test_one_failing_media_or_conversation_stops_nothing_else(
     ig.list_comments, ig.list_messages = odd_comments, odd_messages
     task(sessions)
 
-    assert ("reply_public", on_fine, "A") in ig.sent
+    assert ("reply_public", on_fine) in {(op, target) for op, target, _ in ig.sent}
     assert [op for op, _, _ in ig.sent].count("send_message") == 1
     assert all(marker not in logged(caplog) for marker in MARKERS)
 
@@ -1381,30 +1477,23 @@ def test_an_opt_out_is_audited_without_its_text(client, headers, ig, sessions, c
 
 # Rule warnings
 
-CLEAN_PUBLIC = ["One", "Two", "Three"]
-
 
 @pytest.mark.parametrize(
     ("channel", "media_ref", "content", "codes"),
     [
-        ("comment", "m1", {"public_replies": CLEAN_PUBLIC, "private_replies": ["DM"]}, []),
+        ("comment", "m1", {"public_replies": PUBLIC_VARIANTS, "private_replies": ["DM"]}, []),
         ("comment", None, {"private_replies": ["DM"]}, []),
         ("message", None, {"private_replies": ["See https://x.test"]}, []),
-        ("comment", "m1", {"public_replies": ["One", "Two"]}, ["few_public_variants"]),
-        ("comment", None, {"public_replies": CLEAN_PUBLIC}, ["public_on_every_post"]),
-        (
-            "comment",
-            None,
-            {"public_replies": ["One"]},
-            ["few_public_variants", "public_on_every_post"],
-        ),
+        # A rule stored before the floor on public variants: no warning, it simply keeps working.
+        ("comment", "m1", {"public_replies": ["One", "Two"]}, []),
+        ("comment", None, {"public_replies": PUBLIC_VARIANTS}, ["public_on_every_post"]),
         ("comment", "m1", {"private_replies": ["See http://x.test"]}, ["link_in_first_message"]),
         ("comment", "m1", {"private_replies": ["See HTTPS://x.test"]}, ["link_in_first_message"]),
         ("comment", "m1", {"private_replies": ["See Www.x.test"]}, ["link_in_first_message"]),
         ("comment", "m1", {"private_replies": ["See x.test"]}, []),
         ("comment", "m1", {"private_replies": ["\U0001f525\U0001f525"]}, ["no_words"]),
         ("message", None, {"private_replies": ["ok", "!!!"]}, ["no_words"]),
-        ("comment", "m1", {"public_replies": [*CLEAN_PUBLIC, "..."]}, ["no_words"]),
+        ("comment", "m1", {"public_replies": [*PUBLIC_VARIANTS, "..."]}, ["no_words"]),
         ("comment", "m1", {"private_replies": ["Thanks \U0001f525"]}, []),
         ("comment", "m1", {"private_replies": ["1 \U0001f525"]}, []),
     ],
@@ -1416,7 +1505,7 @@ def test_rule_warnings(channel, media_ref, content, codes):
 def test_warnings_come_with_every_answer_and_block_nothing(client, headers):
     created = make_rule(client, headers, activate=False)
     rule_id = created["id"]
-    codes = ["few_public_variants", "public_on_every_post"]
+    codes = ["public_on_every_post"]
 
     def answers():
         yield created
@@ -1432,11 +1521,7 @@ def test_warnings_come_with_every_answer_and_block_nothing(client, headers):
         assert [w["code"] for w in answer["warnings"]] == codes
     assert "not a published Meta rule" in created["warnings"][0]["message"]
 
-    fixed = client.patch(
-        f"/v1/rules/{rule_id}",
-        json={"media_ref": "m1", "content": {**PRICE_RULE, "public_replies": CLEAN_PUBLIC}},
-        headers=headers,
-    ).json()
+    fixed = client.patch(f"/v1/rules/{rule_id}", json={"media_ref": "m1"}, headers=headers).json()
     assert fixed["warnings"] == []
 
 

@@ -41,8 +41,9 @@ RuleContent = Annotated[
         description="keywords (list, required), exclude (list), match (word, contains or "
         "exact; default word), public_replies (comment rules only) and private_replies (the "
         "private reply to a comment, or the answer to a message): lists of variants, one picked "
-        "at random. Matching ignores case and accents. The API validates it and says what is "
-        "wrong."
+        "at random. public_replies needs at least 3 variants that differ in more than case, "
+        "accents or spacing, or none at all; private_replies has no minimum. Matching ignores "
+        "case and accents. The API validates it and says what is wrong."
     ),
 ]
 ConversationId = Annotated[
@@ -110,8 +111,13 @@ per post. Replies go out at a limited pace per minute, so a pending one may simp
 public replies expire 24 hours after the comment and have their own, lower hourly cap. A sent \
 delivery means Instagram accepted the reply, not that it was delivered.
 
-A rule's warnings list what automation users report as risky (few public variants, public \
-replies on every post, a link in the first private message, replies with no words). They are \
+A rule that replies publicly needs at least 3 public variants that differ in more than case, \
+accents or spacing. That is this service's own floor, not a Meta rule, and it is refused with \
+status 422, not warned about. A rule stored earlier with fewer keeps answering, but any edit to \
+it, even of its name alone, gets that same refusal until its content is fixed.
+
+A rule's warnings list what automation users report as risky (public replies on every post, a \
+link in the first private message, replies with no words). They are \
 reported practice, not Meta's published rules, and block nothing: tell the operator and fix them \
 if you can. Do not write rule copy that requires following, liking or commenting to receive \
 promised content either.
@@ -540,8 +546,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             int | None, Field(description="Lower is tried first; default 100.")
         ] = None,
     ) -> str:
-        """Create an inactive rule. It answers nothing until activate_rule. The answer's warnings
-        list what automation users report as risky; they block nothing."""
+        """Create an inactive rule. It answers nothing until activate_rule. public_replies needs
+        at least 3 variants that differ in more than case, accents or spacing, or none at all:
+        this service's own floor, not a Meta rule. The answer's warnings list what automation
+        users report as risky; they block nothing."""
         body = {
             "name": name,
             "channel": channel,
@@ -565,8 +573,11 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ] = None,
     ) -> str:
         """Edit a rule; only the fields given change. An active rule keeps answering, with the
-        new content from now on. Archived rules cannot be edited. The answer's warnings list what
-        automation users report as risky; they block nothing."""
+        new content from now on. Archived rules cannot be edited. public_replies needs at least
+        3 variants that differ in more than case, accents or spacing, or none at all: this
+        service's own floor, not a Meta rule. A rule stored with fewer keeps answering, but any
+        edit, even of its name alone, gets that same refusal until content fixes it. The answer's
+        warnings list what automation users report as risky; they block nothing."""
         given = {"name": name, "content": content, "media_ref": media_ref, "priority": priority}
         given = {k: v for k, v in given.items() if v is not None}
         both = sorted(set(clear or []) & set(given))
@@ -629,7 +640,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         offset: Offset = None,
     ) -> str:
         """Comments and messages seen, newest first: identifiers and the rule they fired. Their
-        text and authors are never stored, so they are not here."""
+        text and usernames are never stored, only identifiers; a comment's author id is kept, but
+        not returned here."""
         query = {"type": type, "rule_id": rule_id, "matched": matched, "limit": limit}
         return call("GET", "/v1/events", query={**query, "offset": offset})
 

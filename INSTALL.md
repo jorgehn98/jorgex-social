@@ -465,10 +465,15 @@ Too many automatic replies can get an Instagram account restricted, so they are 
   which has not been verified. The person shows as `paused_forever` in `GET /v1/conversations`, with
   `conversation.opted_out` in the audit log. Only `POST /v1/conversations/{id}/resume` undoes it: a
   pause with `until` is refused. An empty value turns this off.
-- Rules get `warnings` in the API, the MCP and the web interface: fewer than 3 public variants, public
-  replies on every post, a link in a comment's first private message, or a variant with no letter or
-  digit. These are reported by automation users, not published by Meta, so a rule with warnings can
-  still be activated.
+- A rule that replies publicly needs at least 3 public variants that differ in more than case, accents
+  or spacing; anything less is refused with a 422. This is this service's own floor, not a Meta rule:
+  an automation tool's interface asks for 3 and users of these tools suggest 3 to 5, with no number
+  from Meta. Private replies have no minimum. A rule stored earlier with fewer keeps answering, but
+  any edit to it, even of its name alone, is refused with that same message until its content is
+  fixed.
+- Rules get `warnings` in the API, the MCP and the web interface: public replies on every post, a link
+  in a comment's first private message, or a variant with no letter or digit. These are reported by
+  automation users, not published by Meta, so a rule with warnings can still be activated.
 - At most 50 posts are published in any 24 hours, the lower of the two figures Meta's page gives. Over
   that, the next due post fails as `daily_limit` without calling Instagram, and can be scheduled again.
   Only posts published by this service count; Meta's own count, with the ones you publish by hand, is
