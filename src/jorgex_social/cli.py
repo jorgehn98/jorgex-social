@@ -178,6 +178,9 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> None:
         host=args.host,
         port=args.port,
         log_config=None,
+        # The client address behind the proxy: sign-in limits are per address, and without this
+        # every request would share the proxy's.
+        forwarded_allow_ips=settings.forwarded_allow_ips,
     )
 
 

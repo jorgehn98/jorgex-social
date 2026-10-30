@@ -97,3 +97,25 @@ def test_reads_webhook_settings_and_keeps_secrets_out_of_repr():
 )
 def test_the_webhook_needs_both_secrets(env):
     assert Settings.from_env(env).webhook_enabled is False
+
+
+def test_reads_exposure_settings():
+    defaults = Settings.from_env({})
+    settings = Settings.from_env(
+        {
+            "JORGEX_SOCIAL_FORWARDED_ALLOW_IPS": "172.30.0.1",
+            "JORGEX_SOCIAL_LOGIN_LIMIT_PER_MINUTE": "3",
+            "JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR": "10",
+        }
+    )
+
+    assert defaults.forwarded_allow_ips == "127.0.0.1,::1"
+    assert settings.forwarded_allow_ips == "172.30.0.1"
+    assert (defaults.login_limit_per_minute, defaults.login_limit_per_hour) == (5, 20)
+    assert (settings.login_limit_per_minute, settings.login_limit_per_hour) == (3, 10)
+
+
+def test_a_login_limit_of_zero_is_refused():
+    # Zero would refuse every sign-in, the operator's included.
+    with pytest.raises(ValueError, match="at least 1"):
+        Settings.from_env({"JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR": "0"})

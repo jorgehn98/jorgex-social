@@ -40,11 +40,14 @@ def app(settings, clock):
     return create_app(settings, clock)
 
 
+LOCAL = "http://localhost"
+
+
 @pytest.fixture
 def client(app):
     # Plain http to localhost, like the SSH tunnel: the cookie is not Secure, so the test client
-    # sends it back.
-    return TestClient(app, base_url="http://localhost")
+    # sends it back. Its form posts carry the Origin a browser would send.
+    return TestClient(app, base_url=LOCAL, headers={"origin": LOCAL})
 
 
 @pytest.fixture
@@ -89,7 +92,7 @@ def test_pages_redirect_to_login_without_a_session(client, path):
     response = client.get(path, follow_redirects=False)
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/ui/login"
+    assert response.headers["location"].split("?")[0] == "/ui/login"
 
 
 def test_unknown_session_cookie_redirects_and_is_cleared(client):
@@ -141,18 +144,13 @@ def test_operator_without_totp_cannot_sign_in(app, client, clock):
 
 
 @pytest.mark.usefixtures("enrolled")
-def test_five_failures_lock_the_operator_out_for_fifteen_minutes(app, client, clock):
-    for _ in range(operator.MAX_FAILURES):
+def test_failures_never_lock_the_operator_out(app, client, clock):
+    """Anyone can fail on purpose; a lockout of the one account would keep the operator out.
+    Guessing is bounded per address instead (test_ui_exposure.py)."""
+    for _ in range(8):
         assert log_in(client, clock, password="wrong password!!").status_code == 401
+        clock.advance(minutes=1)
 
-    locked = log_in(client, clock)  # right credentials, but locked
-    assert locked.status_code == 401
-    assert INVALID in locked.text
-
-    clock.advance(minutes=14, seconds=50)
-    assert log_in(client, clock).status_code == 401
-
-    clock.advance(seconds=20)
     assert log_in(client, clock).status_code == 303
 
     actions = rows(
@@ -162,36 +160,9 @@ def test_five_failures_lock_the_operator_out_for_fifteen_minutes(app, client, cl
     assert [tuple(a) for a in actions] == [
         ("operator.created", "ok", "operator"),
         ("operator.totp_enrolled", "ok", "operator"),
-        *[("operator.login", "denied", "operator")] * 5,
-        ("operator.locked", "denied", "operator"),
+        *[("operator.login", "denied", "operator")] * 8,
         ("operator.login", "ok", "operator"),
     ]
-
-
-@pytest.mark.usefixtures("enrolled")
-def test_attempts_while_locked_do_not_take_the_write_lock(app, client, clock, monkeypatch):
-    for _ in range(operator.MAX_FAILURES):
-        log_in(client, clock, password="wrong password!!")
-
-    def no_writes():
-        raise AssertionError("a sign-in while locked out opened a write transaction")
-
-    monkeypatch.setattr(app.state, "sessionmaker", no_writes)
-
-    assert log_in(client, clock, password="wrong password!!").status_code == 401
-    assert log_in(client, clock).status_code == 401
-
-
-@pytest.mark.usefixtures("enrolled")
-def test_a_success_resets_the_failure_count(client, clock):
-    for _ in range(operator.MAX_FAILURES - 1):
-        log_in(client, clock, password="wrong password!!")
-    assert log_in(client, clock).status_code == 303
-
-    clock.advance(seconds=30)
-    for _ in range(operator.MAX_FAILURES - 1):  # would make nine in a row without the reset
-        log_in(client, clock, password="wrong password!!")
-    assert log_in(client, clock).status_code == 303
 
 
 @pytest.mark.usefixtures("enrolled")
@@ -225,8 +196,10 @@ def test_the_enrolment_code_cannot_sign_in(client, clock):
 
 
 @pytest.mark.usefixtures("enrolled")
-def test_session_cookie_flags_over_https(app, clock):
-    client = TestClient(app, base_url="https://social.example.com")
+def test_session_cookie_flags_over_https(settings, clock):
+    public = "https://social.example.com"
+    app = create_app(replace(settings, public_url=public), clock)
+    client = TestClient(app, base_url=public, headers={"origin": public})
 
     response = log_in(client, clock)
 
@@ -678,29 +651,25 @@ def test_cli_refuses_a_short_password_and_a_second_operator(cli_env, monkeypatch
         main(["create-operator"])
 
 
-def test_cli_set_password_lifts_a_lockout(app, cli_env, monkeypatch, clock):
-    _stdin(monkeypatch, PASSWORD + "\n")
-    main(["create-operator"])
-    with app.state.sessionmaker() as session, session.begin():
-        session.scalar(select(Operator)).locked_until = clock.now() + timedelta(minutes=10)
-
-    _stdin(monkeypatch, "a brand new password\n")
-    main(["set-password"])
-
-    assert rows(app, "SELECT failed_attempts, locked_until FROM operator") == [(0, None)]
-
-
 # Review fixes
 
 
 @pytest.mark.usefixtures("enrolled")
-@pytest.mark.parametrize("code", ["１２３４５６", "é12345", "12345６", "1234567", " 12 345"])
-def test_a_malformed_code_after_the_right_password_is_a_plain_failure(app, client, clock, code):
+@pytest.mark.parametrize("code", ["１２３４５６", "é12345", "12345６", "1234567", " 12 3", "12345"])
+def test_a_malformed_code_fails_without_argon2_or_a_write(app, client, clock, code, monkeypatch):
+    def no_argon2(*_):
+        raise AssertionError("a malformed code paid for a password check")
+
+    def no_writes():
+        raise AssertionError("a malformed code opened a write transaction")
+
+    monkeypatch.setattr(operator, "_password_matches", no_argon2)
+    monkeypatch.setattr(app.state, "sessionmaker", no_writes)
+
     response = log_in(client, clock, code=code)
 
     assert response.status_code == 401
     assert INVALID in response.text
-    assert rows(app, "SELECT failed_attempts FROM operator") == [(1,)]
 
 
 def test_enrolment_refuses_a_non_ascii_code(app, settings, clock):

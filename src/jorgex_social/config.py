@@ -17,6 +17,13 @@ def _flag(value: str) -> bool:
     raise ValueError(f"not a boolean: {value!r}")
 
 
+def _positive(env, name: str, default: int) -> int:
+    value = int(env.get(f"{ENV_PREFIX}{name}", default))
+    if value < 1:
+        raise ValueError(f"{ENV_PREFIX}{name} must be at least 1")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path = Path("data/jorgex-social.db")
@@ -52,6 +59,13 @@ class Settings:
     # A direct message the account sent by hand (not one of our replies) pauses automatic replies
     # to that person for this long.
     human_pause_minutes: int = 30
+    # Peers whose X-Forwarded-For uvicorn believes (comma-separated addresses or networks): the
+    # reverse proxy, as seen from the service. Behind Docker that is the network's gateway
+    # (compose.yaml). Anyone else's header is ignored, so nobody can pick their own address.
+    forwarded_allow_ips: str = "127.0.0.1,::1"
+    # Sign-in attempts allowed per client address (IPv6: per /64), per minute and per hour.
+    login_limit_per_minute: int = 5
+    login_limit_per_hour: int = 20
 
     @property
     def webhook_enabled(self) -> bool:
@@ -96,5 +110,13 @@ class Settings:
             meta_app_secret=(env.get(f"{ENV_PREFIX}META_APP_SECRET") or "").strip() or None,
             human_pause_minutes=int(
                 env.get(f"{ENV_PREFIX}HUMAN_PAUSE_MINUTES", defaults.human_pause_minutes)
+            ),
+            forwarded_allow_ips=(env.get(f"{ENV_PREFIX}FORWARDED_ALLOW_IPS") or "").strip()
+            or defaults.forwarded_allow_ips,
+            login_limit_per_minute=_positive(
+                env, "LOGIN_LIMIT_PER_MINUTE", defaults.login_limit_per_minute
+            ),
+            login_limit_per_hour=_positive(
+                env, "LOGIN_LIMIT_PER_HOUR", defaults.login_limit_per_hour
             ),
         )
