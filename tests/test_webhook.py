@@ -609,7 +609,7 @@ def test_sends_to_other_conversations_do_not_block_a_human_pause(
     echoed = []
 
     def send_and_echo(recipient_id, text):
-        # While each reply to someone else is in flight, Jorge answers PERSON by hand.
+        # While each reply to someone else is in flight, the operator answers PERSON by hand.
         echoed.append(human_echo(client, clock, mid=f"by-hand-{recipient_id}").status_code)
         return original(recipient_id, text)
 

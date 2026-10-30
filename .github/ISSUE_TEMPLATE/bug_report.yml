@@ -1,0 +1,58 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security vulnerabilities do not go here.** Report them privately as described in SECURITY.md.
+
+        **Do not paste** tokens, app secrets, verify tokens, passwords, the secret key, screenshots or
+        copies of conversations, comments or messages, or other people's usernames or ids. Issues are
+        public. Replace anything sensitive with a placeholder such as `<token>` or `<user-id>`; if a
+        secret has already been exposed, revoke it.
+
+        There is no support: issues are read when possible, with no commitment.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps, ideally in simulation mode, which uses synthetic data.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit (`git rev-parse --short HEAD`) of your installation.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Simulation
+        - Real (connected to Instagram)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Only the relevant lines, with tokens, ids and usernames removed.
+      render: text
+  - type: checkboxes
+    id: no-secrets
+    attributes:
+      label: Privacy check
+      options:
+        - label: This issue contains no tokens, secrets, conversation screenshots or other people's identifiers.
+          required: true

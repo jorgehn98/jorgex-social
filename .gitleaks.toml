@@ -1,0 +1,11 @@
+# Secret scan configuration for gitleaks (run in CI over the full history).
+# Keep the default rules; allow only the exact placeholder token used in the documentation examples.
+# Not restricted by path on purpose: a path allowlist makes gitleaks skip the whole file, so a real
+# token next to the placeholder would go unnoticed.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Placeholder API token in the documentation examples"
+regexes = ['''^jxs_your_token_here$''']

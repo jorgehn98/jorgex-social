@@ -1,0 +1,4 @@
+blank_issues_enabled: false
+# Security reports go through private vulnerability reporting, as SECURITY.md explains. GitHub adds
+# its own "Report a security vulnerability" entry to the issue chooser once that is enabled, so no
+# contact link is needed here (contact_links only takes absolute URLs, which would name the owner).
