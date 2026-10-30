@@ -13,6 +13,7 @@ import contextlib
 import functools
 import inspect
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
@@ -32,6 +33,8 @@ from starlette.routing import Route
 from jorgex_social.remote_mcp import uploads
 from jorgex_social_mcp.client import Api, ApiError, Body
 from jorgex_social_mcp.server import INSTRUCTIONS, WRITE, tool_definitions
+
+log = logging.getLogger(__name__)
 
 # Requests made in process carry no forwarding header, so the app does not take them for the
 # proxy's (access/proxy.py), and only the token of the MCP request.
@@ -71,8 +74,14 @@ class InProcessTools:
 
     async def _send(self, method: str, url: str, headers: dict[str, str], body: Body):
         asgi = httpx2.ASGITransport(app=self.app)
-        async with httpx2.AsyncClient(transport=asgi) as client:
-            response = await client.request(method, url, headers=headers, content=body)
+        try:
+            async with httpx2.AsyncClient(transport=asgi) as client:
+                response = await client.request(method, url, headers=headers, content=body)
+        except Exception:
+            # What uvicorn would log for a request over the network, and what the agent would
+            # get: a 500. Method and path only: the query and headers may carry anything.
+            log.exception("in-process %s %s failed", method, urlsplit(url).path)
+            return 500, b"Internal Server Error"
         return response.status_code, response.content
 
     def tool(self, template: Callable[..., str]) -> Callable[..., Any]:

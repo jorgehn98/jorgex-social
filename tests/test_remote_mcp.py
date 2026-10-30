@@ -236,6 +236,29 @@ async def test_a_tool_call_does_not_block_the_event_loop(app, agent, browser, mo
     assert results["tool"][0] == "ok"
 
 
+@pytest.mark.anyio
+async def test_a_crash_in_process_is_logged_and_reaches_the_agent_as_a_500(
+    app, agent, browser, monkeypatch, caplog
+):
+    _, tokens = connect(agent, browser, posts="read")
+
+    class BrokenCatalog(dict):
+        def items(self):
+            raise RuntimeError("catalog exploded")
+
+    monkeypatch.setattr(catalog, "CATALOG", BrokenCatalog())
+
+    async with mcp_client(app, headers=bearer(tokens["access_token"])) as client:
+        outcome, error = await call(client, "get_catalog")
+
+    assert outcome == "error"
+    assert (error["status"], error["code"]) == (500, "http_error")
+    crash = [r for r in caplog.records if r.name == "jorgex_social.remote_mcp.server"]
+    assert crash and crash[0].getMessage() == "in-process GET /v1/catalog failed"
+    assert "catalog exploded" in caplog.text
+    assert tokens["access_token"] not in caplog.text
+
+
 def test_without_a_public_url_there_is_no_mcp(settings, clock):
     without = TestClient(create_app(replace(settings, public_url=None), clock))
 
