@@ -57,10 +57,12 @@ def _usable(session: Session, token: str, now: datetime) -> UploadUrl | None:
     found = session.get(UploadUrl, hash_token(token))
     if found is None or found.used_at is not None or found.expires_at <= now:
         return None
-    # Revoking the grant kills its URLs. Its permissions never change, and issuing one already
-    # needed posts:write.
+    # Revoking the grant or reaching its end kills its URLs. Its permissions never change, and
+    # issuing one already needed posts:write.
     grant = session.get(OAuthGrant, found.grant_id)
-    return found if grant is not None and grant.revoked_at is None else None
+    if grant is None or grant.revoked_at is not None or oauth.grant_end(grant) <= now:
+        return None
+    return found
 
 
 def spend(state, token: str) -> str | None:

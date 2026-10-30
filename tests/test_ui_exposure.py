@@ -45,7 +45,12 @@ def enrolled(app, settings, clock):
     with app.state.sessionmaker() as session, session.begin():
         operator.create_operator(session, PASSWORD, earlier)
         operator.enroll_totp(
-            session, key, TOTP_SECRET, pyotp.TOTP(TOTP_SECRET).at(earlier), earlier
+            session,
+            app.state.network,
+            key,
+            TOTP_SECRET,
+            pyotp.TOTP(TOTP_SECRET).at(earlier),
+            earlier,
         )
 
 

@@ -1,6 +1,7 @@
 """Append-only audit log: every authenticated API request that writes, and the transitions the
 worker makes on its own. Entries carry identifiers only: never a request body, a secret or
-third-party text."""
+third-party text. The one exception to append-only is old denied sign-ins, which anyone can make
+it write (access/operator.py purges them)."""
 
 import logging
 from datetime import datetime

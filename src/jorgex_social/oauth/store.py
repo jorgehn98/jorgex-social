@@ -19,6 +19,9 @@ from jorgex_social.oauth.models import OAuthClient, OAuthCode, OAuthGrant, OAuth
 
 ACCESS_LIFETIME = timedelta(hours=1)
 REFRESH_LIFETIME = timedelta(days=30)
+# Counted from the grant's creation: however often its tokens are refreshed, a stolen one stops
+# working by then, and the client goes through consent again.
+GRANT_LIFETIME = timedelta(days=90)
 CODE_LIFETIME = timedelta(seconds=60)
 REQUEST_LIFETIME = timedelta(minutes=10)
 # A registered client nobody approved is forgotten after this: registration is open to anyone.
@@ -51,6 +54,7 @@ class Issued:
     access: str
     refresh: str
     grant_id: str
+    expires_in: timedelta  # the access token's: less than ACCESS_LIFETIME near the grant's end
 
 
 @dataclass(frozen=True)
@@ -245,7 +249,12 @@ def find_code(session: Session, code: str, client_id: str, now: datetime) -> OAu
     return found
 
 
+def grant_end(grant: OAuthGrant) -> datetime:
+    return grant.created_at + GRANT_LIFETIME
+
+
 def _issue(session: Session, grant: OAuthGrant, parent_hash: str | None, now: datetime) -> Issued:
+    end = grant_end(grant)
     access = ACCESS_PREFIX + secrets.token_urlsafe(32)
     refresh = REFRESH_PREFIX + secrets.token_urlsafe(32)
     for secret, kind, lifetime in (
@@ -259,10 +268,10 @@ def _issue(session: Session, grant: OAuthGrant, parent_hash: str | None, now: da
                 kind=kind,
                 parent_hash=parent_hash,
                 created_at=now,
-                expires_at=now + lifetime,
+                expires_at=min(now + lifetime, end),
             )
         )
-    return Issued(access, refresh, grant.id)
+    return Issued(access, refresh, grant.id, min(ACCESS_LIFETIME, end - now))
 
 
 def _end(session: Session, grant: OAuthGrant, now: datetime, reason: str, **who) -> None:
@@ -313,6 +322,8 @@ def _live_refresh(
         return None
     grant = session.get(OAuthGrant, found.grant_id)
     if grant is None or grant.revoked_at is not None or grant.client_id != client_id:
+        return None
+    if grant_end(grant) <= now:
         return None
     return found, grant
 
@@ -395,7 +406,7 @@ def find_access(
     if found is None or found.kind != ACCESS or found.expires_at <= now:
         return None
     grant = session.get(OAuthGrant, found.grant_id)
-    if grant is None or grant.revoked_at is not None:
+    if grant is None or grant.revoked_at is not None or grant_end(grant) <= now:
         return None
     if resource is not None and grant.resource != resource:
         return None
@@ -463,6 +474,7 @@ def list_grants(session: Session) -> list[dict[str, Any]]:
             "client_name": name,
             "permissions": grant.permissions,
             "created_at": grant.created_at.isoformat(),
+            "expires_at": grant_end(grant).isoformat(),
             "revoked_at": grant.revoked_at and grant.revoked_at.isoformat(),
         }
         for grant, name in rows

@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from mcp.client.auth import OAuthClientProvider
 from mcp.server.auth.provider import TokenError
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from jorgex_social.access import operator
 from jorgex_social.account import crypto
@@ -24,6 +24,8 @@ from jorgex_social.api import create_app
 from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
+from jorgex_social.oauth import store
+from jorgex_social.oauth.models import OAuthGrant, OAuthToken
 
 PUBLIC = "http://localhost"
 RESOURCE = f"{PUBLIC}/mcp"
@@ -52,7 +54,12 @@ def app(settings, clock):
     with app.state.sessionmaker() as session, session.begin():
         operator.create_operator(session, PASSWORD, earlier)
         operator.enroll_totp(
-            session, key, TOTP_SECRET, pyotp.TOTP(TOTP_SECRET).at(earlier), earlier
+            session,
+            app.state.network,
+            key,
+            TOTP_SECRET,
+            pyotp.TOTP(TOTP_SECRET).at(earlier),
+            earlier,
         )
     return app
 
@@ -840,12 +847,17 @@ def test_changing_the_credentials_ends_every_grant(app, settings, agent, browser
     _, tokens = connect(agent, browser, posts="read")
     with app.state.sessionmaker() as session, session.begin():
         if change == "password":
-            operator.set_password(session, "another long password", clock.now())
+            operator.set_password(session, app.state.network, "another long password", clock.now())
         else:
             key = crypto.load_key(settings.secret_key_file)
             code = pyotp.TOTP(TOTP_SECRET).at(clock.now() + timedelta(minutes=5))
             operator.enroll_totp(
-                session, key, TOTP_SECRET, code, clock.now() + timedelta(minutes=5)
+                session,
+                app.state.network,
+                key,
+                TOTP_SECRET,
+                code,
+                clock.now() + timedelta(minutes=5),
             )
 
     assert api(agent, tokens["access_token"]).status_code == 401
@@ -886,3 +898,47 @@ def test_the_cli_can_revoke_every_grant(settings, agent, browser, monkeypatch, c
     assert json.loads(capsys.readouterr().out) == {"revoked": 2}
     assert api(agent, first["access_token"]).status_code == 401
     assert api(agent, second["access_token"]).status_code == 401
+
+
+# The grant's absolute lifetime
+
+
+def age_grant(app, age: timedelta, now: datetime) -> None:
+    with app.state.sessionmaker() as session, session.begin():
+        session.scalar(select(OAuthGrant)).created_at = now - age
+
+
+def test_a_grant_past_its_lifetime_is_gone_until_the_operator_consents_again(
+    app, agent, browser, clock
+):
+    client_id, tokens = connect(agent, browser, posts="read")
+    assert api(agent, tokens["access_token"]).status_code == 200
+
+    # Tokens still within their own lifetimes, as a grant older than 90 days has on upgrade.
+    age_grant(app, store.GRANT_LIFETIME, clock.now())
+
+    assert api(agent, tokens["access_token"]).status_code == 401
+    assert refresh(agent, client_id, tokens["refresh_token"]).json()["error"] == "invalid_grant"
+    assert not grant_revoked(app)  # it ran out; nobody ended it
+
+    _, verifier, code = code_for(agent, browser, client_id=client_id, posts="read")
+    renewed = exchange(agent, client_id, code, verifier).json()
+    assert api(agent, renewed["access_token"]).status_code == 200
+
+
+def test_tokens_issued_near_the_end_of_a_grant_do_not_outlive_it(app, agent, browser, clock):
+    client_id, tokens = connect(agent, browser, posts="read")
+    age_grant(app, store.GRANT_LIFETIME - timedelta(minutes=30), clock.now())
+
+    renewed = refresh(agent, client_id, tokens["refresh_token"]).json()
+
+    assert renewed["expires_in"] == 1800
+    with app.state.read_sessionmaker() as session:
+        live = session.scalars(select(OAuthToken).where(OAuthToken.used_at.is_(None))).all()
+    assert {token.expires_at for token in live} == {clock.now() + timedelta(minutes=30)}
+    assert api(agent, renewed["access_token"]).status_code == 200
+
+    clock.advance(minutes=30)
+
+    assert api(agent, renewed["access_token"]).status_code == 401
+    assert refresh(agent, client_id, renewed["refresh_token"]).json()["error"] == "invalid_grant"

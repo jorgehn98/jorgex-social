@@ -13,13 +13,13 @@ from pathlib import Path
 import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from jorgex_social.access.models import Operator, OperatorSession
 from jorgex_social.access.tokens import hash_token
-from jorgex_social.account import audit, crypto
-from jorgex_social.account.models import ActorType, Outcome
+from jorgex_social.account import audit, crypto, incidents
+from jorgex_social.account.models import ActorType, AuditEntry, IncidentType, Outcome
 from jorgex_social.oauth import store as oauth
 
 log = logging.getLogger(__name__)
@@ -28,6 +28,14 @@ SESSION_LIFETIME = timedelta(hours=12)
 IDLE_TIMEOUT = timedelta(hours=1)
 # last_activity_at is only as precise as this, so browsing does not write on every page.
 ACTIVITY_RESOLUTION = timedelta(minutes=1)
+LOGIN = "operator.login"
+CREDENTIAL_CHANGES = ("operator.password_set", "operator.totp_enrolled")
+# A denied sign-in is the one audit row anyone on the internet can make the service write.
+DENIED_LOGIN_RETENTION = timedelta(days=90)
+# A right password with a wrong code this many times means the password may have leaked. Fewer
+# could be the operator mistyping, or reusing a code within its 30 seconds.
+WRONG_CODE_LIMIT = 3
+WRONG_CODE_WINDOW = timedelta(hours=1)
 MIN_PASSWORD_LENGTH = 12
 TOTP_CONTEXT = "operator/totp"
 TOTP_ISSUER = "jorgex-social"
@@ -58,11 +66,12 @@ def get_operator(session: Session) -> Operator | None:
     return session.scalar(select(Operator))
 
 
-def _end_sessions(session: Session, now: datetime) -> None:
+def _end_sessions(session: Session, network: str, now: datetime) -> None:
     """Every browser signs out and every OAuth grant ends: they were all given on the strength of
-    the credentials that just changed."""
+    the credentials that just changed. Changing them also removes what the incident warns of."""
     session.execute(delete(OperatorSession))
     oauth.revoke_all(session, now, "credentials_changed")
+    incidents.sync(session, network, IncidentType.SIGN_IN_PASSWORD_ACCEPTED, False, now)
 
 
 def _hash_password(password: str) -> str:
@@ -71,7 +80,14 @@ def _hash_password(password: str) -> str:
     return _hasher.hash(password)
 
 
-def _audit(session: Session, now: datetime, action: str, operator: Operator, outcome=Outcome.OK):
+def _audit(
+    session: Session,
+    now: datetime,
+    action: str,
+    operator: Operator,
+    outcome=Outcome.OK,
+    detail: dict[str, str] | None = None,
+):
     audit.record(
         session,
         now,
@@ -80,6 +96,7 @@ def _audit(session: Session, now: datetime, action: str, operator: Operator, out
         actor_type=ActorType.OPERATOR,
         object_type="operator",
         object_id=operator.id,
+        detail=detail,
     )
 
 
@@ -93,13 +110,13 @@ def create_operator(session: Session, password: str, now: datetime) -> Operator:
     return operator
 
 
-def set_password(session: Session, password: str, now: datetime) -> Operator:
-    """Also signs every browser out and ends every OAuth grant."""
+def set_password(session: Session, network: str, password: str, now: datetime) -> Operator:
+    """Also signs every browser out, ends every OAuth grant and closes the incident."""
     operator = get_operator(session)
     if operator is None:
         raise OperatorError("there is no operator yet; run create-operator first")
     operator.password_hash = _hash_password(password)
-    _end_sessions(session, now)
+    _end_sessions(session, network, now)
     _audit(session, now, "operator.password_set", operator)
     return operator
 
@@ -130,9 +147,12 @@ def totp_step(secret: str, code: str, now: datetime, after: int | None) -> int |
     return None
 
 
-def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datetime) -> None:
+def enroll_totp(
+    session: Session, network: str, key: bytes, secret: str, code: str, now: datetime
+) -> None:
     """Stores `secret` only once `code` proves the authenticator app has it. Signs every browser
-    out and ends every OAuth grant, since the old second factor no longer applies."""
+    out, ends every OAuth grant and closes the incident, since the old second factor no longer
+    applies."""
     operator = get_operator(session)
     if operator is None:
         raise OperatorError("there is no operator yet; run create-operator first")
@@ -141,7 +161,7 @@ def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datet
         raise OperatorError("the code does not match; check the device's clock and try again")
     operator.totp_secret_encrypted = crypto.encrypt(key, secret, TOTP_CONTEXT)
     operator.totp_last_step = step  # the confirmation code cannot then sign in
-    _end_sessions(session, now)
+    _end_sessions(session, network, now)
     _audit(session, now, "operator.totp_enrolled", operator)
 
 
@@ -161,18 +181,48 @@ def _password_matches(password_hash: str, password: str) -> bool:
         _password_attempts.release()
 
 
+def _wrong_codes(session: Session, now: datetime) -> int:
+    """Right-password denials in the last WRONG_CODE_WINDOW, counted from the last time the
+    operator got in or changed the credentials: older ones are about credentials since proved or
+    replaced. occurred_at's index bounds both queries to the window."""
+    recent = AuditEntry.occurred_at > now - WRONG_CODE_WINDOW
+    is_login = AuditEntry.action == LOGIN
+    reset = session.scalar(
+        select(func.max(AuditEntry.occurred_at)).where(
+            recent,
+            or_(
+                and_(is_login, AuditEntry.outcome == Outcome.OK),
+                AuditEntry.action.in_(CREDENTIAL_CHANGES),
+            ),
+        )
+    )
+    return session.scalar(
+        select(func.count())
+        .select_from(AuditEntry)
+        .where(
+            AuditEntry.occurred_at > reset if reset else recent,
+            is_login,
+            AuditEntry.outcome == Outcome.DENIED,
+            AuditEntry.detail["reason"].as_string() == "wrong_code",
+        )
+    )
+
+
 def log_in(
     write: sessionmaker,
     read: sessionmaker,
     key_file: Path,
+    network: str,
     password: str,
     code: str,
+    client: str,
     now: datetime,
 ) -> str | None:
     """Returns a new session id, or None whatever the reason, so the caller cannot tell the
-    reasons apart. Raises Busy when no password check slot frees up in time. The checks read
-    in a deferred transaction and run outside any transaction; the write lock is taken only to
-    record the outcome, and never when there is no operator or the code is malformed."""
+    reasons apart: only the audit detail does. Raises Busy when no password check slot frees up
+    in time. The checks read in a deferred transaction and run outside any transaction; the write
+    lock is taken only to record the outcome, and never when there is no operator or the code is
+    malformed."""
     if not TOTP_CODE.fullmatch(code.strip()):
         # Not even shaped like a code (the form only sends six digits): refused before paying
         # for an argon2 check. It says nothing about the password, so it needs no record.
@@ -182,7 +232,8 @@ def log_in(
     if operator is None:
         return None
     step = None
-    if _password_matches(operator.password_hash, password):
+    password_matched = _password_matches(operator.password_hash, password)
+    if password_matched:
         if operator.totp_secret_encrypted is None:
             log.warning("sign-in refused: the operator has no TOTP enrolled; run enroll-totp")
         else:
@@ -196,12 +247,18 @@ def log_in(
         current = get_operator(session)
         if current is None:
             return None
-        still_valid = (
-            current.password_hash == operator.password_hash
-            and current.totp_last_step == operator.totp_last_step
-        )
-        if step is not None and still_valid:
+        same_password = current.password_hash == operator.password_hash
+        if step is not None and same_password and current.totp_last_step == operator.totp_last_step:
             current.totp_last_step = step
+            # Only here: it scans every audit row older than the retention under the write lock,
+            # and anyone on the internet can reach the denied path.
+            session.execute(
+                delete(AuditEntry).where(
+                    AuditEntry.action == LOGIN,
+                    AuditEntry.outcome == Outcome.DENIED,
+                    AuditEntry.occurred_at <= now - DENIED_LOGIN_RETENTION,
+                )
+            )
             session_id = secrets.token_urlsafe(32)
             session.execute(delete(OperatorSession).where(OperatorSession.expires_at <= now))
             session.add(
@@ -213,9 +270,23 @@ def log_in(
                     last_activity_at=now,
                 )
             )
-            _audit(session, now, "operator.login", current)
+            _audit(session, now, LOGIN, current, detail={"client": client})
             return session_id
-        _audit(session, now, "operator.login", current, Outcome.DENIED)
+        wrong_code = password_matched and same_password
+        detail = {"client": client, "reason": "wrong_code"} if wrong_code else {"client": client}
+        _audit(session, now, LOGIN, current, Outcome.DENIED, detail)
+        # Counted for every denial, so a wrong password runs the same statements as a wrong code
+        # and takes as long.
+        count = _wrong_codes(session, now)
+        if wrong_code and count >= WRONG_CODE_LIMIT:
+            incidents.sync(
+                session,
+                network,
+                IncidentType.SIGN_IN_PASSWORD_ACCEPTED,
+                True,
+                now,
+                {"wrong_codes": count},
+            )
         return None
 
 

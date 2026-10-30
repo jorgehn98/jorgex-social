@@ -140,7 +140,11 @@ def list_incidents(
     limit: Limit = 100,
     offset: Offset = 0,
 ):
-    """Newest first. `open=true` lists the ones whose cause is still there."""
+    """Newest first. `open=true` lists the ones whose cause is still there.
+
+    `sign_in_password_accepted` means sign-ins with the right password kept failing on the code,
+    so the password may have leaked. It needs the operator: if it was not them, they change the
+    password (`set-password`), which is what closes it; signing in does not."""
     query = select(ChannelIncident).where(ChannelIncident.network == request.app.state.network)
     if open is not None:
         closed = ChannelIncident.closed_at

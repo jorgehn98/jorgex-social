@@ -7,6 +7,7 @@
     <span class="wordmark">Jorge<span class="x">X</span> Social</span>
     <h1>Sign in</h1>
     {% if error %}<p class="notice" role="alert">{{ error }}</p>{% endif %}
+    <input type="text" name="username" value="operator" autocomplete="username" hidden>
     <label for="password">Password</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
     <label for="code">Authenticator code</label>
