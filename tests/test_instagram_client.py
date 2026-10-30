@@ -298,3 +298,104 @@ def test_a_credential_source_is_asked_on_every_call():
         ("1784", "Bearer first-not-real"),
         ("2048", "Bearer second-not-real"),
     ]
+
+
+def test_comments_ask_only_for_the_author_id_and_page_with_the_cursor():
+    first = {
+        "data": [
+            {
+                "id": "c1",
+                "text": "third-party text",
+                "timestamp": "2026-10-29T12:00:00+0000",
+                "from": {"id": "u1", "username": "someone"},
+            }
+        ],
+        "paging": {"cursors": {"after": "A"}, "next": "https://graph.instagram.com/next"},
+    }
+    second = {"data": [{"id": "c2", "timestamp": "2026-10-29T12:01:00+0000"}]}
+    ig, transport = client((200, first), (200, second))
+
+    comments = ig.list_comments("m1")
+
+    assert [(c.id, c.author_id, c.text) for c in comments] == [
+        ("c1", "u1", "third-party text"),
+        ("c2", None, ""),
+    ]
+    assert comments[0].timestamp == datetime(2026, 10, 29, 12, tzinfo=UTC)
+    assert "someone" not in repr(comments) and "third-party" not in repr(comments)
+    assert urlsplit(transport.calls[0][1]).path.endswith("/m1/comments")
+    assert query(transport.calls[0][1])["fields"] == "id,text,timestamp,from{id}"
+    assert query(transport.calls[1][1])["after"] == "A"
+
+
+def test_conversations_stop_at_the_first_one_older_than_since():
+    page = {
+        "data": [
+            {"id": "t1", "updated_time": "2026-10-29T12:00:00+0000"},
+            {"id": "t2", "updated_time": "2026-10-27T12:00:00+0000"},
+        ],
+        "paging": {"cursors": {"after": "A"}, "next": "https://graph.instagram.com/next"},
+    }
+    ig, transport = client((200, page))
+
+    found = ig.list_conversations(since=datetime(2026, 10, 28, tzinfo=UTC))
+
+    assert [c.id for c in found] == ["t1"]
+    assert len(transport.calls) == 1
+    assert query(transport.calls[0][1])["platform"] == "instagram"
+    assert urlsplit(transport.calls[0][1]).path.endswith("/1784/conversations")
+
+
+def test_messages_of_a_conversation():
+    payload = {
+        "id": "t1",
+        "messages": {
+            "data": [
+                {
+                    "id": "mid1",
+                    "created_time": "2026-10-29T12:00:00+0000",
+                    "from": {"id": "u1", "username": "someone"},
+                    "message": "hello",
+                },
+                {"id": "mid2", "created_time": "2026-10-29T11:00:00+0000", "from": {"id": "1784"}},
+            ]
+        },
+    }
+    ig, transport = client((200, payload))
+
+    messages = ig.list_messages("t1")
+
+    assert [(m.id, m.sender_id, m.text) for m in messages] == [
+        ("mid1", "u1", "hello"),
+        ("mid2", "1784", ""),
+    ]
+    assert query(transport.calls[0][1]) == {"fields": "messages{id,created_time,from{id},message}"}
+
+
+def test_replies_and_messages_go_to_the_documented_endpoints():
+    ig, transport = client(
+        (200, {"id": "r1"}),
+        (200, {"recipient_id": "u1", "message_id": "mid1"}),
+        (200, {"recipient_id": "u2", "message_id": "mid2"}),
+    )
+
+    results = (
+        ig.reply_public("c1", "Thanks!"),
+        ig.reply_private("c1", "Sent"),
+        ig.send_message("u2", "Hi"),
+    )
+
+    assert results == ("r1", "mid1", "mid2")
+    sent = [(m, urlsplit(u).path, parse_qs(b.decode())) for m, u, _, b in transport.calls]
+    assert sent[0] == ("POST", "/v26.0/c1/replies", {"message": ["Thanks!"]})
+    assert sent[1][:2] == ("POST", "/v26.0/1784/messages")
+    assert json.loads(sent[1][2]["recipient"][0]) == {"comment_id": "c1"}
+    assert json.loads(sent[1][2]["message"][0]) == {"text": "Sent"}
+    assert json.loads(sent[2][2]["recipient"][0]) == {"id": "u2"}
+
+
+def test_a_send_without_a_message_id_is_unavailable():
+    ig, _ = client((200, {"recipient_id": "u1"}))
+
+    with pytest.raises(Unavailable):
+        ig.reply_private("c1", "Sent")

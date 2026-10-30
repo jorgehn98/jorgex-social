@@ -144,9 +144,9 @@ def acknowledge_incident(incident_id: str, request: Request, session: SessionDep
 
 @router.put("/kill-switch", response_model=KillSwitchOut, dependencies=AccountWrite)
 def set_kill_switch(body: KillSwitchIn, request: Request, session: SessionDep):
-    """On: the worker stops writing to the network (no containers, no publishing). Scheduled
-    posts stay scheduled; those past the grace window when it is turned off fail as
-    `missed_schedule` and can be rescheduled."""
+    """On: the worker stops writing to the network (no containers, no publishing, no replies).
+    Scheduled posts stay scheduled; those past the grace window when it is turned off fail as
+    `missed_schedule` and can be rescheduled. Replies due while it is on are skipped."""
     audit.set_detail(request, {"enabled": body.enabled})
     setting = kill_switch.set_state(session, body.enabled, request.app.state.clock.now())
     return KillSwitchOut(enabled=setting.value, updated_at=setting.updated_at)

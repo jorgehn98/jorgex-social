@@ -31,6 +31,23 @@ PostType = Annotated[
     str, Field(description="Post type: one of the keys of get_catalog's post_types.")
 ]
 CLEARABLE = Literal["cover_media_id", "thumb_offset_ms", "source_ref"]
+Channel = Annotated[
+    str, Field(description="comment (top-level comments on posts) or message (direct messages).")
+]
+RuleId = Annotated[str, Field(description="Rule id, as returned by create_rule or list_rules.")]
+RuleContent = Annotated[
+    dict[str, Any],
+    Field(
+        description="keywords (list, required), exclude (list), match (word, contains or "
+        "exact; default word), public_replies (comment rules only) and private_replies (the "
+        "private reply to a comment, or the answer to a message): lists of variants, one picked "
+        "at random. Matching ignores case and accents. The API validates it and says what is "
+        "wrong."
+    ),
+]
+ConversationId = Annotated[
+    str, Field(description="Conversation id, as returned by list_conversations or list_events.")
+]
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
@@ -303,10 +320,182 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         return call("POST", "/v1/account/incidents/{}/acknowledge", incident_id)
 
     def set_kill_switch(enabled: bool) -> str:
-        """On: the service stops writing to the network (no publishing); scheduled posts stay
-        scheduled. Off: it resumes, and posts past their grace window fail as missed_schedule
-        and can be rescheduled."""
+        """On: the service stops writing to the network (no publishing, no replies); scheduled
+        posts stay scheduled and replies due meanwhile are skipped. Off: it resumes, and posts
+        past their grace window fail as missed_schedule and can be rescheduled."""
         return call("PUT", "/v1/account/kill-switch", json_body={"enabled": enabled})
+
+    # rules
+
+    def list_rules(
+        channel: Annotated[str | None, Field(description="comment or message.")] = None,
+        active: bool | None = None,
+        archived: Annotated[
+            bool | None, Field(description="true: only archived rules, which are hidden otherwise.")
+        ] = None,
+        limit: Limit = None,
+        offset: Offset = None,
+    ) -> str:
+        """Automatic reply rules in the order they are tried: lower priority first, then the
+        oldest. The first rule that matches an event wins."""
+        query = {"channel": channel, "active": active, "archived": archived, "limit": limit}
+        return call("GET", "/v1/rules", query={**query, "offset": offset})
+
+    def get_rule(rule_id: RuleId) -> str:
+        """One rule with its content."""
+        return call("GET", "/v1/rules/{}", rule_id)
+
+    def test_rules(
+        channel: Channel,
+        text: Annotated[str, Field(description="A sample comment or message.")],
+        media_ref: Annotated[
+            str | None, Field(description="Instagram media id the comment would be on.")
+        ] = None,
+        rule_id: Annotated[
+            str | None,
+            Field(description="Test this rule, even if inactive; otherwise the active rules."),
+        ] = None,
+    ) -> str:
+        """Which rule a sample text would fire and which variants it could send. Stores nothing
+        and sends nothing."""
+        body = {"channel": channel, "text": text, "media_ref": media_ref, "rule_id": rule_id}
+        return call(
+            "POST", "/v1/rules/test", json_body={k: v for k, v in body.items() if v is not None}
+        )
+
+    def create_rule(
+        name: str,
+        channel: Channel,
+        content: RuleContent,
+        media_ref: Annotated[
+            str | None,
+            Field(description="Only comments on this Instagram media id; omit for every post."),
+        ] = None,
+        priority: Annotated[int | None, Field(description="Lower is tried first.")] = None,
+    ) -> str:
+        """Create an inactive rule. It answers nothing until activate_rule."""
+        body = {
+            "name": name,
+            "channel": channel,
+            "content": content,
+            "media_ref": media_ref,
+            "priority": priority,
+        }
+        return call("POST", "/v1/rules", json_body={k: v for k, v in body.items() if v is not None})
+
+    def update_rule(
+        rule_id: RuleId,
+        name: str | None = None,
+        content: Annotated[
+            RuleContent | None, Field(description="Replaces the whole content.")
+        ] = None,
+        media_ref: str | None = None,
+        priority: int | None = None,
+        clear: Annotated[
+            list[Literal["media_ref"]] | None,
+            Field(description="media_ref: apply the rule to every post."),
+        ] = None,
+    ) -> str:
+        """Edit a rule; only the fields given change. An active rule keeps answering, with the
+        new content from now on. Archived rules cannot be edited."""
+        given = {"name": name, "content": content, "media_ref": media_ref, "priority": priority}
+        given = {k: v for k, v in given.items() if v is not None}
+        both = sorted(set(clear or []) & set(given))
+        if both:
+            raise _local_error("invalid_value", f"Both given and cleared: {', '.join(both)}.")
+        body: dict[str, Any] = {field: None for field in clear or []} | given
+        return call("PATCH", "/v1/rules/{}", rule_id, json_body=body)
+
+    def activate_rule(rule_id: RuleId) -> str:
+        """Start answering with this rule on the real account, unless the service runs in
+        simulation. Only comments and messages written from now on fire it."""
+        return call("POST", "/v1/rules/{}/activate", rule_id)
+
+    def deactivate_rule(rule_id: RuleId) -> str:
+        """Stop answering with this rule. Replies already queued are still sent."""
+        return call("POST", "/v1/rules/{}/deactivate", rule_id)
+
+    def archive_rule(rule_id: RuleId) -> str:
+        """Deactivate and archive a rule. It can no longer be edited or activated."""
+        return call("POST", "/v1/rules/{}/archive", rule_id)
+
+    def pause_conversation(
+        conversation_id: ConversationId,
+        until: Annotated[
+            str | None, Field(description="ISO 8601 with offset, in the future.")
+        ] = None,
+        forever: Annotated[bool | None, Field(description="true: until resumed.")] = None,
+    ) -> str:
+        """Stop automatic messages to one person, until a time or until resumed; give exactly
+        one of until or forever. Queued messages to them are skipped."""
+        body = {"until": until, "forever": forever}
+        return call(
+            "POST",
+            "/v1/conversations/{}/pause",
+            conversation_id,
+            json_body={k: v for k, v in body.items() if v is not None},
+        )
+
+    def resume_conversation(conversation_id: ConversationId) -> str:
+        """Lift a pause. What was skipped while paused is not sent afterwards."""
+        return call("POST", "/v1/conversations/{}/resume", conversation_id)
+
+    # events
+
+    def list_events(
+        type: Annotated[str | None, Field(description="comment or message.")] = None,
+        rule_id: str | None = None,
+        matched: Annotated[
+            bool | None, Field(description="true: fired a rule; false: fired none.")
+        ] = None,
+        limit: Limit = None,
+        offset: Offset = None,
+    ) -> str:
+        """Comments and messages seen, newest first: identifiers and the rule they fired. Their
+        text and authors are never stored, so they are not here."""
+        query = {"type": type, "rule_id": rule_id, "matched": matched, "limit": limit}
+        return call("GET", "/v1/events", query={**query, "offset": offset})
+
+    def list_deliveries(
+        status: Annotated[
+            str | None, Field(description="pending, sent, failed or skipped.")
+        ] = None,
+        reason: Annotated[
+            str | None,
+            Field(
+                description="Why skipped or failed: kill_switch, paused, window_closed, "
+                "cooldown, hourly_cap, refused or unknown."
+            ),
+        ] = None,
+        action: Annotated[
+            str | None, Field(description="public_reply, private_reply or message.")
+        ] = None,
+        rule_id: str | None = None,
+        event_id: str | None = None,
+        limit: Limit = None,
+        offset: Offset = None,
+    ) -> str:
+        """Automatic replies, newest first: what was sent, or why not."""
+        query = {
+            "status": status,
+            "reason": reason,
+            "action": action,
+            "rule_id": rule_id,
+            "event_id": event_id,
+            "limit": limit,
+        }
+        return call("GET", "/v1/deliveries", query={**query, "offset": offset})
+
+    def list_conversations(
+        paused: bool | None = None, limit: Limit = None, offset: Offset = None
+    ) -> str:
+        """People who wrote by direct message, most recent first, with their 24-hour window and
+        pause."""
+        return call(
+            "GET",
+            "/v1/conversations",
+            query={"paused": paused, "limit": limit, "offset": offset},
+        )
 
     return [
         ("posts", "read", get_catalog, READ),
@@ -327,6 +516,19 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         ("account", "read", audit_log, READ),
         ("account", "write", acknowledge_incident, WRITE),
         ("account", "write", set_kill_switch, WRITE),
+        ("rules", "read", list_rules, READ),
+        ("rules", "read", get_rule, READ),
+        ("rules", "read", test_rules, READ),
+        ("rules", "write", create_rule, WRITE),
+        ("rules", "write", update_rule, WRITE),
+        ("rules", "write", activate_rule, ON_ACCOUNT),
+        ("rules", "write", deactivate_rule, WRITE),
+        ("rules", "write", archive_rule, WRITE),
+        ("rules", "write", pause_conversation, WRITE),
+        ("rules", "write", resume_conversation, WRITE),
+        ("events", "read", list_events, READ),
+        ("events", "read", list_deliveries, READ),
+        ("events", "read", list_conversations, READ),
     ]
 
 
@@ -344,8 +546,9 @@ def build_server(api: Api) -> MCPServer:
         )
     server = MCPServer(
         "jorgex-social",
-        instructions="Prepare, schedule and review posts of one Instagram account through the "
-        "jorgex-social API. Errors carry a stable `code`; decide by it.",
+        instructions="Prepare, schedule and review posts, and manage automatic reply rules, of "
+        "one Instagram account through the jorgex-social API. Errors carry a stable `code`; "
+        "decide by it.",
     )
     for group, level, tool, annotations in _tools(api):
         if _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:

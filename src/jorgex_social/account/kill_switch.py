@@ -1,5 +1,5 @@
 """The kill switch: while on, nothing is written to the network (no containers, no publishing,
-and from step 7 no replies). Reads such as snapshots and connection checks go on."""
+no replies). Reads such as snapshots and connection checks go on."""
 
 from datetime import datetime
 

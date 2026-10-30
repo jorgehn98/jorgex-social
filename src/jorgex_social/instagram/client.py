@@ -2,6 +2,7 @@ import json
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from http.client import HTTPException
+from itertools import islice
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -10,9 +11,12 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from jorgex_social.instagram.errors import AuthError, RateLimited, Refused, Unavailable
 from jorgex_social.instagram.types import (
     Account,
+    Comment,
     ContainerRequest,
     ContainerStatus,
+    Conversation,
     Media,
+    Message,
     ProductType,
     PublishingLimit,
     Renewal,
@@ -46,6 +50,9 @@ ACCOUNT_METRICS = (
     "replies,profile_links_taps,website_clicks,profile_views"
 )
 MEDIA_FIELDS = "id,caption,media_product_type,media_type,permalink,timestamp"
+# Only the author's id is asked for: the username is third-party data the service has no use for.
+COMMENT_FIELDS = "id,text,timestamp,from{id}"
+MESSAGE_FIELDS = "messages{id,created_time,from{id},message}"
 RATE_LIMIT_CODES = {4, 17, 32, 613}
 AUTH_ERROR_CODE = 190
 
@@ -135,6 +142,28 @@ def _media(item: dict[str, Any]) -> Media | None:
         timestamp=datetime.fromisoformat(item["timestamp"]),
         caption=item.get("caption"),
     )
+
+
+def _author(item: dict[str, Any]) -> str | None:
+    author = item.get("from")
+    return str(author["id"]) if isinstance(author, dict) and author.get("id") else None
+
+
+def _parse_one(build: Callable[[dict[str, Any]], Any], item: Any) -> Any:
+    """None for a malformed item, which is dropped rather than failing the whole listing (and
+    never quoted, since it may hold third-party text)."""
+    try:
+        return build(item)
+    except KeyError, TypeError, ValueError, AttributeError:
+        return None
+
+
+def _parsed(build: Callable[[dict[str, Any]], Any], items) -> list:
+    return [x for x in (_parse_one(build, item) for item in items) if x is not None]
+
+
+def _conversation(item: dict[str, Any]) -> Conversation:
+    return Conversation(id=str(item["id"]), updated_at=datetime.fromisoformat(item["updated_time"]))
 
 
 class InstagramClient:
@@ -248,21 +277,8 @@ class InstagramClient:
 
     def list_media(self, max_items: int | None = None) -> list[Media]:
         """Feed posts and reels, newest first. Stories are not listed by this endpoint."""
-        items: list[Media] = []
-        after = None
-        while max_items is None or len(items) < max_items:
-            # Paged with the cursor, not paging.next, whose URL would carry the token.
-            page = self._call(
-                "GET",
-                "/{user_id}/media",
-                {"fields": MEDIA_FIELDS, "limit": PAGE_SIZE, "after": after},
-            )
-            items.extend(m for m in map(_media, page.get("data", [])) if m is not None)
-            paging = page.get("paging") or {}
-            after = (paging.get("cursors") or {}).get("after")
-            if "next" not in paging or not after:
-                break
-        return items if max_items is None else items[:max_items]
+        items = map(_media, self._pages("/{user_id}/media", {"fields": MEDIA_FIELDS}))
+        return list(islice((m for m in items if m is not None), max_items))
 
     def media_insights(self, media_id: str, product_type: ProductType) -> dict[str, Any]:
         data = self._call("GET", f"/{media_id}/insights", {"metric": MEDIA_METRICS[product_type]})
@@ -282,6 +298,69 @@ class InstagramClient:
             },
         )
         return _metrics(data.get("data", []))
+
+    def _pages(self, path: str, params: dict[str, Any]):
+        """Every item of a paged listing, page by page, following the cursor (never paging.next,
+        whose URL would carry the token)."""
+        after = None
+        while True:
+            page = self._call("GET", path, {**params, "limit": PAGE_SIZE, "after": after})
+            yield from page.get("data", [])
+            paging = page.get("paging") or {}
+            after = (paging.get("cursors") or {}).get("after")
+            if "next" not in paging or not after:
+                return
+
+    def list_comments(self, media_id: str) -> list[Comment]:
+        return _parsed(
+            lambda item: Comment(
+                id=str(item["id"]),
+                author_id=_author(item),
+                timestamp=datetime.fromisoformat(item["timestamp"]),
+                text=item.get("text") or "",
+            ),
+            self._pages(f"/{media_id}/comments", {"fields": COMMENT_FIELDS}),
+        )
+
+    def list_conversations(self, since: datetime | None = None) -> list[Conversation]:
+        # Assumes Instagram lists the most recently updated first, as its inbox does.
+        found = []
+        pages = self._pages(
+            "/{user_id}/conversations", {"platform": "instagram", "fields": "id,updated_time"}
+        )
+        for item in pages:
+            conversation = _parse_one(_conversation, item)
+            if conversation is None:
+                continue
+            if since is not None and conversation.updated_at < since:
+                break
+            found.append(conversation)
+        return found
+
+    def list_messages(self, conversation_id: str) -> list[Message]:
+        data = self._call("GET", f"/{conversation_id}", {"fields": MESSAGE_FIELDS})
+        return _parsed(
+            lambda item: Message(
+                id=str(item["id"]),
+                sender_id=_author(item),
+                created_at=datetime.fromisoformat(item["created_time"]),
+                text=item.get("message") or "",  # absent for attachments
+            ),
+            (data.get("messages") or {}).get("data", []),
+        )
+
+    def reply_public(self, comment_id: str, text: str) -> str:
+        return str(_field(self._call("POST", f"/{comment_id}/replies", {"message": text}), "id"))
+
+    def _send(self, recipient: dict[str, str], text: str) -> str:
+        params = {"recipient": json.dumps(recipient), "message": json.dumps({"text": text})}
+        return str(_field(self._call("POST", "/{user_id}/messages", params), "message_id"))
+
+    def reply_private(self, comment_id: str, text: str) -> str:
+        return self._send({"comment_id": comment_id}, text)
+
+    def send_message(self, recipient_id: str, text: str) -> str:
+        return self._send({"id": recipient_id}, text)
 
     def check_credential(self) -> None:
         self._credentials()

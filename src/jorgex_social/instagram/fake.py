@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from itertools import count
 from typing import Any
@@ -8,11 +8,14 @@ from jorgex_social.instagram.client import check_insights_window
 from jorgex_social.instagram.errors import AuthError, InstagramError, Refused
 from jorgex_social.instagram.types import (
     Account,
+    Comment,
     ContainerKind,
     ContainerRequest,
     ContainerStatus,
+    Conversation,
     Instagram,
     Media,
+    Message,
     ProductType,
     PublishingLimit,
     Renewal,
@@ -26,6 +29,13 @@ MAX_CAROUSEL_ITEMS = 20
 PUBLISHING_WINDOW = timedelta(hours=24)
 CREDENTIAL_LIFETIME = timedelta(days=60)
 MIN_CREDENTIAL_AGE_TO_RENEW = timedelta(hours=24)
+PRIVATE_REPLY_WINDOW = timedelta(days=7)
+MESSAGING_WINDOW = timedelta(hours=24)
+MAX_MESSAGE_BYTES = 1000
+MAX_COMMENT_CHARS = 2200
+MESSAGES_READABLE = 20
+# The simulated account. Comments and messages injected for tests come from other ids.
+ACCOUNT_ID = "17841400000000000"
 
 _PRODUCT = {
     ContainerKind.IMAGE: ProductType.FEED,
@@ -50,6 +60,22 @@ class _Container:
 
 
 @dataclass
+class _Comment:
+    media_id: str
+    comment: Comment
+    private_reply_sent: bool = False
+
+
+@dataclass
+class _Thread:
+    """The conversation between the account and one person."""
+
+    id: str
+    person_id: str
+    messages: list[Message] = field(default_factory=list)
+
+
+@dataclass
 class _Failure:
     error: InstagramError
     after: bool  # True: the call takes effect and then fails, like a 5xx after going live
@@ -60,6 +86,8 @@ class FakeInstagram:
 
     Video containers take `video_processing` to become FINISHED; images are ready at once.
     `fail_next` injects errors, including the ones that leave a write's outcome unknown.
+    `add_comment` and `add_message` inject synthetic third-party activity; `sent` records every
+    reply and message the account sends, as (operation, target, text).
 
     The credential is untracked (never expires) until it is first renewed or a
     `credential_issued_at` is given; from then on it expires after `credential_lifetime` unless
@@ -88,6 +116,9 @@ class FakeInstagram:
         self._containers: dict[str, _Container] = {}
         self._media: dict[str, tuple[Media, ContainerKind]] = {}
         self._failures: dict[str, list[_Failure]] = {}
+        self._comments: dict[str, _Comment] = {}
+        self._threads: dict[str, _Thread] = {}  # by person id
+        self.sent: list[tuple[str, str, str]] = []
 
     # Test and simulation controls
 
@@ -111,6 +142,29 @@ class FakeInstagram:
         expires_at = self.credential_expires_at
         if expires_at is not None and self.clock.now() >= expires_at:
             raise AuthError("Instagram API 400: the access token has expired", code=190)
+
+    def add_comment(
+        self,
+        media_id: str,
+        text: str,
+        *,
+        author_id: str = "17900000000000001",
+        at: datetime | None = None,
+    ) -> str:
+        self._get_media(media_id)
+        comment = Comment(self._new_id(), author_id, at or self.clock.now(), text)
+        self._comments[comment.id] = _Comment(media_id, comment)
+        return comment.id
+
+    def add_message(self, sender_id: str, text: str, *, at: datetime | None = None) -> str:
+        message = Message(self._new_id(), sender_id, at or self.clock.now(), text)
+        self._thread(sender_id).messages.append(message)
+        return message.id
+
+    def _thread(self, person_id: str) -> _Thread:
+        if person_id not in self._threads:
+            self._threads[person_id] = _Thread(self._new_id(), person_id)
+        return self._threads[person_id]
 
     def mark_error(self, container_id: str) -> None:
         self._containers[container_id].error = True
@@ -138,7 +192,7 @@ class FakeInstagram:
         return self._run(
             "account",
             lambda: Account(
-                id="17841400000000000",
+                id=ACCOUNT_ID,
                 username="simulated_account",
                 account_type="MEDIA_CREATOR",
                 followers_count=1000,
@@ -279,6 +333,97 @@ class FakeInstagram:
             "account_insights",
             lambda: {"reach": 300 * days, "views": 500 * days, "accounts_engaged": 20 * days},
         )
+
+    def list_comments(self, media_id: str) -> list[Comment]:
+        def comments() -> list[Comment]:
+            self._get_media(media_id)
+            found = [c.comment for c in self._comments.values() if c.media_id == media_id]
+            return sorted(found, key=lambda c: c.timestamp, reverse=True)
+
+        return self._run("list_comments", comments)
+
+    def list_conversations(self, since: datetime | None = None) -> list[Conversation]:
+        def conversations() -> list[Conversation]:
+            found = [
+                Conversation(t.id, max(m.created_at for m in t.messages))
+                for t in self._threads.values()
+                if t.messages
+            ]
+            found.sort(key=lambda c: c.updated_at, reverse=True)
+            return [c for c in found if since is None or c.updated_at >= since]
+
+        return self._run("list_conversations", conversations)
+
+    def list_messages(self, conversation_id: str) -> list[Message]:
+        def messages() -> list[Message]:
+            for thread in self._threads.values():
+                if thread.id == conversation_id:
+                    newest = sorted(thread.messages, key=lambda m: m.created_at, reverse=True)
+                    return newest[:MESSAGES_READABLE]
+            raise Refused(f"unknown conversation {conversation_id}", code=100)
+
+        return self._run("list_messages", messages)
+
+    def _comment(self, comment_id: str) -> _Comment:
+        if comment_id not in self._comments:
+            raise Refused(f"unknown comment {comment_id}", code=100)
+        return self._comments[comment_id]
+
+    def _check_message(self, text: str) -> None:
+        if not text or len(text.encode()) > MAX_MESSAGE_BYTES:
+            raise Refused(f"message text must be 1 to {MAX_MESSAGE_BYTES} bytes", code=100)
+
+    def _record(self, operation: str, target: str, text: str) -> str:
+        self.sent.append((operation, target, text))
+        return self._new_id()
+
+    def reply_public(self, comment_id: str, text: str) -> str:
+        def reply() -> str:
+            self._comment(comment_id)
+            if not text or len(text) > MAX_COMMENT_CHARS:
+                raise Refused(f"reply must be 1 to {MAX_COMMENT_CHARS} characters", code=100)
+            return self._record("reply_public", comment_id, text)
+
+        return self._run("reply_public", reply)
+
+    def reply_private(self, comment_id: str, text: str) -> str:
+        def reply() -> str:
+            stored = self._comment(comment_id)
+            self._check_message(text)
+            if stored.private_reply_sent:
+                raise Refused("only one private reply per comment", code=10, subcode=2534023)
+            if self.clock.now() - stored.comment.timestamp > PRIVATE_REPLY_WINDOW:
+                raise Refused("the comment is older than 7 days", code=10, subcode=2534022)
+            stored.private_reply_sent = True
+            message_id = self._record("reply_private", comment_id, text)
+            # Like Instagram: the reply opens (or continues) a conversation with the author.
+            if stored.comment.author_id:
+                self._thread(stored.comment.author_id).messages.append(
+                    Message(message_id, ACCOUNT_ID, self.clock.now(), text)
+                )
+            return message_id
+
+        return self._run("reply_private", reply)
+
+    def send_message(self, recipient_id: str, text: str) -> str:
+        def send() -> str:
+            self._check_message(text)
+            thread = self._threads.get(recipient_id)
+            last = max(
+                (
+                    m.created_at
+                    for m in (thread.messages if thread else [])
+                    if m.sender_id == recipient_id
+                ),
+                default=None,
+            )
+            if last is None or self.clock.now() - last > MESSAGING_WINDOW:
+                raise Refused("outside the 24-hour messaging window", code=10, subcode=2018278)
+            message_id = self._record("send_message", recipient_id, text)
+            thread.messages.append(Message(message_id, ACCOUNT_ID, self.clock.now(), text))
+            return message_id
+
+        return self._run("send_message", send)
 
     def check_credential(self) -> None:
         # Nothing to read in simulation; `fail_next` can still inject a CredentialUnavailable.
