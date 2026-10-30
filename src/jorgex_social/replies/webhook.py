@@ -23,7 +23,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -32,7 +32,14 @@ from jorgex_social.account.credential import connection_of
 from jorgex_social.account.models import IncidentType
 from jorgex_social.instagram.types import Comment, Message
 from jorgex_social.replies.intake import Intake
-from jorgex_social.replies.models import Conversation, Delivery, DeliveryStatus, Event, Source
+from jorgex_social.replies.models import (
+    Action,
+    Conversation,
+    Delivery,
+    DeliveryStatus,
+    Event,
+    Source,
+)
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +70,8 @@ class Notification:
     messages: list[Message] = field(default_factory=list)
     echoes: list[Echo] = field(default_factory=list)
     ignored: int = 0  # entries or changes not used: other fields, other accounts, odd shapes
+    matched: int = 0  # entries for our account, useful or not
+    other_accounts: set[str] = field(default_factory=set)  # entry ids that are not ours
 
 
 def _str_id(value: Any) -> str | None:
@@ -146,9 +155,13 @@ def parse(payload: Any, own: str, now: datetime) -> Notification:
     for entry in entries if isinstance(entries, list) else []:
         # entry.id is "the Instagram professional account ID of your app user": the `user_id`
         # the connection stores. One installation serves one account; anything else is dropped.
-        if not isinstance(entry, dict) or _str_id(entry.get("id")) != own:
+        entry_id = _str_id(entry.get("id")) if isinstance(entry, dict) else None
+        if entry_id != own:
             notification.ignored += 1
+            if entry_id is not None:
+                notification.other_accounts.add(entry_id)
             continue
+        notification.matched += 1
         sent_at = min(_time(entry.get("time")) or now, now)
         # Meta's Instagram Login example puts `field` and `value` on the entry itself; its
         # Unified Login examples, and the generic Graph format, wrap them in `changes`. Both read.
@@ -180,6 +193,32 @@ def signature_valid(secret: str, body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected.encode(), header.encode("latin-1"))
 
 
+def _sending(session: Session, network: str, conversation: Conversation) -> bool:
+    """Meta can echo a reply before the worker has stored its id, so an unknown echo may be a
+    send still in flight: a message to this conversation, or any private reply (its comment's
+    author is not stored, so it cannot be tied to a conversation)."""
+    return (
+        session.scalar(
+            select(Delivery.id)
+            .join(Event)
+            .where(
+                Event.network == network,
+                Delivery.status == DeliveryStatus.PENDING,
+                Delivery.attempted_at.is_not(None),
+                or_(
+                    and_(
+                        Delivery.action == Action.MESSAGE,
+                        Event.conversation_id == conversation.id,
+                    ),
+                    Delivery.action == Action.PRIVATE_REPLY,
+                ),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
 def _sent_recently(session: Session, conversation: Conversation, now: datetime) -> bool:
     return (
         session.scalar(
@@ -205,21 +244,9 @@ def _pause_for_echoes(
         return 0
     ids = [e.message_id for e in echoes]
     ours = set(session.scalars(select(Delivery.result_ref).where(Delivery.result_ref.in_(ids))))
-    # Meta can echo a reply before the worker has stored its id: while any send is in flight,
-    # an unknown echo may be that one, and pausing on it would silence the rules for nothing.
-    sending = session.scalar(
-        select(Delivery.id)
-        .join(Event)
-        .where(
-            Event.network == network,
-            Delivery.status == DeliveryStatus.PENDING,
-            Delivery.attempted_at.is_not(None),
-        )
-        .limit(1)
-    )
     paused = 0
     for echo in echoes:
-        if echo.message_id in ours or sending is not None:
+        if echo.message_id in ours:
             continue
         conversation = session.scalar(
             select(Conversation).where(
@@ -231,6 +258,7 @@ def _pause_for_echoes(
             conversation is None  # nobody to pause: the person has not written within retention
             or conversation.paused_forever
             or (conversation.paused_until is not None and conversation.paused_until >= until)
+            or _sending(session, network, conversation)
             or _sent_recently(session, conversation, now)
         ):
             continue
@@ -253,14 +281,22 @@ def _process(request: Request, payload: Any) -> None:
     network = state.network
     now = state.clock.now()
     with state.sessionmaker() as session, session.begin():
-        incidents.sync(session, network, IncidentType.WEBHOOK_SILENT, False, now)
         connection = connection_of(session, network)
         if connection is None:
             log.warning("webhook notification before any account is connected; ignored")
             return
-        connection.webhook_notified_at = now
         own = connection.external_account_id
         notification = parse(payload, own, now)
+        if notification.other_accounts:
+            # Ids only: an account id, never anything from the body.
+            log.warning(
+                "webhook notification for another account; ignored",
+                extra={"account_ids": sorted(notification.other_accounts), "expected": own},
+            )
+        # Only a notification about our account shows that the webhook works for it.
+        if notification.matched:
+            connection.webhook_notified_at = now
+            incidents.sync(session, network, IncidentType.WEBHOOK_SILENT, False, now)
         intake: Intake = state.intake
         intake.comments(session, own, notification.comments, now, Source.WEBHOOK)
         intake.messages(session, own, notification.messages, now, Source.WEBHOOK)

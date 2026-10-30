@@ -2,11 +2,17 @@ import hashlib
 import hmac
 import json
 import logging
+import socket
 import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
@@ -17,13 +23,15 @@ from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
-from jorgex_social.logs import JsonFormatter
+from jorgex_social.logs import JsonFormatter, hide_query_strings
 from jorgex_social.replies.models import Conversation, Delivery, Event
 from jorgex_social.replies.task import ReplyTask
 from jorgex_social.replies.webhook import parse
 
 START = datetime(2026, 10, 30, 12, tzinfo=UTC)
 PERSON = "17900000000000042"
+OTHERS = ["17900000000000077", "17900000000000078"]
+ANOTHER_ACCOUNT = "17841499999999999"
 VERIFY_TOKEN = "verify-token-for-tests"
 APP_SECRET = "app-secret-for-tests"
 COMMENT_RULE = {
@@ -382,7 +390,7 @@ def test_replies_to_comments_and_other_fields_are_ignored(client, headers, ig, s
     live["entry"][0]["field"] = "live_comments"
     notify(client, live)
     other_account = comment_payload("905", media, "precio")
-    other_account["entry"][0]["id"] = "17841499999999999"
+    other_account["entry"][0]["id"] = ANOTHER_ACCOUNT
     notify(client, other_account)
 
     assert events(sessions) == []
@@ -583,6 +591,57 @@ def test_an_echo_while_a_reply_is_in_flight_pauses_nothing(
     assert conversation(sessions).paused_until is None
 
 
+def human_echo(client, clock, mid="typed-by-hand"):
+    return notify(
+        client,
+        message_payload(mid, "x", sender=ACCOUNT_ID, recipient=PERSON, at=clock.now(), echo=True),
+    )
+
+
+def test_sends_to_other_conversations_do_not_block_a_human_pause(
+    client, headers, ig, sessions, task, clock
+):
+    make_rule(client, headers, channel="message", content=MESSAGE_RULE)
+    ig.add_message(PERSON, "hola")  # a conversation, and no rule matches
+    for other in OTHERS:
+        ig.add_message(other, "precio")
+    original = ig.send_message
+    echoed = []
+
+    def send_and_echo(recipient_id, text):
+        # While each reply to someone else is in flight, Jorge answers PERSON by hand.
+        echoed.append(human_echo(client, clock, mid=f"by-hand-{recipient_id}").status_code)
+        return original(recipient_id, text)
+
+    ig.send_message = send_and_echo
+    task(sessions)
+
+    assert echoed == [200, 200]
+    assert conversation(sessions).paused_until == START + timedelta(minutes=30)
+
+
+def test_an_echo_while_a_private_reply_is_in_flight_pauses_nothing(
+    client, headers, ig, sessions, task, clock
+):
+    """A private reply's event has no conversation, so any one in flight holds every pause."""
+    make_rule(client, headers)
+    ig.add_message(PERSON, "hola")
+    ig.add_comment(publish(ig), "precio", author_id=PERSON)
+    original = ig.reply_private
+    echoed = []
+
+    def reply_and_echo(comment_id, text):
+        message_id = original(comment_id, text)
+        echoed.append(human_echo(client, clock, mid=message_id).status_code)
+        return message_id
+
+    ig.reply_private = reply_and_echo
+    task(sessions)
+
+    assert echoed == [200]
+    assert conversation(sessions).paused_until is None
+
+
 def test_an_echo_does_not_shorten_a_longer_pause(client, headers, ig, sessions, task, clock):
     ig.add_message(PERSON, "hola")
     task(sessions)
@@ -615,6 +674,35 @@ def test_webhook_silent_opens_after_a_silent_day_and_closes_on_the_next_notifica
     assert open_incidents(sessions) == 0
     with sessions() as session:
         assert session.scalar(select(Connection.webhook_notified_at)) == clock.now()
+
+
+def test_notifications_for_another_account_do_not_count_as_the_webhook_working(
+    client, ig, sessions, task, clock, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    media = publish(ig)
+
+    def foreign():
+        payload = comment_payload("914", media, f"precio {MARKERS[0]}", at=clock.now())
+        payload["entry"][0]["id"] = ANOTHER_ACCOUNT
+        assert notify(client, payload).status_code == 200
+
+    ig.add_comment(media, "hola")
+    task(sessions)
+    clock.advance(hours=23)
+    foreign()
+    clock.advance(hours=1, minutes=1)
+    ig.add_comment(media, "otra")
+    task(sessions)
+    assert open_incidents(sessions) == 1
+    foreign()
+
+    assert open_incidents(sessions) == 1
+    with sessions() as session:
+        assert session.scalar(select(Connection.webhook_notified_at)) is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(getattr(r, "account_ids", None) == [ANOTHER_ACCOUNT] for r in warnings)
+    assert MARKERS[0] not in logged(caplog)
 
 
 def test_webhook_silent_needs_activity_the_webhook_missed(ig, sessions, task, clock):
@@ -659,6 +747,58 @@ def test_the_account_reports_the_webhook(client, headers, ig, sessions, task, cl
 
 
 # Privacy
+
+
+def test_a_failure_while_processing_answers_500_without_quoting_it(
+    client, app, ig, task, caplog, monkeypatch
+):
+    caplog.set_level(logging.DEBUG)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError(f"could not store {MARKERS[0]}")
+
+    monkeypatch.setattr(app.state.intake, "comments", explode)
+    response = notify(client, comment_payload("915", publish(ig), f"precio {MARKERS[0]}"))
+
+    assert response.status_code == 500  # Meta retries
+    assert "RuntimeError" in logged(caplog)
+    assert MARKERS[0] not in logged(caplog)
+
+
+def test_the_access_log_never_shows_query_strings(app, caplog):
+    """Through a real uvicorn server: its access log prints the query string, where Meta's check
+    carries the verify token."""
+    hide_query_strings()  # what `serve` does through logs.configure()
+    caplog.set_level(logging.INFO, logger="uvicorn.access")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None, lifespan="off")
+    )
+    thread = threading.Thread(target=server.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started:
+            assert time.monotonic() < deadline, "server did not start"
+            time.sleep(0.01)
+        base = f"http://127.0.0.1:{port}"
+        query = f"hub.mode=subscribe&hub.verify_token={VERIFY_TOKEN}&hub.challenge=77"
+        with urllib.request.urlopen(f"{base}/webhook?{query}") as response:
+            assert response.read() == b"77"
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(f"{base}/m/QZX-media-token.jpg?sig=QZX-query-5531")
+    finally:
+        server.should_exit = True
+        thread.join(10)
+
+    lines = [r.getMessage() for r in caplog.records if r.name == "uvicorn.access"]
+    assert any('"GET /webhook HTTP/1.1" 200' in line for line in lines)
+    assert any("/m/QZX-media-token.jpg HTTP/1.1" in line for line in lines)  # the path stays
+    for text in (logged(caplog), *lines):
+        assert VERIFY_TOKEN not in text
+        assert "QZX-query-5531" not in text
 
 
 def test_notifications_do_not_log_the_unauthenticated_request_line(client, ig, task, caplog):
