@@ -324,9 +324,14 @@ right and go to Settings, Appearance:
 The name, CSS and icon are public, because the sign-in page needs them, so put nothing private there.
 They live in the database, so your backups carry them. Saving requires a sign-in under an hour old
 and a refused save loses what you typed, so long CSS edits are safer in a file. Agents use `GET` and `PUT /v1/appearance` with
-the `account` group, or the MCP tools `get_appearance` and `set_appearance`.
+the `account` group, or the MCP tools `get_appearance` and `set_appearance`, for the name and icon.
 
-CSS can hide the page that would undo it (`body { display: none }`). To recover, on the server:
+CSS is the exception: only the Settings page can write it. The API and MCP can read it but refuse to
+change it, whatever the token's permissions, because valid CSS can change what a page shows, for
+example hide an open incident. Their reset leaves it untouched.
+
+CSS can hide the page that would undo it (`body { display: none }`). To recover, this command clears
+the CSS, name and icon, as the Settings page's reset does:
 
 ```sh
 docker compose exec api jorgex-social reset-appearance

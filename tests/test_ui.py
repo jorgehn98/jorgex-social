@@ -1404,8 +1404,8 @@ def test_reset_returns_the_defaults_and_audits_without_content(app, signed_in):
     assert visitor.get("/ui/icon").content == default
     entries = appearance_audit(app)
     assert [(actor, json.loads(detail)) for actor, detail in entries] == [
-        ("operator", {"changed": ["name", "name_highlight", "css", "icon"]}),
-        ("operator", {"changed": ["name", "name_highlight", "css", "icon"]}),
+        ("operator", {"changed": ["name", "name_highlight", "icon", "css"]}),
+        ("operator", {"changed": ["name", "name_highlight", "icon", "css"]}),
     ]
     assert "Secret" not in str(rows(app, "SELECT * FROM audit_log"))
 

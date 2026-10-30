@@ -21,7 +21,7 @@ from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
 from sqlalchemy import select, text
 
 from jorgex_social.access import operator
-from jorgex_social.account import crypto
+from jorgex_social.account import appearance, crypto
 from jorgex_social.api import create_app
 from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
@@ -1031,3 +1031,18 @@ def test_a_refused_consent_answer_reads_nothing_on_the_event_loop(app, browser, 
     for data in ({"decision": "maybe"}, {"decision": "deny", "req": "gone", "nonce": "x"}):
         assert browser.post("/ui/oauth/consent", data=data).status_code == 400
     assert on_the_loop == []
+
+
+def test_an_oauth_token_with_account_write_cannot_write_css(app, agent, browser, clock):
+    with app.state.sessionmaker() as session, session.begin():
+        appearance.update_by_operator(session, clock.now(), css="kept {}")
+    _, tokens = connect(agent, browser, account="write")
+    token = tokens["access_token"]
+
+    refused = api(agent, token, "/v1/appearance", "PUT", json={"css": "a { display: none; }"})
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["code"] == "invalid_appearance"
+    assert api(agent, token, "/v1/appearance").json()["css"] == "kept {}"
+    saved = api(agent, token, "/v1/appearance", "PUT", json={"name": "Acme"})
+    assert saved.json()["name"] == "Acme"

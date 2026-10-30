@@ -155,9 +155,10 @@ restriction the API can keep answering while the account is limited, so calls th
 nothing: a human must check Account Status in the Instagram app.
 
 Appearance: `get_appearance` shows the web interface's product name and the part of it in the \
-accent colour, its CSS, its icon and the CSS variables that can be overridden. `set_appearance` \
-changes them, and only how the interface looks: nothing reaches Instagram. Its warnings are likely \
-typos in the CSS, which was saved anyway; check them.
+accent colour, its CSS, its icon, the CSS variables that can be overridden and warnings about \
+likely typos in the CSS. `set_appearance` changes the name, its highlight and the icon; nothing \
+reaches Instagram. CSS is only editable by the operator in Settings: to change it, ask them to \
+paste it there, and do not try to work around this.
 
 sign_in_password_accepted: sign-ins to the web interface with the right password kept failing on \
 the code, so the password may have leaked. Tell the operator at once; if it was not them, they \
@@ -192,6 +193,12 @@ it. Never retry publish_now or schedule_post blindly: check the post with `get_p
 LOCAL_UPLOAD = (
     "`upload_media` with the absolute path of each file; it returns the media id. invalid_path, "
     "not_a_file and file_error mean the path cannot be read."
+)
+
+
+CSS_SETTINGS_ONLY = (
+    "CSS is only editable by the operator in Settings: ask them to paste it there, and do not try "
+    "to work around this."
 )
 
 
@@ -517,7 +524,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     def get_appearance() -> str:
         """The web interface's product name, the part of it in the accent colour and its CSS; its
         icon's type and size in bytes (icon null: the default icon); the CSS variables that can be
-        overridden, with their defaults; and warnings about the CSS (see set_appearance)."""
+        overridden, with their defaults; and warnings: custom properties in the CSS the interface
+        does not read, likely typos."""
         return call("GET", "/v1/appearance")
 
     def set_appearance(
@@ -533,33 +541,27 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
                 "pass this too."
             ),
         ] = None,
-        css: Annotated[
-            str | None,
-            Field(
-                description="CSS up to 256 KB, loaded after the default stylesheet; it can load "
-                "same-origin resources only and run no script. Every page but the OAuth consent "
-                "page loads it, since CSS there could disguise a grant. An empty string removes "
-                "it."
-            ),
-        ] = None,
         icon_base64: Annotated[
             str | None, Field(description="A PNG, ICO or SVG file up to 256 KB, in base64.")
         ] = None,
         clear_icon: Annotated[bool, Field(description="Back to the default icon.")] = False,
         reset: Annotated[
-            bool, Field(description="Everything back to the defaults. Alone, with no other field.")
+            bool,
+            Field(
+                description="Name, highlight and icon back to the defaults; the CSS stays. Alone, "
+                "with no other field."
+            ),
         ] = False,
     ) -> str:
-        """Change how the web interface looks, including its public sign-in page. Only what you
-        pass changes, and invalid_appearance means nothing did. The answer's warnings list custom
-        properties in the CSS the interface does not read: likely typos, saved all the same."""
+        """Change the name and icon of the web interface, including its public sign-in page. Only
+        what you pass changes, and invalid_appearance means nothing did. CSS is only editable by the
+        operator in Settings: ask them to paste it there, and do not try to work around this."""
         return call(
             "PUT",
             "/v1/appearance",
             json_body={
                 "name": name,
                 "name_highlight": name_highlight,
-                "css": css,
                 "icon_base64": icon_base64,
                 "clear_icon": clear_icon,
                 "reset": reset,
@@ -828,6 +830,17 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     ]
 
 
+class Server(MCPServer):
+    """Refuses `css` on set_appearance. The SDK drops arguments a tool does not declare, so without
+    this an agent would get a success for CSS that was never saved."""
+
+    async def call_tool(self, name, arguments, context=None):
+        if name == "set_appearance" and "css" in arguments:
+            error = _local_error("invalid_appearance", CSS_SETTINGS_ONLY)
+            raise ToolError(f"Error executing tool {name}: {error}")
+        return await super().call_tool(name, arguments, context)
+
+
 def build_server(api: Api) -> MCPServer:
     """Asks the API what the token may do and registers only those tools."""
     answer = api.request("GET", "/v1/token")
@@ -840,7 +853,7 @@ def build_server(api: Api) -> MCPServer:
                 "message": "GET /v1/token did not return the token's permissions.",
             }
         )
-    server = MCPServer("jorgex-social", instructions=instructions(LOCAL_UPLOAD))
+    server = Server("jorgex-social", instructions=instructions(LOCAL_UPLOAD))
     for group, level, tool, annotations in tool_definitions(api):
         if level == ANY or _RANK.get(permissions.get(group, "deny"), 0) >= _RANK[level]:
             server.add_tool(tool, annotations=annotations, structured_output=False)

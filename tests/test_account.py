@@ -9,7 +9,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import crypto
+from jorgex_social.account import appearance, crypto
 from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
 from jorgex_social.account.credential import NotConnected, StoredCredential, credential_context
 from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
@@ -723,18 +723,17 @@ def test_appearance_needs_account_write_to_change_and_read_to_see(app, client, h
 def test_appearance_changes_only_what_is_sent_and_reports_the_icon(client, headers):
     icon = base64.b64encode(PNG).decode()
 
-    first = put_appearance(client, headers, name="Acme", css="a { color: red; }", icon_base64=icon)
+    first = put_appearance(client, headers, name="Acme", icon_base64=icon)
     second = put_appearance(client, headers, name="Other")
 
     assert first.status_code == 200
     assert first.json()["icon"] == {"type": "image/png", "bytes": len(PNG)}
     answer = second.json()
-    assert (answer["name"], answer["css"]) == ("Other", "a { color: red; }")
+    assert answer["name"] == "Other"
     assert answer["icon"] == {"type": "image/png", "bytes": len(PNG)}
     assert client.get("/ui/icon").content == PNG
 
-    cleared = put_appearance(client, headers, clear_icon=True, css="").json()
-    assert (cleared["icon"], cleared["css"]) == (None, "")
+    assert put_appearance(client, headers, clear_icon=True).json()["icon"] is None
 
 
 def test_appearance_returns_the_variables_of_the_stylesheet(client, headers):
@@ -745,13 +744,51 @@ def test_appearance_returns_the_variables_of_the_stylesheet(client, headers):
     assert "--cyan-400" not in variables
 
 
-def test_appearance_warns_about_unknown_properties_and_saves_anyway(client, headers):
-    answer = put_appearance(client, headers, css=":root { --colr-bg: red; --accent: blue; }")
+def store_css(app, clock, css):
+    with app.state.sessionmaker() as session, session.begin():
+        appearance.update_by_operator(session, clock.now(), css=css)
 
-    assert answer.status_code == 200
-    (warning,) = answer.json()["warnings"]
+
+def test_reading_appearance_reports_the_css_and_its_likely_typos(app, client, clock, headers):
+    store_css(app, clock, ":root { --colr-bg: red; --accent: blue; }")
+
+    answer = client.get("/v1/appearance", headers=headers).json()
+
+    assert "--colr-bg" in answer["css"]
+    (warning,) = answer["warnings"]
     assert warning.startswith("--colr-bg is not a variable of this interface and does nothing")
-    assert "--colr-bg" in answer.json()["css"]
+
+
+def test_saving_appearance_answers_neither_css_nor_warnings(app, client, clock, headers):
+    store_css(app, clock, ":root { --colr-bg: red; }")
+
+    answer = put_appearance(client, headers, name="Acme").json()
+
+    assert set(answer) == {"name", "name_highlight", "icon"}
+
+
+@pytest.mark.parametrize("css", ["a { display: none; }", "", None])
+def test_no_token_can_write_css(app, client, clock, headers, css):
+    store_css(app, clock, "kept {}")
+
+    refused = put_appearance(client, headers, name="Acme", css=css)
+
+    assert refused.status_code == 422
+    detail = refused.json()["detail"]
+    assert detail["code"] == "invalid_appearance"
+    assert "only be edited by the operator, in Settings" in detail["message"]
+    stored = client.get("/v1/appearance", headers=headers).json()
+    assert (stored["css"], stored["name"]) == ("kept {}", "Social")
+
+
+def test_css_is_refused_after_the_permission_check(app, client):
+    reader = headers_for(app, account="read")
+
+    assert put_appearance(client, reader, css="a {}").status_code == 403
+
+
+def test_other_unknown_fields_are_refused_too(client, headers):
+    assert put_appearance(client, headers, nmae="Acme").status_code == 422
 
 
 @pytest.mark.parametrize(
@@ -760,7 +797,6 @@ def test_appearance_warns_about_unknown_properties_and_saves_anyway(client, head
         ({"name": ""}, "The name must be 1 to 40 characters."),
         ({"name": "n" * 41}, "The name must be 1 to 40 characters."),
         ({"name": "Acme", "name_highlight": "x"}, "The highlight must be part of the name"),
-        ({"css": "a" * (256 * 1024 + 1)}, "The CSS is over 256 KB."),
         ({"icon_base64": "not base64!"}, "The icon is not valid base64."),
         ({"icon_base64": base64.b64encode(b"plain text").decode()}, "The icon must be a PNG"),
         ({"icon_base64": ""}, "The icon must be a PNG"),
@@ -774,13 +810,14 @@ def test_appearance_warns_about_unknown_properties_and_saves_anyway(client, head
     ],
 )
 def test_appearance_refusals_share_one_shape_and_change_nothing(client, headers, body, message):
-    refused = put_appearance(client, headers, **{"css": "kept", **body})
+    refused = put_appearance(client, headers, **body)
 
     assert refused.status_code == 422
     detail = refused.json()["detail"]
     assert detail["code"] == "invalid_appearance"
     assert message in detail["message"]
-    assert client.get("/v1/appearance", headers=headers).json()["css"] == ""
+    stored = client.get("/v1/appearance", headers=headers).json()
+    assert (stored["name"], stored["icon"]) == ("Social", None)
 
 
 def test_a_new_name_keeps_the_highlight_rule(client, headers):
@@ -796,38 +833,39 @@ def test_a_new_name_keeps_the_highlight_rule(client, headers):
     assert 'class="accent"' not in client.get("/ui/login").text
 
 
-def test_appearance_reset_returns_the_defaults(client, headers):
+def test_appearance_reset_clears_the_rest_and_keeps_the_css(app, client, clock, headers):
+    store_css(app, clock, "kept {}")
     put_appearance(
-        client, headers, name="Acme", css="a {}", icon_base64=base64.b64encode(PNG).decode()
+        client,
+        headers,
+        name="Acme",
+        name_highlight="me",
+        icon_base64=base64.b64encode(PNG).decode(),
     )
 
-    answer = put_appearance(client, headers, reset=True).json()
+    assert put_appearance(client, headers, reset=True).status_code == 200
 
-    assert (answer["name"], answer["name_highlight"], answer["css"], answer["icon"]) == (
-        "Social",
-        "",
-        "",
-        None,
-    )
+    stored = client.get("/v1/appearance", headers=headers).json()
+    assert (stored["name"], stored["name_highlight"], stored["icon"]) == ("Social", "", None)
+    assert stored["css"] == "kept {}"
 
 
 def test_appearance_changes_are_audited_without_their_content(app, client, headers):
-    put_appearance(client, headers, name="Secret Brand", css="a { color: red; }")
+    put_appearance(client, headers, name="Secret Brand")
 
     with app.state.read_sessionmaker() as session:
         (entry,) = session.scalars(
             select(AuditEntry).where(AuditEntry.action == "PUT /v1/appearance")
         ).all()
-    assert entry.detail == {"changed": ["name", "css"]}
+    assert entry.detail == {"changed": ["name"]}
     assert entry.actor_type == "token"
 
 
 def test_going_back_to_a_default_answers_the_default(client, headers):
     icon = base64.b64encode(PNG).decode()
-    put_appearance(client, headers, name="Acme", css="a {}", icon_base64=icon)
+    put_appearance(client, headers, name="Acme", icon_base64=icon)
 
     # One at a time: each removes a row, and the same request reads it back for its answer. A later
     # read of a row not yet loaded would flush the removal and hide the bug.
     assert put_appearance(client, headers, name="Social").json()["name"] == "Social"
-    assert put_appearance(client, headers, css="").json()["css"] == ""
     assert put_appearance(client, headers, clear_icon=True).json()["icon"] is None

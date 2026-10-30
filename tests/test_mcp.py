@@ -11,6 +11,7 @@ import pytest
 from mcp import Client
 
 from jorgex_social.access.tokens import create_token, revoke_token
+from jorgex_social.account import appearance
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.models import Post
 from jorgex_social_mcp import client as http_client
@@ -624,7 +625,6 @@ async def test_appearance_tools(app, transport):
             "set_appearance",
             name="Acme One",
             name_highlight="One",
-            css=":root { --colr-bg: red; }",
         )
         refused = await call(client, "set_appearance", name="Other")
 
@@ -633,6 +633,25 @@ async def test_appearance_tools(app, transport):
     assert before[1]["variables"]["--accent"] == "#22d3ee"
     assert saved[0] == "ok"
     assert (saved[1]["name"], saved[1]["name_highlight"]) == ("Acme One", "One")
-    assert "--colr-bg" in saved[1]["warnings"][0]
     assert refused[0] == "error"
     assert (refused[1]["status"], refused[1]["code"]) == (422, "invalid_appearance")
+
+
+async def test_set_appearance_cannot_write_css(app, transport):
+    with app.state.sessionmaker() as session, session.begin():
+        appearance.update_by_operator(session, datetime.now(UTC), css="kept {}")
+
+    async with Client(server_for(app, transport, account="write")) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        refused = await call(client, "set_appearance", name="Acme", css="a { display: none; }")
+        after = await call(client, "get_appearance")
+        guide = client.instructions
+
+    assert "css" not in tools["set_appearance"].input_schema["properties"]
+    description = " ".join(tools["set_appearance"].description.split())
+    assert "only editable by the operator in Settings" in description
+    assert "only editable by the operator in Settings" in guide
+    assert refused[0] == "error"
+    assert refused[1]["code"] == "invalid_appearance"
+    assert "ask them to paste it" in refused[1]["message"]
+    assert (after[1]["css"], after[1]["name"]) == ("kept {}", "Social")

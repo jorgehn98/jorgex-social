@@ -1,7 +1,11 @@
 """How this installation looks: its product name, its own CSS and its icon. Kept in the settings
 table, so a database backup carries them. One key each, so a page that only needs the name does not
 load the CSS and the icon. The web interface and the API both write through `update`, so they share
-every limit."""
+every limit.
+
+CSS is written only by `update_by_operator`, which only the Settings page and the command line call.
+`update`, the API's way in, cannot reach it: valid CSS can change what a page shows, for example
+hide an open incident, and no token may be able to do that."""
 
 import base64
 import binascii
@@ -26,9 +30,9 @@ SVG = "image/svg+xml"
 _KEYS = {
     "name": "appearance.name",
     "name_highlight": "appearance.name_highlight",
-    "css": "appearance.css",
     "icon": "appearance.icon",
 }
+_CSS_KEY = "appearance.css"
 TOO_LARGE_ICON = f"The icon is over {MAX_ICON_BYTES // 1024} KB."
 _STYLESHEET = (Path(__file__).parent.parent / "ui" / "static" / "style.css").read_text()
 _ROOT = re.search(r"^:root \{.*?^\}", _STYLESHEET, re.M | re.S)[0]
@@ -182,14 +186,13 @@ def update(
     *,
     name: str | None = None,
     name_highlight: str | None = None,
-    css: str | None = None,
     icon: bytes | None = None,
     clear_icon: bool = False,
     reset: bool = False,
 ) -> list[str]:
     """Changes what is given, all of it or nothing, and returns which fields really changed. Raises
     InvalidAppearance before writing anything."""
-    given = (name, name_highlight, css, icon)
+    given = (name, name_highlight, icon)
     if reset and (clear_icon or any(value is not None for value in given)):
         raise InvalidAppearance("Reset cannot be combined with other changes.")
     if icon is not None and clear_icon:
@@ -209,8 +212,6 @@ def update(
             values["name"] = None if final_name == DEFAULT_NAME else final_name
         if name_highlight is not None:
             values["name_highlight"] = name_highlight or None
-    if css is not None:
-        values["css"] = _clean_css(css)
     if icon is not None:
         values["icon"] = _clean_icon(icon)
     changed = [field for field, value in values.items() if _put(session, _KEYS[field], value, now)]
@@ -219,10 +220,18 @@ def update(
     return changed
 
 
-def update_by_operator(session: Session, now: datetime, **changes: Any) -> list[str]:
-    """`update`, audited, for what has no API token behind it: the web interface and the command
-    line. The API's calls are audited by its middleware."""
-    changed = update(session, now, **changes)
+def update_by_operator(
+    session: Session, now: datetime, *, css: str | None = None, reset: bool = False, **changes: Any
+) -> list[str]:
+    """`update` plus the CSS, audited, for the Settings page and the command line alone. Reset here
+    clears the CSS too: it is the way back when bad CSS hides Settings. The API's calls go to
+    `update`, and its middleware audits them."""
+    if reset and css is not None:
+        raise InvalidAppearance("Reset cannot be combined with other changes.")
+    cleaned = None if css is None else _clean_css(css)
+    changed = update(session, now, reset=reset, **changes)
+    if (reset or css is not None) and _put(session, _CSS_KEY, cleaned, now):
+        changed.append("css")
     if changed:
         audit.record(
             session,
@@ -241,7 +250,7 @@ def name_of(session: Session) -> Name:
 
 
 def css_of(session: Session) -> str:
-    setting = session.get(Setting, _KEYS["css"])
+    setting = session.get(Setting, _CSS_KEY)
     return setting.value if setting else ""
 
 
