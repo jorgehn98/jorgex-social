@@ -6,11 +6,12 @@ HTTP contract.
 
 import ipaddress
 import json
+import re
 from collections.abc import Callable
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 TIMEOUT_SECONDS = 120
 
@@ -25,7 +26,12 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-_opener = build_opener(_NoRedirect)
+def _make_opener():
+    # No proxy from the environment: the token goes only to the URL that check_url accepted.
+    return build_opener(_NoRedirect, ProxyHandler({}))
+
+
+_opener = _make_opener()
 
 
 def urllib_transport(method: str, url: str, headers: dict[str, str], body: Body):
@@ -56,6 +62,18 @@ def check_url(url: str) -> None:
     raise ValueError("JORGEX_SOCIAL_URL must use https, or http only to localhost.")
 
 
+# Visible ASCII: a stray newline (a CRLF .env) or space would make urllib raise with the whole
+# header, token included, in the message.
+_TOKEN = re.compile(r"[\x21-\x7e]+")
+
+
+def check_token(token: str) -> None:
+    if not _TOKEN.fullmatch(token):
+        raise ValueError(
+            "JORGEX_SOCIAL_TOKEN must be visible ASCII, with no spaces, tabs or line breaks."
+        )
+
+
 def _is_loopback(host: str) -> bool:
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -65,6 +83,11 @@ def _is_loopback(host: str) -> bool:
 
 def segment(value: str) -> str:
     """A path parameter, escaped so an id cannot point at another endpoint."""
+    # Escaping leaves these alone, and they would walk the path.
+    if value in ("", ".", ".."):
+        raise ApiError(
+            {"status": None, "code": "invalid_id", "message": f"Not a valid id: {value!r}."}
+        )
     return quote(value, safe="")
 
 
@@ -99,19 +122,37 @@ class Api:
         try:
             status, content = self._transport(method, url, headers, body)
         except (URLError, OSError) as exc:
-            # The reason names the host or the socket error, never the request headers.
+            # Only the OS error text: an exception message may quote the request, token included.
             reason = getattr(exc, "reason", exc)
+            detail = getattr(reason, "strerror", None) or type(reason).__name__
             raise ApiError(
                 {
                     "status": None,
                     "code": "unreachable",
-                    "message": f"Cannot reach the API: {reason}",
+                    "message": f"Cannot reach the API: {detail}",
+                }
+            ) from None
+        except Exception as exc:
+            raise ApiError(
+                {
+                    "status": None,
+                    "code": "client_error",
+                    "message": f"The request could not be sent ({type(exc).__name__}).",
                 }
             ) from None
         try:
             data = json.loads(content) if content else None
         except ValueError:
             data = content[:500].decode(errors="replace")
+        if 300 <= status < 400:
+            # Redirects are not followed (see _NoRedirect), and are never a result.
+            raise ApiError(
+                {
+                    "status": status,
+                    "code": "redirect",
+                    "message": "The API answered with a redirect; check JORGEX_SOCIAL_URL.",
+                }
+            )
         if status >= 400:
             detail = data.get("detail", data) if isinstance(data, dict) else data
             # The API's own errors carry {code, message, ...}; anything else (FastAPI validation

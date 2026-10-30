@@ -2,7 +2,10 @@ import json
 import logging
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 
 import pytest
@@ -12,7 +15,9 @@ pytest.importorskip("mcp", reason="install the mcp extra: uv sync --extra mcp")
 from mcp import Client  # noqa: E402
 
 from jorgex_social.access.tokens import create_token, revoke_token  # noqa: E402
-from jorgex_social_mcp.client import Api, ApiError, check_url  # noqa: E402
+from jorgex_social.publishing import media as storage  # noqa: E402
+from jorgex_social_mcp import client as http_client  # noqa: E402
+from jorgex_social_mcp.client import Api, ApiError, check_url, urllib_transport  # noqa: E402
 from jorgex_social_mcp.server import build_server, main  # noqa: E402
 
 pytestmark = pytest.mark.anyio
@@ -141,6 +146,7 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
 
     sent = [(method, path) for method, path, _, _ in transport.calls]
     assert sent == [
+        ("GET", "/v1/catalog"),  # the upload limit, read once
         ("POST", "/v1/media"),
         ("POST", "/v1/posts"),
         ("GET", "/v1/catalog"),
@@ -161,7 +167,7 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
         ("POST", f"/v1/posts/{draft['id']}/resolve"),
         ("POST", "/v1/account/incidents/nope/acknowledge"),
     ]
-    bodies = {path: json.loads(body) for _, path, _, body in transport.calls[1:] if body}
+    bodies = {path: json.loads(body) for _, path, _, body in transport.calls[2:] if body}
     assert bodies[f"/v1/posts/{pid}"] == {"source_ref": None, "caption": "Bye"}
     assert bodies[f"/v1/posts/{pid}/schedule"] == {"scheduled_for": when}
     assert bodies["/v1/account/kill-switch"] == {"enabled": True}
@@ -338,3 +344,137 @@ def test_the_service_does_not_import_mcp():
         "sys.exit('mcp' in sys.modules)"
     )
     assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+@contextmanager
+def loopback_server(status=200, body=b"{}", headers=()):
+    """A real HTTP server on 127.0.0.1 that answers every GET the same way and counts them."""
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(status)
+            for name, value in headers:
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", hits
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("token", ["jxs_abc\r", "jxs_abc\n", "jxs abc", "jxs_ñ"])
+def test_a_malformed_token_never_leaks_from_the_real_transport(token):
+    # urllib refuses the header before connecting, quoting it whole; nothing listens on port 9.
+    with pytest.raises(ApiError) as error:
+        Api("http://127.0.0.1:9", token, urllib_transport).request("GET", "/v1/token")
+
+    assert error.value.payload["code"] in {"client_error", "unreachable"}
+    assert token.strip() not in str(error.value)
+
+
+def test_main_refuses_a_malformed_token(monkeypatch):
+    token = "jxs_from_a_crlf_file\r"
+    monkeypatch.setenv("JORGEX_SOCIAL_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("JORGEX_SOCIAL_TOKEN", token)
+
+    with pytest.raises(SystemExit) as exit_:
+        main()
+
+    assert "JORGEX_SOCIAL_TOKEN must be visible ASCII" in str(exit_.value.code)
+    assert token.strip() not in str(exit_.value.code)
+
+
+def test_the_token_never_goes_to_an_environment_proxy(monkeypatch):
+    with (
+        loopback_server(body=b'{"permissions": {}}') as (target, target_hits),
+        loopback_server() as (proxy, proxy_hits),
+    ):
+        monkeypatch.setenv("http_proxy", proxy)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        # The opener reads the environment when built, so build it with the proxy set.
+        monkeypatch.setattr(http_client, "_opener", http_client._make_opener())
+
+        answer = Api(target, "jxs_token", urllib_transport).request("GET", "/v1/token")
+
+    assert answer == {"permissions": {}}
+    assert (target_hits, proxy_hits) == (["/v1/token"], [])
+
+
+def test_a_redirect_is_an_error_not_an_answer():
+    location = [("Location", "https://elsewhere.example.com/v1/token")]
+    with loopback_server(302, b"", location) as (url, hits), pytest.raises(ApiError) as error:
+        build_server(Api(url, "jxs_token", urllib_transport))
+
+    assert hits == ["/v1/token"]
+    assert error.value.payload["status"] == 302
+    assert error.value.payload["code"] == "redirect"
+
+
+@pytest.mark.parametrize("body", [b"[]", b'{"name": "x"}', b'{"permissions": ["posts"]}'])
+def test_startup_needs_the_token_permissions(body):
+    with loopback_server(body=body) as (url, _), pytest.raises(ApiError) as error:
+        build_server(Api(url, "jxs_token", urllib_transport))
+
+    assert error.value.payload["code"] == "invalid_response"
+
+
+@pytest.mark.parametrize("post_id", ["", ".", ".."])
+async def test_ids_that_walk_the_path_are_refused(app, transport, post_id):
+    server = server_for(app, transport, posts="read")
+    calls_before = len(transport.calls)
+
+    async with Client(server) as client:
+        outcome, error = await call(client, "get_post", post_id=post_id)
+
+    assert (outcome, error["code"]) == ("error", "invalid_id")
+    assert len(transport.calls) == calls_before
+
+
+async def test_upload_over_the_server_limit_is_not_sent(app, transport, tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "MAX_UPLOAD_BYTES", len(JPEG))
+    (tmp_path / "fits.jpg").write_bytes(JPEG)
+    (tmp_path / "big.jpg").write_bytes(JPEG + b"x")
+    server = server_for(app, transport, posts="write")
+
+    async with Client(server) as client:
+        fits = await call(client, "upload_media", path=str(tmp_path / "fits.jpg"))
+        big = await call(client, "upload_media", path=str(tmp_path / "big.jpg"))
+
+    assert fits[0] == "ok"
+    assert big == (
+        "error",
+        {
+            "status": None,
+            "code": "too_large",
+            "message": f"Uploads are limited to {len(JPEG)} bytes.",
+        },
+    )
+    assert [m for m, path, _, _ in transport.calls if path == "/v1/media"] == ["POST"]
+
+
+async def test_update_refuses_a_field_both_given_and_cleared(app, transport):
+    server = server_for(app, transport, posts="write")
+    calls_before = len(transport.calls)
+
+    async with Client(server) as client:
+        outcome, error = await call(
+            client, "update_post", post_id="p1", source_ref="mine", clear=["source_ref"]
+        )
+
+    assert (outcome, error["code"]) == ("error", "invalid_value")
+    assert "source_ref" in error["message"]
+    assert len(transport.calls) == calls_before

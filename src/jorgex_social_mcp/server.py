@@ -17,7 +17,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from jorgex_social_mcp.client import Api, ApiError, check_url, segment
+from jorgex_social_mcp.client import Api, ApiError, check_token, check_url, segment
 
 # By extension, so the API gets a Content-Type it accepts; the server re-checks the signature.
 UPLOAD_CONTENT_TYPES = {
@@ -58,14 +58,23 @@ def _local_error(code: str, message: str) -> ToolError:
 def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations]]:
     """(group, level, tool, annotations). The docstring of each tool is what the agent reads."""
 
-    def call(method: str, path: str, **kwargs) -> str:
+    def call(method: str, path: str, *ids: str, **kwargs) -> str:
+        """`path` takes each id in a `{}`, escaped."""
         # One JSON text block, as the API answered: the SDK would turn a list into one block per
         # item, and an empty list into no content at all.
         try:
-            return json.dumps(api.request(method, path, **kwargs))
+            return json.dumps(api.request(method, path.format(*map(segment, ids)), **kwargs))
         except ApiError as exc:
             # As it came from the API: the agent decides by `code`.
             raise ToolError(exc.args[0]) from None
+
+    limits: dict[str, int] = {}
+
+    def upload_limit() -> int:
+        # From the catalog, so it follows the server; it does not change while the server runs.
+        if "max_bytes" not in limits:
+            limits["max_bytes"] = json.loads(call("GET", "/v1/catalog"))["upload"]["max_bytes"]
+        return limits["max_bytes"]
 
     # posts
 
@@ -90,7 +99,7 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
 
     def get_post(post_id: PostId) -> str:
         """One post with its publish attempts."""
-        return call("GET", f"/v1/posts/{segment(post_id)}")
+        return call("GET", "/v1/posts/{}", post_id)
 
     def upload_media(
         path: Annotated[
@@ -116,6 +125,11 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         try:
             with file.open("rb") as fh:
                 size = os.fstat(fh.fileno()).st_size
+                # Checked here because the server refuses an oversized upload as soon as it reads
+                # Content-Length, and the client, still sending, only sees a broken connection.
+                limit = upload_limit()
+                if size > limit:
+                    raise _local_error("too_large", f"Uploads are limited to {limit} bytes.")
                 return call("POST", "/v1/media", raw=(fh, content_type, size))
         except OSError as exc:
             raise _local_error("file_error", f"{exc.strerror or exc}: {path}") from None
@@ -166,7 +180,6 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         """Edit a draft or a scheduled post; only the fields given change. A scheduled post goes
         back to draft and has to be scheduled again. Published, failed or cancelled posts cannot
         be edited."""
-        body: dict[str, Any] = {field: None for field in clear or []}
         given = {
             "type": type,
             "items": items,
@@ -175,8 +188,12 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
             "thumb_offset_ms": thumb_offset_ms,
             "source_ref": source_ref,
         }
-        body.update({k: v for k, v in given.items() if v is not None})
-        return call("PATCH", f"/v1/posts/{segment(post_id)}", json_body=body)
+        given = {k: v for k, v in given.items() if v is not None}
+        both = sorted(set(clear or []) & set(given))
+        if both:
+            raise _local_error("invalid_value", f"Both given and cleared: {', '.join(both)}.")
+        body: dict[str, Any] = {field: None for field in clear or []} | given
+        return call("PATCH", "/v1/posts/{}", post_id, json_body=body)
 
     # scheduling
 
@@ -192,7 +209,8 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         body = {"scheduled_for": scheduled_for, "expected_hash": expected_hash}
         return call(
             "POST",
-            f"/v1/posts/{segment(post_id)}/schedule",
+            "/v1/posts/{}/schedule",
+            post_id,
             json_body={k: v for k, v in body.items() if v is not None},
         )
 
@@ -200,12 +218,12 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         """Schedule the post for now: the worker publishes it to the real account on its next
         pass, unless the service runs in simulation. Check the result with get_post."""
         body = {"expected_hash": expected_hash} if expected_hash is not None else {}
-        return call("POST", f"/v1/posts/{segment(post_id)}/publish-now", json_body=body)
+        return call("POST", "/v1/posts/{}/publish-now", post_id, json_body=body)
 
     def cancel_post(post_id: PostId) -> str:
         """Cancel a draft or scheduled post. It will not be published and cannot be edited or
         scheduled again. Does not delete anything already on Instagram."""
-        return call("POST", f"/v1/posts/{segment(post_id)}/cancel")
+        return call("POST", "/v1/posts/{}/cancel", post_id)
 
     def resolve_post(
         post_id: PostId,
@@ -222,7 +240,8 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         body = {"outcome": outcome, "media_ref": media_ref}
         return call(
             "POST",
-            f"/v1/posts/{segment(post_id)}/resolve",
+            "/v1/posts/{}/resolve",
+            post_id,
             json_body={k: v for k, v in body.items() if v is not None},
         )
 
@@ -246,7 +265,7 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
         media_ref: Annotated[str, Field(description="Instagram media id.")], limit: Limit = None
     ) -> str:
         """Every stored snapshot of one media, newest first. Empty if none has been taken yet."""
-        return call("GET", f"/v1/stats/media/{segment(media_ref)}", query={"limit": limit})
+        return call("GET", "/v1/stats/media/{}", media_ref, query={"limit": limit})
 
     # account
 
@@ -281,7 +300,7 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
 
     def acknowledge_incident(incident_id: str) -> str:
         """Mark an incident as seen. It stays open until its cause is gone."""
-        return call("POST", f"/v1/account/incidents/{segment(incident_id)}/acknowledge")
+        return call("POST", "/v1/account/incidents/{}/acknowledge", incident_id)
 
     def set_kill_switch(enabled: bool) -> str:
         """On: the service stops writing to the network (no publishing); scheduled posts stay
@@ -313,7 +332,16 @@ def _tools(api: Api) -> list[tuple[str, str, Callable[..., str], ToolAnnotations
 
 def build_server(api: Api) -> MCPServer:
     """Asks the API what the token may do and registers only those tools."""
-    permissions = api.request("GET", "/v1/token")["permissions"]
+    answer = api.request("GET", "/v1/token")
+    permissions = answer.get("permissions") if isinstance(answer, dict) else None
+    if not isinstance(permissions, dict):
+        raise ApiError(
+            {
+                "status": None,
+                "code": "invalid_response",
+                "message": "GET /v1/token did not return the token's permissions.",
+            }
+        )
     server = MCPServer(
         "jorgex-social",
         instructions="Prepare, schedule and review posts of one Instagram account through the "
@@ -332,6 +360,7 @@ def main() -> None:
         sys.exit("jorgex-social-mcp: set JORGEX_SOCIAL_URL and JORGEX_SOCIAL_TOKEN.")
     try:
         check_url(url)
+        check_token(token)
     except ValueError as exc:
         sys.exit(f"jorgex-social-mcp: {exc}")
     try:
