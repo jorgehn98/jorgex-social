@@ -119,3 +119,15 @@ def test_a_login_limit_of_zero_is_refused():
     # Zero would refuse every sign-in, the operator's included.
     with pytest.raises(ValueError, match="at least 1"):
         Settings.from_env({"JORGEX_SOCIAL_LOGIN_LIMIT_PER_HOUR": "0"})
+
+
+def test_oauth_redirect_uris_are_https_only():
+    listed = {"JORGEX_SOCIAL_OAUTH_REDIRECT_URIS": "https://a.example/cb, https://b.example/cb"}
+
+    assert Settings.from_env({}).oauth_redirect_uris == ()
+    assert Settings.from_env(listed).oauth_redirect_uris == (
+        "https://a.example/cb",
+        "https://b.example/cb",
+    )
+    with pytest.raises(ValueError, match="https URIs only"):
+        Settings.from_env({"JORGEX_SOCIAL_OAUTH_REDIRECT_URIS": "http://a.example/cb"})
