@@ -917,7 +917,7 @@ def test_the_audit_names_the_client_and_only_a_right_password_has_a_reason(app, 
 
 
 @pytest.mark.usefixtures("enrolled")
-def test_only_old_denied_sign_ins_are_purged(app, client, clock):
+def test_a_successful_sign_in_purges_only_old_denied_sign_ins(app, client, clock):
     log_in(client, clock, password="purged after 90 days")
     assert log_in(client, clock).status_code == 303
     clock.advance(days=2)
@@ -925,9 +925,26 @@ def test_only_old_denied_sign_ins_are_purged(app, client, clock):
     other_actions = rows(app, "SELECT count(*) FROM audit_log WHERE action != 'operator.login'")
     clock.advance(days=88)
 
+    # Anyone can make a denial happen, so none of them pays for the purge.
     log_in(client, clock, password="another wrong password")
+    fail_the_code(client, clock)
+    assert [outcome for outcome, _ in login_details(app)] == [
+        "denied",
+        "ok",
+        "denied",
+        "denied",
+        "denied",
+    ]
 
-    assert [outcome for outcome, _ in login_details(app)] == ["ok", "denied", "denied"]
+    assert log_in(client, clock).status_code == 303
+
+    assert [outcome for outcome, _ in login_details(app)] == [
+        "ok",
+        "denied",
+        "denied",
+        "denied",
+        "ok",
+    ]
     assert (
         rows(app, "SELECT count(*) FROM audit_log WHERE action != 'operator.login'")
         == other_actions

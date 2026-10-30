@@ -249,12 +249,12 @@ def find_code(session: Session, code: str, client_id: str, now: datetime) -> OAu
     return found
 
 
-def _grant_end(grant: OAuthGrant) -> datetime:
+def grant_end(grant: OAuthGrant) -> datetime:
     return grant.created_at + GRANT_LIFETIME
 
 
 def _issue(session: Session, grant: OAuthGrant, parent_hash: str | None, now: datetime) -> Issued:
-    end = _grant_end(grant)
+    end = grant_end(grant)
     access = ACCESS_PREFIX + secrets.token_urlsafe(32)
     refresh = REFRESH_PREFIX + secrets.token_urlsafe(32)
     for secret, kind, lifetime in (
@@ -323,7 +323,7 @@ def _live_refresh(
     grant = session.get(OAuthGrant, found.grant_id)
     if grant is None or grant.revoked_at is not None or grant.client_id != client_id:
         return None
-    if _grant_end(grant) <= now:
+    if grant_end(grant) <= now:
         return None
     return found, grant
 
@@ -406,7 +406,7 @@ def find_access(
     if found is None or found.kind != ACCESS or found.expires_at <= now:
         return None
     grant = session.get(OAuthGrant, found.grant_id)
-    if grant is None or grant.revoked_at is not None or _grant_end(grant) <= now:
+    if grant is None or grant.revoked_at is not None or grant_end(grant) <= now:
         return None
     if resource is not None and grant.resource != resource:
         return None
@@ -474,7 +474,7 @@ def list_grants(session: Session) -> list[dict[str, Any]]:
             "client_name": name,
             "permissions": grant.permissions,
             "created_at": grant.created_at.isoformat(),
-            "expires_at": _grant_end(grant).isoformat(),
+            "expires_at": grant_end(grant).isoformat(),
             "revoked_at": grant.revoked_at and grant.revoked_at.isoformat(),
         }
         for grant, name in rows

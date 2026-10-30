@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.request
 from dataclasses import replace
+from datetime import timedelta
 
 import anyio
 import httpx2
@@ -22,6 +23,7 @@ from sqlalchemy import text
 from test_oauth import (  # the OAuth fixtures and helpers
     PUBLIC,
     RESOURCE,
+    age_grant,
     agent,
     api,
     app,
@@ -38,6 +40,7 @@ from test_oauth import (  # the OAuth fixtures and helpers
 from jorgex_social.access.tokens import create_token
 from jorgex_social.api import create_app
 from jorgex_social.logs import hide_query_strings
+from jorgex_social.oauth import store
 from jorgex_social.publishing import catalog
 
 JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
@@ -396,6 +399,19 @@ def test_revoking_the_grant_kills_its_upload_urls(agent, browser):
     revoke(agent, client_id, tokens["access_token"])
 
     assert agent.post(path, content=JPEG).status_code == 404
+
+
+def test_an_upload_url_does_not_outlive_its_grant(app, agent, browser, clock):
+    _, tokens = connect(agent, browser, posts="write")
+    usable = new_url(agent, tokens["access_token"])
+    late = new_url(agent, tokens["access_token"])
+    age_grant(app, store.GRANT_LIFETIME - timedelta(minutes=5), clock.now())
+
+    assert agent.post(usable, content=JPEG).status_code == 201
+
+    clock.advance(minutes=5)  # well within the URL's own ten minutes
+
+    assert agent.post(late, content=JPEG).status_code == 404
 
 
 def test_upload_urls_are_limited_per_grant(agent, browser, clock):

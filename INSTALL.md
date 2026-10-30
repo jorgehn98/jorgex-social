@@ -232,8 +232,9 @@ service answers 429 without checking anything. There is no account lockout, so n
 out by failing on purpose from elsewhere. Password checks are expensive by design; at most two run at
 once, and a sign-in that cannot get a turn within two seconds gets 503.
 
-The audit log records each sign-in with the client's address. Denied sign-ins are deleted after 90
-days, since anyone can make the service write them; every other entry stays.
+The audit log records each sign-in with the client's address (IPv6: its `/64`). Denied sign-ins older
+than 90 days are deleted at the next successful sign-in, since anyone can make the service write
+them; every other entry stays.
 
 Three sign-ins with the right password and a wrong code within an hour, with no successful sign-in
 between them, open the incident `sign_in_password_accepted`: **your password may have leaked**, and
@@ -291,7 +292,8 @@ grant. If a client keeps failing to connect after that, clear what it stored and
 Claude Code, `claude mcp logout jorgex-social` (the name you gave it in `claude mcp add`).
 
 A grant lasts 90 days from your consent (`expires_at` in `list-grants`), however often its tokens are
-refreshed. Past that its tokens stop working and the client asks for your consent again.
+refreshed. Past that its tokens and upload URLs stop working and the client asks for your consent
+again.
 
 Clients may only register redirect URIs on the loopback address, so an approved code always goes
 back to the machine that asked. A client that needs an https redirect must be listed in

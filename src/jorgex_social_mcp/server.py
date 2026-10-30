@@ -439,7 +439,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     ) -> str:
         """Audit log of writes and denied calls, newest first. operator.login entries give the
         client address in detail, and reason wrong_code when a denied sign-in had the right
-        password. Denied sign-ins are kept for 90 days, everything else for good."""
+        password. Denied sign-ins older than 90 days are deleted at the next successful sign-in;
+        everything else stays."""
         query = {"object_type": object_type, "object_id": object_id, "limit": limit}
         return call("GET", "/v1/account/audit", query={**query, "offset": offset})
 

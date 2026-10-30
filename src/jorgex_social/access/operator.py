@@ -247,16 +247,18 @@ def log_in(
         current = get_operator(session)
         if current is None:
             return None
-        session.execute(
-            delete(AuditEntry).where(
-                AuditEntry.action == LOGIN,
-                AuditEntry.outcome == Outcome.DENIED,
-                AuditEntry.occurred_at <= now - DENIED_LOGIN_RETENTION,
-            )
-        )
         same_password = current.password_hash == operator.password_hash
         if step is not None and same_password and current.totp_last_step == operator.totp_last_step:
             current.totp_last_step = step
+            # Only here: it scans every audit row older than the retention under the write lock,
+            # and anyone on the internet can reach the denied path.
+            session.execute(
+                delete(AuditEntry).where(
+                    AuditEntry.action == LOGIN,
+                    AuditEntry.outcome == Outcome.DENIED,
+                    AuditEntry.occurred_at <= now - DENIED_LOGIN_RETENTION,
+                )
+            )
             session_id = secrets.token_urlsafe(32)
             session.execute(delete(OperatorSession).where(OperatorSession.expires_at <= now))
             session.add(
