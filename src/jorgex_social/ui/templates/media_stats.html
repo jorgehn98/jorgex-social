@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Media stats{% endblock %}
+{% block main %}
+<p><a href="/ui/stats">Stats</a></p>
+<h1 class="mono">{{ media_ref }}</h1>
+<p class="muted">{{ snapshots[0].product_type }} · published {{ snapshots[0].published_at | when }}{% if snapshots[0].permalink %} · <a href="{{ snapshots[0].permalink }}" rel="noreferrer noopener" target="_blank">open</a>{% endif %}</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Taken</th>{% for name in metrics %}<th class="num">{{ name | replace("_", " ") }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for s in snapshots %}
+    <tr>
+      <td class="when">{{ s.taken_at | when }}</td>
+      {% for name in metrics %}<td class="num">{{ s.metrics[name] if s.metrics.get(name) is not none else "—" }}</td>{% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}

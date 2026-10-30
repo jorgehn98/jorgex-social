@@ -18,6 +18,7 @@ from jorgex_social.replies.api import router as replies_router
 from jorgex_social.replies.intake import Intake
 from jorgex_social.replies.webhook import router as webhook_router
 from jorgex_social.stats.api import router as stats_router
+from jorgex_social.ui import routes as ui
 
 log = logging.getLogger(__name__)
 
@@ -64,4 +65,5 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.include_router(media_files_router)
     app.include_router(replies_router)
     app.include_router(webhook_router)
+    ui.install(app)
     return app

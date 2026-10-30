@@ -359,6 +359,17 @@ def list_posts(
     return [_out(session, post) for post in posts]
 
 
+def next_scheduled(session: Session, network: str, limit: int) -> list[dict]:
+    """Scheduled posts, soonest first: the order the worker publishes them in."""
+    query = (
+        select(Post)
+        .where(Post.network == network, Post.status == PostStatus.SCHEDULED)
+        .order_by(Post.scheduled_for, Post.id)
+        .limit(limit)
+    )
+    return [_out(session, post) for post in session.scalars(query)]
+
+
 @router.get("/posts/{post_id}", response_model=PostDetail, dependencies=PostsRead)
 def get_post(post_id: str, session: SessionDep, network: Network):
     """One post with its publish attempts."""

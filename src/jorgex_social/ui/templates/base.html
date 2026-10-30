@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}{% endblock %} · jorgex-social</title>
+<link rel="preload" href="/ui/static/fonts/inter-latin-var.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/ui/static/style.css">
+</head>
+<body>
+{% block body %}
+<header class="top">
+  <div class="top-inner">
+    <a class="wordmark" href="/ui/">Jorge<span class="x">X</span> Social</a>
+    <nav aria-label="Sections">
+      {% for href, label in [("/ui/", "Home"), ("/ui/posts", "Posts"), ("/ui/stats", "Stats"), ("/ui/rules", "Rules"), ("/ui/events", "Events"), ("/ui/incidents", "Incidents")] %}
+      <a href="{{ href }}"{% if request.url.path == href or (href != "/ui/" and request.url.path.startswith(href)) %} aria-current="page"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <form method="post" action="/ui/logout"><button type="submit">Sign out</button></form>
+  </div>
+</header>
+<main>
+{% block main %}{% endblock %}
+</main>
+{% endblock %}
+</body>
+</html>

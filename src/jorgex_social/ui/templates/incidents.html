@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, empty, detail %}
+{% block title %}Incidents{% endblock %}
+{% block main %}
+<h1>Incidents</h1>
+{% if incidents %}
+<div class="table-wrap"><table>
+  <thead><tr><th>Opened</th><th>Type</th><th>State</th><th>Acknowledged</th><th>Closed</th><th>Detail</th></tr></thead>
+  <tbody>
+  {% for i in incidents %}
+    <tr>
+      <td class="when">{{ i.opened_at | when }}</td>
+      <td class="mono">{{ i.type }}</td>
+      <td>{% if i.closed_at %}{{ pill("closed", "draft") }}{% else %}{{ pill("open", "incident") }}{% endif %}</td>
+      <td class="when">{{ i.acknowledged_at | when }}</td>
+      <td class="when">{{ i.closed_at | when }}</td>
+      <td>{{ detail(i.detail) }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No incidents.") }}{% endif %}
+{% endblock %}

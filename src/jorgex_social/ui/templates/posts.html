@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, empty %}
+{% block title %}Posts{% endblock %}
+{% block main %}
+<h1>Posts</h1>
+{% for title, found, folded in sections %}
+{% if folded %}<details class="folded"><summary><h2>{{ title }} <span class="muted mono">{{ found | length }}</span></h2></summary>
+{% else %}<h2>{{ title }} <span class="muted mono">{{ found | length }}</span></h2>{% endif %}
+{% if found %}
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>When</th><th>Type</th><th>Caption</th><th>Status</th><th>Link</th></tr></thead>
+  <tbody>
+  {% for p in found %}
+    <tr>
+      <td>{% if p.thumbnail %}<img class="thumb" src="/ui/media/{{ p.thumbnail }}" alt="" loading="lazy">{% endif %}</td>
+      <td class="when">{{ (p.published_at or p.scheduled_for or p.updated_at) | when }}</td>
+      <td class="mono">{{ p.type }}</td>
+      <td><a href="/ui/posts/{{ p.id }}">{{ p.caption | truncate(80) or "(no caption)" }}</a></td>
+      <td>{{ pill(p.status) }}{% if p.failure %} <span class="mono muted">{{ p.failure }}</span>{% endif %}</td>
+      <td>{% if p.permalink %}<a href="{{ p.permalink }}" rel="noreferrer noopener" target="_blank">open</a>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("None.") }}{% endif %}
+{% if folded %}</details>{% endif %}
+{% endfor %}
+{% endblock %}

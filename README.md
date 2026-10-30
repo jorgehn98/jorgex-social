@@ -111,6 +111,29 @@ Point the MCP server at `http://localhost:8000` while the tunnel is open (see
 [MCP server](#mcp-server)). Exposing `/v1` publicly also works, since every call needs a token, but
 then add a rate limit at the proxy so nobody can hammer it with guessed tokens.
 
+### Web interface
+
+A read-only web interface at `/ui` shows the connection, scheduled and published posts, insights,
+rules, events and incidents. It cannot change anything; agents and scripts keep using the API. It is
+for one operator, who signs in with a password and a TOTP code from an authenticator app:
+
+```sh
+docker compose exec api jorgex-social create-operator   # asks for the password (12+ characters)
+docker compose exec api jorgex-social enroll-totp       # shows an otpauth:// URI, asks for a code
+```
+
+`enroll-totp` prints the secret as an `otpauth://` URI (and as a plain key) for your authenticator
+app, and only enables it once you type a code the app shows. Running it again replaces the second
+factor; `set-password` changes the password. Both sign every browser out. Five failed sign-ins in a
+row lock the operator out for 15 minutes; `set-password` lifts the lock.
+
+Like the API, `/ui` is not public with the recommended proxy. Open the SSH tunnel and browse to
+`http://localhost:8000/ui/`. The session cookie is `Secure` for every host except a loopback one
+(`localhost`, `127.0.0.0/8`, `::1`) over plain http, which is how the tunnel reaches it; if you put
+`/ui` behind a proxy, serve it over HTTPS and rate-limit `POST /ui/login` there: each attempt costs
+an argon2 check, and the lockout protects the password, not the server's CPU. Sessions last 12 hours at most and end after an hour
+without activity.
+
 ### Switch to real mode
 
 1. Connect your account while the service is still in simulation. The command reads a long-lived
@@ -217,7 +240,8 @@ Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
 uv sync
 uv run jorgex-social migrate
 uv run jorgex-social create-token --name my-agent --grant posts=write --grant stats=read
-uv run jorgex-social serve        # API on http://127.0.0.1:8000, docs at /docs
+uv run jorgex-social create-operator && uv run jorgex-social enroll-totp   # for /ui
+uv run jorgex-social serve        # API on http://127.0.0.1:8000, docs at /docs, web interface at /ui
 uv run jorgex-social worker       # background worker
 uv run pytest
 uv run ruff check . && uv run ruff format --check .
@@ -268,3 +292,7 @@ described in [Reverse proxy](#reverse-proxy).
 ## License
 
 MIT. See `LICENSE`.
+
+The web interface ships the Outfit, Inter and JetBrains Mono fonts, which are not under MIT: each is
+licensed under the SIL Open Font License 1.1, whose text is next to the font files in
+`src/jorgex_social/ui/static/fonts/`.

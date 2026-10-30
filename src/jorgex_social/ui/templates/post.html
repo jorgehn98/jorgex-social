@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, empty %}
+{% block title %}Post{% endblock %}
+{% block main %}
+<p><a href="/ui/posts">Posts</a></p>
+<h1>{{ post.type | capitalize }} {{ pill(post.status) }}</h1>
+<div class="grid">
+  <div class="card">
+    <dl class="facts">
+      <dt>Id</dt><dd class="mono">{{ post.id }}</dd>
+      <dt>Scheduled</dt><dd class="mono">{{ post.scheduled_for | when }}</dd>
+      <dt>Published</dt><dd class="mono">{{ post.published_at | when }}</dd>
+      <dt>Failure</dt><dd class="mono">{{ post.failure or "—" }}</dd>
+      <dt>Media ref</dt><dd class="mono">{% if post.external_ref %}<a href="/ui/stats/{{ post.external_ref }}">{{ post.external_ref }}</a>{% else %}—{% endif %}</dd>
+      <dt>Link</dt><dd>{% if post.permalink %}<a href="{{ post.permalink }}" rel="noreferrer noopener" target="_blank">{{ post.permalink }}</a>{% else %}—{% endif %}</dd>
+      <dt>Hash</dt><dd class="mono">{{ post.content_hash }}</dd>
+      <dt>Source</dt><dd class="mono">{{ post.source_ref or "—" }}</dd>
+      <dt>Created</dt><dd class="mono">{{ post.created_at | when }}</dd>
+    </dl>
+  </div>
+  {% if thumbnail %}<div><img class="thumb-large" src="/ui/media/{{ thumbnail }}" alt="First image of the post"></div>{% endif %}
+</div>
+
+<h2>Caption</h2>
+<div class="card"><p class="caption">{{ post.caption or "(no caption)" }}</p></div>
+
+{% if post.errors or post.warnings %}
+<h2>Catalog</h2>
+<div class="card">
+  {% for issue in post.errors %}<p>{{ pill("error", "failed") }} <span class="mono">{{ issue.code }}</span> {{ issue.message }}</p>{% endfor %}
+  {% for issue in post.warnings %}<p>{{ pill("warning") }} <span class="mono">{{ issue.code }}</span> {{ issue.message }}</p>{% endfor %}
+</div>
+{% endif %}
+
+<h2>Items</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>#</th><th>Media</th><th>Type</th><th class="num">Bytes</th><th>File</th></tr></thead>
+  <tbody>
+  {% for m in items %}
+    <tr>
+      <td class="mono">{{ loop.index }}</td>
+      <td class="mono">{{ post["items"][loop.index0] }}</td>
+      <td class="mono">{{ m.type if m else "—" }}</td>
+      <td class="num">{{ "{:,}".format(m.bytes) if m else "—" }}</td>
+      <td>{% if m and on_disk[m.id] %}{{ pill("on disk", "ok") }}{% else %}{{ pill("deleted", "draft") }}{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+
+<h2>Publish attempts</h2>
+{% if post.attempts %}
+<div class="table-wrap"><table>
+  <thead><tr><th>#</th><th>Started</th><th>Ended</th><th>Result</th><th>Container</th><th>Error</th><th>Resolved</th></tr></thead>
+  <tbody>
+  {% for a in post.attempts %}
+    <tr>
+      <td class="mono">{{ a.number }}</td>
+      <td class="when">{{ a.started_at | when }}</td>
+      <td class="when">{{ a.ended_at | when }}</td>
+      <td>{{ pill(a.result, {"ok": "ok", "unknown": "warning", "in_progress": "pending"}.get(a.result, "failed")) }}</td>
+      <td class="mono">{{ a.container_ref or "—" }}</td>
+      <td class="mono">{% if a.error_code %}{{ a.error_code }}{% if a.error_subcode %}/{{ a.error_subcode }}{% endif %}{% else %}—{% endif %}</td>
+      <td class="mono">{% if a.resolved_as %}{{ a.resolved_as }} · {{ a.resolved_at | when }}{% else %}—{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}{{ empty("No attempts yet.") }}{% endif %}
+{% endblock %}
