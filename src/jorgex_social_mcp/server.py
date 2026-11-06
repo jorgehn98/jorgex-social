@@ -93,8 +93,11 @@ or `publish_now`. Always pass expected_hash, the content_hash you reviewed.
 may be null), failed (see failure; schedule it again once its cause is fixed) or \
 outcome_unknown.
 Editing a scheduled post returns it to draft. Only draft and scheduled posts can be edited or \
-cancelled; to change a failed post, create a new one. A post not published within the grace \
-window after its time (kill switch on, service down) fails as missed_schedule. With 50 posts \
+cancelled; to change a failed post, create a new one. `delete_post` removes a draft, cancelled \
+or failed post from the service (never one scheduled, publishing, published or \
+outcome_unknown) and archives the rules made for it; it deletes nothing on Instagram. A post \
+not published within the grace window after its time (kill switch on, service down) fails as \
+missed_schedule. With 50 posts \
 published in the last 24 hours, the next due post fails as daily_limit without reaching Instagram; \
 schedule it again for later. Do not write a caption that requires following, liking or \
 commenting to receive promised content: Meta's spam policy lists engagement gating.
@@ -189,9 +192,9 @@ description.
 Errors are JSON with a stable code and the HTTP status; act on the code:
 - invalid_token: the token is missing, unknown or revoked; stop. forbidden: this token lacks \
 the group or level named in the error; do not retry, tell the operator.
-- not_found: wrong id. invalid_state: the post, rule or conversation is not in a status that \
-allows it (for \
-a post, the error lists status and allowed).
+- not_found: wrong id, or a post already deleted. invalid_state: the post, rule or \
+conversation is not in a status that allows it (for a post, the error lists status and \
+allowed; to delete a scheduled post, cancel it first).
 - content_changed: the post changed since you reviewed it; read it again and review the new \
 content_hash. invalid_post: it fails the catalog; see errors. unknown_media: those media ids \
 do not exist (unused uploads are purged); upload the files again.
@@ -431,6 +434,15 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         """Cancel a draft or scheduled post. It will not be published and cannot be edited or
         scheduled again. Does not delete anything already on Instagram."""
         return call("POST", "/v1/posts/{}/cancel", post_id)
+
+    def delete_post(post_id: PostId) -> str:
+        """Delete a draft, cancelled or failed post and its publish attempts from this service;
+        scheduled, publishing, published and outcome_unknown posts are refused with
+        invalid_state (cancel a scheduled one first). Rules made for the post are archived, as
+        they could never fire; the answer lists them in archived_rule_ids. Deletes nothing on
+        Instagram. Its media stay usable by other posts and are purged once unused. Cannot be
+        undone; calling it again answers not_found."""
+        return call("DELETE", "/v1/posts/{}", post_id)
 
     def resolve_post(
         post_id: PostId,
@@ -820,6 +832,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ("posts", "write", upload_media, WRITE),
         ("posts", "write", create_post, WRITE),
         ("posts", "write", update_post, WRITE),
+        ("posts", "write", delete_post, WRITE),
         ("scheduling", "write", schedule_post, ON_ACCOUNT),
         ("scheduling", "write", publish_now, ON_ACCOUNT),
         ("scheduling", "write", cancel_post, WRITE),

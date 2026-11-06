@@ -6,7 +6,7 @@ from typing import Annotated, BinaryIO, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
@@ -17,6 +17,7 @@ from jorgex_social.access.deps import (
     require_outside_transaction,
 )
 from jorgex_social.access.tokens import Group, Level
+from jorgex_social.account.audit import set_detail
 from jorgex_social.publishing import catalog
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.catalog import Check, Issue
@@ -27,9 +28,11 @@ from jorgex_social.publishing.models import (
     PostItem,
     PostStatus,
     PostType,
+    PublishAttempt,
     Resolution,
     TrialMode,
 )
+from jorgex_social.replies.models import Rule
 from jorgex_social.replies.rules import bind_to_published
 
 router = APIRouter(prefix="/v1", tags=["publishing"])
@@ -43,6 +46,9 @@ SchedulingWrite = [Depends(require(Group.SCHEDULING, Level.WRITE))]
 
 EDITABLE = {PostStatus.DRAFT, PostStatus.SCHEDULED}
 SCHEDULABLE = {PostStatus.DRAFT, PostStatus.SCHEDULED, PostStatus.FAILED}
+# Never reached Instagram and nothing is under way. Published, scheduled, publishing and
+# outcome_unknown posts are not: the first lives on the account, the others may still go live.
+DELETABLE = {PostStatus.DRAFT, PostStatus.CANCELLED, PostStatus.FAILED}
 
 
 def _error(status_code: int, code: str, message: str, **extra) -> HTTPException:
@@ -495,6 +501,52 @@ def cancel_post(post_id: str, session: SessionDep, network: Network):
     post.status = PostStatus.CANCELLED
     post.scheduled_for = None
     return _out(session, post)
+
+
+class DeletedOut(BaseModel):
+    id: str
+    archived_rule_ids: list[str]
+
+
+@router.delete("/posts/{post_id}", response_model=DeletedOut, dependencies=PostsWrite)
+def delete_post(post_id: str, request: Request, session: SessionDep, network: Network):
+    """Delete a draft, cancelled or failed post with its publish attempts. Rules made for it are
+    archived, since they could never fire. Deletes nothing on Instagram; its media files are
+    purged later, once no other post uses them."""
+    post = _post(session, network, post_id)
+    _require_status(post, DELETABLE, "delete")
+    now = request.app.state.clock.now()
+    # Archived as well as unbound: a rule with neither post_id nor media_ref answers on every
+    # post. Already archived rules are unbound too, or their foreign key would block the delete.
+    rules = session.scalars(select(Rule).where(Rule.post_id == post.id)).all()
+    for rule in rules:
+        rule.active, rule.post_id, rule.updated_at = False, None, now
+        rule.archived_at = rule.archived_at or now
+    archived = [rule.id for rule in rules]
+    # The audit entry is all that remains of the post, so it keeps what could explain it later.
+    set_detail(
+        request,
+        {
+            "status": post.status,
+            "type": post.type,
+            "failure": post.failure,
+            "attempts": [
+                {
+                    "number": a.number,
+                    "result": a.result,
+                    "container_ref": a.container_ref,
+                    "error_code": a.error_code,
+                    "error_subcode": a.error_subcode,
+                }
+                for a in post.attempts
+            ],
+            "archived_rule_ids": archived,
+        },
+    )
+    session.execute(delete(PublishAttempt).where(PublishAttempt.post_id == post.id))
+    session.expire(post, ["attempts"])
+    session.delete(post)
+    return {"id": post_id, "archived_rule_ids": archived}
 
 
 class ResolveIn(BaseModel):
