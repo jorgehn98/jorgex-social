@@ -50,6 +50,7 @@ from jorgex_social.publishing.models import (
     PostType,
     PublishAttempt,
     Resolution,
+    TrialMode,
 )
 from jorgex_social.replies.rules import bind_to_published
 from jorgex_social.stats.snapshots import store_recent_media
@@ -78,6 +79,8 @@ MAX_POSTS_PER_DAY = 50
 # Instagram timestamps have whole seconds, so a post can look slightly older than its attempt.
 TIMESTAMP_SLACK = timedelta(minutes=1)
 RECENT_MEDIA_TO_SEARCH = 50
+# trial_params.graduation_strategy for each trial mode.
+GRADUATION = {TrialMode.MANUAL: "MANUAL", TrialMode.AUTO: "SS_PERFORMANCE"}
 # The fake never downloads anything, so simulation needs no real public URL.
 SIMULATED_PUBLIC_URL = "https://simulation.invalid"
 
@@ -128,6 +131,7 @@ class _Plan:
     items: list[tuple[bool, str]]  # (is_video, url) in order
     cover_url: str | None
     thumb_offset_ms: int | None
+    trial: TrialMode | None
 
 
 @dataclass(frozen=True)
@@ -244,6 +248,7 @@ class PublishTask:
                 ],
                 cover_url=url(post.cover_media_id) if post.cover_media_id else None,
                 thumb_offset_ms=post.thumb_offset_ms,
+                trial=TrialMode(post.trial) if post.trial else None,
             )
 
     def _published_since(self, session: Session, since: datetime) -> int:
@@ -340,6 +345,7 @@ class PublishTask:
                     caption=caption,
                     cover_url=plan.cover_url,
                     thumb_offset_ms=plan.thumb_offset_ms,
+                    graduation=GRADUATION[plan.trial] if plan.trial else None,
                 )
             case PostType.STORY:
                 # Stories take no caption; the catalog warned when one was set.

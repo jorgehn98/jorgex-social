@@ -30,7 +30,16 @@ UPLOAD_CONTENT_TYPES = {
 PostType = Annotated[
     str, Field(description="Post type: one of the keys of get_catalog's post_types.")
 ]
-CLEARABLE = Literal["cover_media_id", "thumb_offset_ms", "source_ref"]
+CLEARABLE = Literal["cover_media_id", "thumb_offset_ms", "trial", "source_ref"]
+Trial = Annotated[
+    str | None,
+    Field(
+        description="Reels only: publish as a trial reel, shown only to non-followers at first. "
+        "manual: it stays a trial until the operator shares it with followers in the Instagram "
+        "app. auto: Instagram shares it with followers if it performs well. Several variants of "
+        "one video must be manual: auto judges each reel alone and can share more than one."
+    ),
+]
 Channel = Annotated[
     str, Field(description="comment (top-level comments on posts) or message (direct messages).")
 ]
@@ -90,6 +99,14 @@ published in the last 24 hours, the next due post fails as daily_limit without r
 schedule it again for later. Do not write a caption that requires following, liking or \
 commenting to receive promised content: Meta's spam policy lists engagement gating.
 
+Trial reels: a reel with trial manual or auto is shown only to non-followers at first. To \
+compare variants of one video, publish each as a separate manual trial reel, compare them with \
+`media_stats` and `media_history`, and tell the operator which one does best: only the operator \
+can share it with followers, in the Instagram app. auto lets Instagram share any that performs \
+well, so with variants several near-identical reels could reach followers. Meta does not \
+document whether a trial reel shows in `list_instagram_media` or has statistics before it is \
+shared: if a variant has no statistics yet, say so instead of ranking it.
+
 outcome_unknown: the service cannot tell whether Instagram published the post and keeps \
 checking; after an hour it opens a publish_unresolved incident. Never schedule it again to \
 retry: it could publish twice. You may settle it as published yourself only when \
@@ -98,8 +115,8 @@ and exactly one media with a timestamp after that started_at and the post's prod
 media_type (image: FEED and IMAGE; carousel: FEED and CAROUSEL_ALBUM; reel: REELS and VIDEO), \
 and the operator did not publish by hand in that window (ask if unsure): then `resolve_post` \
 with published and that id. Never resolve not_published without a human checking the account: \
-absence from the listing proves nothing, and stories are never listed. Otherwise leave the post \
-as it is and report its publish_unresolved incident.
+absence from the listing proves nothing, stories are never listed and trial reels may not be. \
+Otherwise leave the post as it is and report its publish_unresolved incident.
 
 Rules: `create_rule` makes an inactive rule. `test_rules` with its rule_id and sample texts \
 shows what it would match and send, sending nothing. `activate_rule` makes it answer, only to \
@@ -322,6 +339,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         thumb_offset_ms: Annotated[
             int | None, Field(description="Video frame used as thumbnail, in milliseconds.")
         ] = None,
+        trial: Trial = None,
         source_ref: Annotated[
             str | None, Field(description="Your own reference for this post.")
         ] = None,
@@ -341,6 +359,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             "caption": caption,
             "cover_media_id": cover_media_id,
             "thumb_offset_ms": thumb_offset_ms,
+            "trial": trial,
             "source_ref": source_ref,
             "idempotency_key": idempotency_key,
         }
@@ -353,6 +372,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         caption: str | None = None,
         cover_media_id: str | None = None,
         thumb_offset_ms: int | None = None,
+        trial: Trial = None,
         source_ref: str | None = None,
         clear: Annotated[
             list[CLEARABLE] | None, Field(description="Optional fields to remove.")
@@ -368,6 +388,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             "caption": caption,
             "cover_media_id": cover_media_id,
             "thumb_offset_ms": thumb_offset_ms,
+            "trial": trial,
             "source_ref": source_ref,
         }
         given = {k: v for k, v in given.items() if v is not None}

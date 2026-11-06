@@ -197,6 +197,30 @@ def test_catalog_warnings_do_not_block():
     assert {w.code for w in reel_.warnings} == {"duration_unchecked", "thumb_offset_ignored"}
 
 
+def test_catalog_allows_trial_only_on_reels():
+    image = catalog.validate(
+        catalog.PostType.IMAGE, VALID_CAPTION, [media()], None, None, catalog.TrialMode.MANUAL
+    )
+    reel_ = catalog.validate(
+        catalog.PostType.REEL, VALID_CAPTION, [media("mp4")], None, None, catalog.TrialMode.AUTO
+    )
+
+    assert [e.code for e in image.errors] == ["trial_not_allowed"]
+    assert reel_.errors == []
+
+
+def test_content_hash_without_trial_is_the_one_stored_before_trial_reels():
+    # Computed by the code before trial reels existed: a change here breaks the expected_hash of
+    # every stored post.
+    cover = Media(type="jpeg", bytes=1, sha256="1" * 64)
+    items = [Media(type="mp4", bytes=1, sha256="0" * 64)]
+
+    assert (
+        catalog.content_hash(catalog.PostType.REEL, "Hello #ai", items, cover, 500)
+        == "9be2d7b8f3fe60c1493d93cc22fc511f4c351b894e74d3ae03c5780d59f0ab94"
+    )
+
+
 def test_catalog_endpoint_declares_the_limits(client, headers):
     body = client.get("/v1/catalog", headers=headers).json()
 
@@ -223,6 +247,28 @@ def test_hash_follows_content_not_identity(client, headers):
     other = create(client, headers, type="image", caption="Other", items=[image])
 
     assert first["content_hash"] == second["content_hash"] != other["content_hash"]
+
+
+def test_trial_is_part_of_the_hash_and_can_be_cleared(client, headers):
+    post = reel(client, headers)
+    trial = client.patch(f"/v1/posts/{post['id']}", json={"trial": "manual"}, headers=headers)
+    cleared = client.patch(f"/v1/posts/{post['id']}", json={"trial": None}, headers=headers)
+
+    assert trial.json()["trial"] == "manual"
+    assert trial.json()["content_hash"] != post["content_hash"]
+    # Without a trial the hash is the one it had before trial reels existed.
+    assert cleared.json()["trial"] is None
+    assert cleared.json()["content_hash"] == post["content_hash"]
+
+
+def test_unknown_trial_mode_is_rejected(client, headers):
+    response = client.post(
+        "/v1/posts",
+        json={"type": "reel", "caption": "x", "items": [], "trial": "maybe"},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
 
 
 def test_unknown_media_is_rejected(client, headers):

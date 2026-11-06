@@ -29,6 +29,15 @@ class PostType(StrEnum):
     STORY = "story"
 
 
+class TrialMode(StrEnum):
+    """A trial reel is shown only to non-followers at first. It reaches followers when the
+    operator shares it from the Instagram app (manual) or when Instagram sees it performing well
+    (auto); Instagram judges each trial reel alone, so variants of one video should be manual."""
+
+    MANUAL = "manual"
+    AUTO = "auto"
+
+
 class PostStatus(StrEnum):
     DRAFT = "draft"
     SCHEDULED = "scheduled"
@@ -85,6 +94,7 @@ class Post(Base):
     caption: Mapped[str] = mapped_column(Text, default="")
     cover_media_id: Mapped[str | None] = mapped_column(ForeignKey("media.id"))
     thumb_offset_ms: Mapped[int | None] = mapped_column(Integer)
+    trial: Mapped[str | None] = mapped_column(String(8))  # TrialMode; reels only
     scheduled_for: Mapped[datetime | None] = mapped_column(UTCDateTime)
     published_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     external_ref: Mapped[str | None] = mapped_column(String(64))

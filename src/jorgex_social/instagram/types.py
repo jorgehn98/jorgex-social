@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -36,6 +37,8 @@ class ContainerRequest:
     caption: str | None = None
     cover_url: str | None = None  # reels only; when set, Instagram ignores thumb_offset
     thumb_offset_ms: int | None = None
+    # reels only: makes it a trial reel; MANUAL or SS_PERFORMANCE (trial_params.graduation_strategy)
+    graduation: str | None = None
     is_carousel_item: bool = False
     children: tuple[str, ...] = field(default_factory=tuple)
 
@@ -52,6 +55,11 @@ class ContainerRequest:
                     "caption": self.caption,
                     "cover_url": self.cover_url,
                     "thumb_offset": self.thumb_offset_ms,
+                    "trial_params": (
+                        json.dumps({"graduation_strategy": self.graduation})
+                        if self.graduation
+                        else None
+                    ),
                 }
             case ContainerKind.STORIES:
                 key = "video_url" if self.is_video else "image_url"

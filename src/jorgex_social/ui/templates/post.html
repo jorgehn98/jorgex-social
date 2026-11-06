@@ -10,6 +10,7 @@
       <dt>Id</dt><dd class="mono">{{ post.id }}</dd>
       <dt>Scheduled</dt><dd class="mono">{{ post.scheduled_for | when }}</dd>
       <dt>Published</dt><dd class="mono">{{ post.published_at | when }}</dd>
+      {% if post.trial %}<dt>Trial reel</dt><dd class="mono">{{ post.trial }}</dd>{% endif %}
       <dt>Failure</dt><dd class="mono">{{ post.failure or "—" }}</dd>
       <dt>Media ref</dt><dd class="mono">{% if post.external_ref %}<a href="/ui/stats/{{ post.external_ref }}">{{ post.external_ref }}</a>{% else %}—{% endif %}</dd>
       <dt>Link</dt><dd>{% if post.permalink %}<a href="{{ post.permalink }}" rel="noreferrer noopener" target="_blank">{{ post.permalink }}</a>{% else %}—{% endif %}</dd>

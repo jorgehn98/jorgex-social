@@ -9,7 +9,9 @@ through an authenticated REST API, so an AI agent can operate it end to end.
 ## What it does
 
 - Publishes images, carousels, reels and stories to your own Instagram professional account, at the
-  time you schedule (the Instagram API does not schedule; the worker does).
+  time you schedule (the Instagram API does not schedule; the worker does). A reel can go out as a
+  trial reel, shown only to non-followers until you share it with followers in the Instagram app,
+  or until Instagram does it for you if it performs well.
 - Takes insights snapshots and keeps their history, beyond the 90 days Instagram keeps.
 - Replies to comments and direct messages by rules ("if a comment on this post contains X, reply
   with one of these versions"), within Meta's limits: one private reply per comment within 7 days,

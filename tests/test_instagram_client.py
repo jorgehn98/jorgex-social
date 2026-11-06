@@ -79,6 +79,15 @@ def test_get_params_go_in_the_query_and_post_params_in_the_body():
             },
         ),
         (
+            ContainerRequest(ContainerKind.REELS, url="v", caption="c", graduation="MANUAL"),
+            {
+                "media_type": "REELS",
+                "video_url": "v",
+                "caption": "c",
+                "trial_params": '{"graduation_strategy": "MANUAL"}',
+            },
+        ),
+        (
             ContainerRequest(ContainerKind.STORIES, url="v", is_video=True),
             {"media_type": "STORIES", "video_url": "v"},
         ),

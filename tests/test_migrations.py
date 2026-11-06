@@ -105,3 +105,26 @@ def test_the_rule_post_column_keeps_existing_rows(settings):
         assert db.execute("PRAGMA foreign_key_list(rules)").fetchall() == []
         assert db.execute("SELECT id FROM deliveries").fetchall() == [("d",)]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_downgrading_trial_returns_scheduled_trial_reels_to_draft(settings):
+    config = alembic_config(settings)
+    command.upgrade(config, "head")
+    with sqlite3.connect(settings.database_path) as db:
+        for post_id, status, trial in [
+            ("trial", "scheduled", "manual"),
+            ("plain", "scheduled", None),
+            ("draft", "draft", "auto"),
+        ]:
+            db.execute(
+                "INSERT INTO posts (id, network, type, status, caption, scheduled_for, trial,"
+                " content_hash, created_at, updated_at)"
+                " VALUES (?, 'n', 'reel', ?, 'c', 's', ?, 'h', 't', 't')",
+                (post_id, status, trial),
+            )
+
+    command.downgrade(config, "0014")
+
+    with sqlite3.connect(settings.database_path) as db:
+        rows = db.execute("SELECT id, status, scheduled_for FROM posts ORDER BY id").fetchall()
+    assert rows == [("draft", "draft", "s"), ("plain", "scheduled", "s"), ("trial", "draft", None)]

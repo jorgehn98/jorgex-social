@@ -7,7 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from jorgex_social.publishing.models import Media, MediaType, PostType
+from jorgex_social.publishing.models import Media, MediaType, PostType, TrialMode
 
 MB = 1024 * 1024
 MAX_IMAGE_BYTES = 8 * MB
@@ -34,6 +34,7 @@ CATALOG = {
         "caption": "required",
         "cover": {"types": ["jpeg"], "max_bytes": MAX_IMAGE_BYTES},
         "thumb_offset_ms": {"min": 0},
+        "trial": [mode.value for mode in TrialMode],
     },
     PostType.CAROUSEL: {
         "items": {
@@ -87,6 +88,7 @@ def validate(
     items: list[Media],
     cover: Media | None,
     thumb_offset_ms: int | None,
+    trial: TrialMode | None = None,
 ) -> Check:
     """Errors block scheduling; warnings do not. Video duration and aspect ratio are not checked:
     that would need ffprobe, a new dependency."""
@@ -142,6 +144,9 @@ def validate(
                 Issue("thumb_offset_ignored", "With a cover image, Instagram ignores thumb_offset.")
             )
 
+    if trial is not None and post_type != PostType.REEL:
+        errors.append(Issue("trial_not_allowed", "Only reels can be trial reels."))
+
     if post_type == PostType.STORY:
         if caption.strip():
             warnings.append(
@@ -165,6 +170,7 @@ def content_hash(
     items: list[Media],
     cover: Media | None,
     thumb_offset_ms: int | None,
+    trial: TrialMode | None = None,
 ) -> str:
     """Fingerprint of what would go live; schedule and publish-now refuse if it changed."""
     material = {
@@ -174,5 +180,8 @@ def content_hash(
         "cover": cover.sha256 if cover else None,
         "thumb_offset_ms": thumb_offset_ms,
     }
+    # Only when set, so the hashes of posts stored before trial reels existed do not change.
+    if trial is not None:
+        material["trial"] = trial.value
     raw = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()

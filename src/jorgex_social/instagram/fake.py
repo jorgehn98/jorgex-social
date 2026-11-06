@@ -227,6 +227,8 @@ class FakeInstagram:
             raise Refused("media url is required", code=100)
         elif request.kind == ContainerKind.VIDEO and not request.is_carousel_item:
             raise Refused("VIDEO containers are only for carousel items; use REELS", code=100)
+        if request.graduation and request.kind != ContainerKind.REELS:
+            raise Refused("trial_params needs media_type REELS", code=100)
         now = self.clock.now()
         is_video = request.kind in {ContainerKind.REELS, ContainerKind.VIDEO} or request.is_video
         container_id = self._new_id()
