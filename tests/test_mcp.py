@@ -131,6 +131,14 @@ async def test_tools_follow_the_token_permissions(app, transport, grants, expect
     assert await tool_names(server_for(app, transport, **grants)) == expected | {"get_token"}
 
 
+async def test_delete_post_asks_for_confirmation_but_stays_off_instagram(app, transport):
+    async with Client(server_for(app, transport, posts="write")) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    hints = tools["delete_post"].annotations
+    assert (hints.destructive_hint, hints.open_world_hint) == (True, False)
+
+
 async def test_get_token_shows_the_token_permissions(app, transport):
     async with Client(server_for(app, transport, stats="read")) as client:
         result = await call(client, "get_token")

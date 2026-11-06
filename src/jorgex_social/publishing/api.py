@@ -17,6 +17,7 @@ from jorgex_social.access.deps import (
     require_outside_transaction,
 )
 from jorgex_social.access.tokens import Group, Level
+from jorgex_social.account import audit
 from jorgex_social.account.audit import set_detail
 from jorgex_social.publishing import catalog
 from jorgex_social.publishing import media as storage
@@ -503,6 +504,10 @@ def cancel_post(post_id: str, session: SessionDep, network: Network):
     return _out(session, post)
 
 
+def _iso(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment else None
+
+
 class DeletedOut(BaseModel):
     id: str
     archived_rule_ids: list[str]
@@ -522,6 +527,14 @@ def delete_post(post_id: str, request: Request, session: SessionDep, network: Ne
     for rule in rules:
         rule.active, rule.post_id, rule.updated_at = False, None, now
         rule.archived_at = rule.archived_at or now
+        audit.record(
+            session,
+            now,
+            "rule.archived",
+            object_type="rule",
+            object_id=rule.id,
+            detail={"deleted_post_id": post.id},
+        )
     archived = [rule.id for rule in rules]
     # The audit entry is all that remains of the post, so it keeps what could explain it later.
     set_detail(
@@ -533,10 +546,14 @@ def delete_post(post_id: str, request: Request, session: SessionDep, network: Ne
             "attempts": [
                 {
                     "number": a.number,
+                    "started_at": _iso(a.started_at),
+                    "ended_at": _iso(a.ended_at),
                     "result": a.result,
                     "container_ref": a.container_ref,
                     "error_code": a.error_code,
                     "error_subcode": a.error_subcode,
+                    "resolved_at": _iso(a.resolved_at),
+                    "resolved_as": a.resolved_as,
                 }
                 for a in post.attempts
             ],

@@ -471,10 +471,14 @@ def test_delete_a_failed_post_takes_its_attempts_and_leaves_a_trace(app, client,
         "attempts": [
             {
                 "number": 1,
+                "started_at": START.isoformat(),
+                "ended_at": None,
                 "result": "rejected",
                 "container_ref": "c1",
                 "error_code": 2207081,
                 "error_subcode": None,
+                "resolved_at": None,
+                "resolved_as": None,
             }
         ],
         "archived_rule_ids": [],
@@ -537,7 +541,11 @@ def test_delete_archives_and_unbinds_the_rules_made_for_the_post(app, client, he
     assert sorted(response.json()["archived_rule_ids"]) == ["active", "archived"]
     with app.state.sessionmaker() as session:
         rules = {r.id: r for r in session.scalars(select(Rule))}
+        archived_entries = session.scalars(
+            select(AuditEntry.object_id).where(AuditEntry.action == "rule.archived")
+        ).all()
     assert {(r.active, r.post_id) for r in (rules["active"], rules["archived"])} == {(False, None)}
+    assert sorted(archived_entries) == ["active", "archived"]
     assert rules["active"].archived_at == clock.now()
     assert rules["archived"].archived_at == START  # kept as it was
     assert (rules["other"].active, rules["other"].post_id, rules["other"].archived_at) == (

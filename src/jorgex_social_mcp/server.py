@@ -61,6 +61,8 @@ ConversationId = Annotated[
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+# Cannot be undone, but touches only this service.
+DELETE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
 # Acts on the real Instagram account unless the service runs in simulation.
 ON_ACCOUNT = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
@@ -832,7 +834,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ("posts", "write", upload_media, WRITE),
         ("posts", "write", create_post, WRITE),
         ("posts", "write", update_post, WRITE),
-        ("posts", "write", delete_post, WRITE),
+        ("posts", "write", delete_post, DELETE),
         ("scheduling", "write", schedule_post, ON_ACCOUNT),
         ("scheduling", "write", publish_now, ON_ACCOUNT),
         ("scheduling", "write", cancel_post, WRITE),
