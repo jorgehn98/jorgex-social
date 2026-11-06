@@ -105,7 +105,7 @@ compare variants of one video, publish each as a separate manual trial reel, com
 can share it with followers, in the Instagram app. auto lets Instagram share any that performs \
 well, so with variants several near-identical reels could reach followers. Meta does not \
 document whether a trial reel shows in `list_instagram_media` or has statistics before it is \
-shared.
+shared: if a variant has no statistics yet, say so instead of ranking it.
 
 outcome_unknown: the service cannot tell whether Instagram published the post and keeps \
 checking; after an hour it opens a publish_unresolved incident. Never schedule it again to \

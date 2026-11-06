@@ -209,6 +209,18 @@ def test_catalog_allows_trial_only_on_reels():
     assert reel_.errors == []
 
 
+def test_content_hash_without_trial_is_the_one_stored_before_trial_reels():
+    # Computed by the code before trial reels existed: a change here breaks the expected_hash of
+    # every stored post.
+    cover = Media(type="jpeg", bytes=1, sha256="1" * 64)
+    items = [Media(type="mp4", bytes=1, sha256="0" * 64)]
+
+    assert (
+        catalog.content_hash(catalog.PostType.REEL, "Hello #ai", items, cover, 500)
+        == "9be2d7b8f3fe60c1493d93cc22fc511f4c351b894e74d3ae03c5780d59f0ab94"
+    )
+
+
 def test_catalog_endpoint_declares_the_limits(client, headers):
     body = client.get("/v1/catalog", headers=headers).json()
 
