@@ -182,6 +182,20 @@ def test_reel_cover_is_sent_with_its_own_url(api, task, sessions, requests):
     assert request.thumb_offset_ms == 1500
 
 
+@pytest.mark.parametrize(
+    ("trial", "graduation"), [("manual", "MANUAL"), ("auto", "SS_PERFORMANCE")]
+)
+def test_trial_reel_is_sent_with_its_graduation(api, task, sessions, requests, trial, graduation):
+    post_id = api.post(trial=trial)
+    api.publish_now(post_id)
+
+    task(sessions)
+
+    [request] = requests
+    assert request.graduation == graduation
+    assert api.get(post_id)["status"] == "published"
+
+
 def test_media_url_is_public_during_the_attempt_and_revoked_after(
     api, client, sessions, ig, clock, settings, requests
 ):

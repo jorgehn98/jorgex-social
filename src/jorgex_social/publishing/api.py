@@ -28,6 +28,7 @@ from jorgex_social.publishing.models import (
     PostStatus,
     PostType,
     Resolution,
+    TrialMode,
 )
 from jorgex_social.replies.rules import bind_to_published
 
@@ -175,6 +176,8 @@ class PostIn(BaseModel):
     items: list[str] = Field(max_length=50)
     cover_media_id: str | None = None
     thumb_offset_ms: int | None = None
+    # Reels only: shown to non-followers first (see TrialMode).
+    trial: TrialMode | None = None
     source_ref: str | None = Field(None, max_length=500)
     # Sending the same key again returns the post created the first time.
     idempotency_key: str | None = Field(None, min_length=1, max_length=200)
@@ -188,6 +191,8 @@ class PostPatch(BaseModel):
     items: list[str] | None = Field(None, max_length=50)
     cover_media_id: str | None = None
     thumb_offset_ms: int | None = None
+    # Reels only: shown to non-followers first (see TrialMode).
+    trial: TrialMode | None = None
     source_ref: str | None = Field(None, max_length=500)
 
 
@@ -212,6 +217,7 @@ class PostOut(BaseModel):
     items: list[str]
     cover_media_id: str | None
     thumb_offset_ms: int | None
+    trial: TrialMode | None
     source_ref: str | None
     idempotency_key: str | None
     content_hash: str
@@ -246,6 +252,7 @@ def _check(session: Session, post: Post) -> Check:
         [media[item.media_id] for item in post.items],
         media.get(post.cover_media_id) if post.cover_media_id else None,
         post.thumb_offset_ms,
+        TrialMode(post.trial) if post.trial else None,
     )
 
 
@@ -270,18 +277,21 @@ def _set_content(
     item_ids: list[str],
     cover_id: str | None,
     thumb_offset_ms: int | None,
+    trial: TrialMode | None,
 ) -> None:
     media = _media(session, item_ids + ([cover_id] if cover_id else []))
     post.type = post_type
     post.caption = caption
     post.cover_media_id = cover_id
     post.thumb_offset_ms = thumb_offset_ms
+    post.trial = trial
     post.content_hash = catalog.content_hash(
         post_type,
         caption,
         [media[i] for i in item_ids],
         media.get(cover_id) if cover_id else None,
         thumb_offset_ms,
+        trial,
     )
     session.add(post)
     # Flush the removal first: the new items reuse the (post_id, position) keys.
@@ -346,6 +356,7 @@ def create_post(body: PostIn, session: SessionDep, network: Network, response: R
         body.items,
         body.cover_media_id,
         body.thumb_offset_ms,
+        body.trial,
     )
     return _out(session, post)
 
@@ -401,6 +412,7 @@ def update_post(post_id: str, body: PostPatch, session: SessionDep, network: Net
         body.items if "items" in fields else [item.media_id for item in post.items],
         body.cover_media_id if "cover_media_id" in fields else post.cover_media_id,
         body.thumb_offset_ms if "thumb_offset_ms" in fields else post.thumb_offset_ms,
+        body.trial if "trial" in fields else (TrialMode(post.trial) if post.trial else None),
     )
     if "source_ref" in fields:
         post.source_ref = body.source_ref
