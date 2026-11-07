@@ -498,6 +498,8 @@ too, within the 24-hour public and 7-day private windows.
 - It does not work for a post published by hand in the Instagram app: add `media_ref` to the rule
   afterwards.
 - Comments from before the rule's activation are never answered.
+- Deleting the post (`DELETE /v1/posts/{id}`, only for draft, cancelled or failed posts) archives
+  the rule, since it could never fire.
 - `post_id` applies to comment rules only, and is refused for stories and cancelled posts. A rule whose
   post is later cancelled, or fails, keeps waiting and gets the warning `post_not_going_out`. One whose
   draft is later edited into a story gets `post_is_a_story`, and answers nothing on it.

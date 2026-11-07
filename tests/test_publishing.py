@@ -6,12 +6,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account.models import AuditEntry
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
 from jorgex_social.publishing import catalog
 from jorgex_social.publishing import media as storage
-from jorgex_social.publishing.models import Media, Post
+from jorgex_social.publishing.models import Media, Post, PostItem, PublishAttempt
+from jorgex_social.replies.models import Rule
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
@@ -392,6 +394,194 @@ def test_cancel_only_from_draft_or_scheduled(client, headers):
 
     assert first.json()["status"] == "cancelled"
     assert second.status_code == 409
+
+
+# Delete
+
+
+def set_status(app, post_id, status, **fields):
+    with app.state.sessionmaker() as session, session.begin():
+        post = session.get(Post, post_id)
+        post.status = status
+        for name, value in fields.items():
+            setattr(post, name, value)
+
+
+def add_rule(app, clock, rule_id, post_id, *, archived=False):
+    with app.state.sessionmaker() as session, session.begin():
+        session.add(
+            Rule(
+                id=rule_id,
+                network=app.state.network,
+                name=rule_id,
+                channel="comment",
+                post_id=post_id,
+                priority=1,
+                active=not archived,
+                activated_at=clock.now(),
+                content={"keywords": ["price"], "private_replies": ["See the website."]},
+                created_at=clock.now(),
+                updated_at=clock.now(),
+                archived_at=START if archived else None,
+            )
+        )
+
+
+@pytest.mark.parametrize("status", ["draft", "cancelled"])
+def test_delete_removes_a_post_that_never_reached_instagram(app, client, headers, status):
+    post = reel(client, headers)
+    set_status(app, post["id"], status)
+
+    response = client.delete(f"/v1/posts/{post['id']}", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {"id": post["id"], "archived_rule_ids": []}
+    assert client.get(f"/v1/posts/{post['id']}", headers=headers).status_code == 404
+
+
+def test_delete_a_failed_post_takes_its_attempts_and_leaves_a_trace(app, client, headers, clock):
+    post = reel(client, headers)
+    set_status(app, post["id"], "failed", failure="refused")
+    with app.state.sessionmaker() as session, session.begin():
+        session.add(
+            PublishAttempt(
+                post_id=post["id"],
+                number=1,
+                started_at=clock.now(),
+                result="rejected",
+                container_ref="c1",
+                error_code=2207081,
+            )
+        )
+
+    response = client.delete(f"/v1/posts/{post['id']}", headers=headers)
+
+    assert response.status_code == 200
+    with app.state.sessionmaker() as session:
+        for model in (Post, PostItem, PublishAttempt):
+            assert session.scalar(select(func.count()).select_from(model)) == 0
+        entry = session.scalars(
+            select(AuditEntry).where(AuditEntry.action == "DELETE /v1/posts/{post_id}")
+        ).one()
+    assert (entry.object_type, entry.object_id, entry.outcome) == ("post", post["id"], "ok")
+    assert entry.detail == {
+        "status": "failed",
+        "type": "reel",
+        "failure": "refused",
+        "attempts": [
+            {
+                "number": 1,
+                "started_at": START.isoformat(),
+                "ended_at": None,
+                "result": "rejected",
+                "container_ref": "c1",
+                "error_code": 2207081,
+                "error_subcode": None,
+                "resolved_at": None,
+                "resolved_as": None,
+            }
+        ],
+        "archived_rule_ids": [],
+    }
+
+
+@pytest.mark.parametrize("status", ["scheduled", "publishing", "published", "outcome_unknown"])
+def test_delete_refuses_posts_in_flight_or_on_instagram(app, client, headers, status):
+    post = reel(client, headers)
+    set_status(app, post["id"], status)
+
+    response = client.delete(f"/v1/posts/{post['id']}", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "invalid_state",
+        "message": f"Cannot delete a post that is {status}.",
+        "status": status,
+        "allowed": ["cancelled", "draft", "failed"],
+    }
+    assert client.get(f"/v1/posts/{post['id']}", headers=headers).json()["status"] == status
+
+
+def test_delete_unknown_already_deleted_or_other_mode_is_404(settings, clock, client, headers):
+    post = reel(client, headers)
+    client.delete(f"/v1/posts/{post['id']}", headers=headers)
+    other = reel(client, headers)
+    real = TestClient(
+        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
+    )
+
+    for c, post_id in ((client, "nope"), (client, post["id"]), (real, other["id"])):
+        response = c.delete(f"/v1/posts/{post_id}", headers=headers)
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "not_found"
+
+
+def test_delete_needs_posts_write(app, client, headers):
+    post = reel(client, headers)
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "scheduler", {"posts": "read", "scheduling": "write"})
+
+    response = client.delete(
+        f"/v1/posts/{post['id']}", headers={"Authorization": f"Bearer {secret}"}
+    )
+
+    assert response.status_code == 403
+
+
+def test_delete_archives_and_unbinds_the_rules_made_for_the_post(app, client, headers, clock):
+    post = reel(client, headers)
+    kept = reel(client, headers)
+    add_rule(app, clock, "active", post["id"])
+    add_rule(app, clock, "archived", post["id"], archived=True)
+    add_rule(app, clock, "other", kept["id"])
+
+    response = client.delete(f"/v1/posts/{post['id']}", headers=headers)
+
+    assert response.status_code == 200
+    assert sorted(response.json()["archived_rule_ids"]) == ["active", "archived"]
+    with app.state.sessionmaker() as session:
+        rules = {r.id: r for r in session.scalars(select(Rule))}
+        archived_entries = session.scalars(
+            select(AuditEntry.object_id).where(AuditEntry.action == "rule.archived")
+        ).all()
+    assert {(r.active, r.post_id) for r in (rules["active"], rules["archived"])} == {(False, None)}
+    assert sorted(archived_entries) == ["active", "archived"]
+    assert rules["active"].archived_at == clock.now()
+    assert rules["archived"].archived_at == START  # kept as it was
+    assert (rules["other"].active, rules["other"].post_id, rules["other"].archived_at) == (
+        True,
+        kept["id"],
+        None,
+    )
+
+
+def test_delete_leaves_media_to_the_purge(app, client, headers, clock):
+    post = reel(client, headers)
+    published = create(client, headers, type="reel", items=post["items"])
+    kept_until = clock.now() + storage.KEEP_AFTER_PUBLISH
+    set_status(app, published["id"], "published")
+    with app.state.sessionmaker() as session, session.begin():
+        session.get(Media, post["items"][0]).delete_at = kept_until
+
+    client.delete(f"/v1/posts/{post['id']}", headers=headers)
+
+    with app.state.sessionmaker() as session:
+        media = session.get(Media, post["items"][0])
+    assert (media.delete_at, media.deleted_at) == (kept_until, None)
+
+
+def test_idempotency_key_can_be_used_again_after_delete(client, headers):
+    first = reel(client, headers, idempotency_key="k1")
+    client.delete(f"/v1/posts/{first['id']}", headers=headers)
+
+    again = client.post(
+        "/v1/posts",
+        json={"type": "reel", "items": first["items"], "idempotency_key": "k1"},
+        headers=headers,
+    )
+
+    assert again.status_code == 201
+    assert again.json()["id"] != first["id"]
 
 
 def test_list_filters_by_status(client, headers):

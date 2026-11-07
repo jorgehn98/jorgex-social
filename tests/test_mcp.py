@@ -26,7 +26,7 @@ MP4 = b"\x00\x00\x00\x18ftypisom" + b"v" * 64
 ALL_WRITE = {g: "write" for g in ("posts", "scheduling", "stats", "account", "rules", "events")}
 
 READ_POSTS = {"get_catalog", "list_posts", "get_post"}
-WRITE_POSTS = {"upload_media", "create_post", "update_post"}
+WRITE_POSTS = {"upload_media", "create_post", "update_post", "delete_post"}
 SCHEDULING = {"schedule_post", "publish_now", "cancel_post", "resolve_post"}
 STATS = {"account_stats", "media_stats", "media_history", "list_instagram_media"}
 READ_ACCOUNT = {"get_account", "list_incidents", "audit_log", "get_appearance"}
@@ -131,6 +131,14 @@ async def test_tools_follow_the_token_permissions(app, transport, grants, expect
     assert await tool_names(server_for(app, transport, **grants)) == expected | {"get_token"}
 
 
+async def test_delete_post_asks_for_confirmation_but_stays_off_instagram(app, transport):
+    async with Client(server_for(app, transport, posts="write")) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    hints = tools["delete_post"].annotations
+    assert (hints.destructive_hint, hints.open_world_hint) == (True, False)
+
+
 async def test_get_token_shows_the_token_permissions(app, transport):
     async with Client(server_for(app, transport, stats="read")) as client:
         result = await call(client, "get_token")
@@ -194,6 +202,7 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
             ),
             "scheduled": await call(client, "schedule_post", post_id=pid, scheduled_for=when),
             "cancelled": await call(client, "cancel_post", post_id=pid),
+            "deleted": await call(client, "delete_post", post_id=pid),
             "account_stats": await call(client, "account_stats", limit=7),
             "media_stats": await call(client, "media_stats"),
             "history": await call(client, "media_history", media_ref="m1"),
@@ -218,6 +227,7 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
         ("PATCH", f"/v1/posts/{pid}"),
         ("POST", f"/v1/posts/{pid}/schedule"),
         ("POST", f"/v1/posts/{pid}/cancel"),
+        ("DELETE", f"/v1/posts/{pid}"),
         ("GET", "/v1/stats/account?limit=7"),
         ("GET", "/v1/stats/media"),
         ("GET", "/v1/stats/media/m1"),
@@ -241,6 +251,7 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
     assert r["edited"][1]["caption"] == "Bye"
     assert r["scheduled"][1]["status"] == "scheduled"
     assert r["cancelled"][1]["status"] == "cancelled"
+    assert r["deleted"] == ("ok", {"id": pid, "archived_rule_ids": []})
     assert r["account_stats"] == r["media_stats"] == r["history"] == ("ok", [])
     assert r["account"][1]["kill_switch"] is False
     assert r["incidents"] == ("ok", [])
