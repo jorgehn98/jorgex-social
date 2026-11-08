@@ -49,7 +49,7 @@ class Reason(StrEnum):
     KILL_SWITCH = "kill_switch"
     PAUSED = "paused"
     WINDOW_CLOSED = "window_closed"
-    HOURLY_CAP = "hourly_cap"
+    HOURLY_CAP = "hourly_cap"  # only on older rows: a reply over a cap now waits, pending
     COOLDOWN = "cooldown"  # the rule already answered this person a moment ago
     ALREADY_ANSWERED = "already_answered"  # the rule already answered this person on this post
     REFUSED = "refused"  # Instagram said no; nothing was sent

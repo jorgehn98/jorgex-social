@@ -50,8 +50,8 @@ RuleContent = Annotated[
         description="keywords (list, required), exclude (list), match (word, contains or "
         "exact; default word), public_replies (comment rules only) and private_replies (the "
         "private reply to a comment, or the answer to a message): lists of variants, one picked "
-        "at random. public_replies needs at least 3 variants that differ in more than case, "
-        "accents or spacing, or none at all; private_replies has no minimum. Matching ignores "
+        "at random. public_replies needs at least 5 variants and private_replies at least 3, "
+        "that differ in more than case, accents or spacing, or none at all. Matching ignores "
         "case and accents. The API validates it and says what is wrong."
     ),
 ]
@@ -146,10 +146,11 @@ Instagram app: add its media_ref to the rule afterwards with `update_rule`. Comm
 activation are not answered either way. A story cannot be linked, and a linked post edited into a \
 story gets the warning post_is_a_story, because the rule answers nothing on it.
 
-A rule that replies publicly needs at least 3 public variants that differ in more than case, \
-accents or spacing. That is this service's own floor, not a Meta rule, and it is refused with \
-status 422, not warned about. A rule stored earlier with fewer keeps answering, but any edit to \
-it, even of its name alone, gets that same refusal until its content is fixed.
+A rule that replies publicly needs at least 5 public variants, and one with private replies at \
+least 3, that differ in more than case, accents or spacing. That is this service's own floor, \
+not a Meta rule, and it is refused with status 422, not warned about. A rule stored earlier with \
+fewer keeps answering, but any edit to it, even of its name alone, gets that same refusal until \
+its content is fixed.
 
 A rule's warnings list what automation users report as risky (public replies on every post, a \
 link in the first private message, replies with no words). They are \
@@ -665,9 +666,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         ] = None,
     ) -> str:
         """Create an inactive rule. It answers nothing until activate_rule. public_replies needs
-        at least 3 variants that differ in more than case, accents or spacing, or none at all:
-        this service's own floor, not a Meta rule. The answer's warnings list what automation
-        users report as risky; they block nothing."""
+        at least 5 variants and private_replies at least 3, that differ in more than case,
+        accents or spacing, or none at all: this service's own floor, not a Meta rule. The answer's
+        warnings list what automation users report as risky; they block nothing."""
         body = {
             "name": name,
             "channel": channel,
@@ -704,10 +705,11 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     ) -> str:
         """Edit a rule; only the fields given change. An active rule keeps answering, with the
         new content from now on. Archived rules cannot be edited. public_replies needs at least
-        3 variants that differ in more than case, accents or spacing, or none at all: this
-        service's own floor, not a Meta rule. A rule stored with fewer keeps answering, but any
-        edit, even of its name alone, gets that same refusal until content fixes it. The answer's
-        warnings list what automation users report as risky; they block nothing."""
+        5 variants and private_replies at least 3, that differ in more than case, accents or
+        spacing, or none at all: this service's own floor, not a Meta rule. A rule stored with fewer
+        keeps answering, but any edit, even of its name alone, gets that same refusal until
+        content fixes it. The answer's warnings list what automation users report as risky; they
+        block nothing."""
         given = {
             "name": name,
             "content": content,
@@ -790,7 +792,7 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             str | None,
             Field(
                 description="Why skipped or failed: kill_switch, paused, window_closed, "
-                "cooldown, already_answered, hourly_cap, refused or unknown."
+                "cooldown, already_answered, hourly_cap (older replies only), refused or unknown."
             ),
         ] = None,
         action: Annotated[
@@ -802,9 +804,9 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         offset: Offset = None,
     ) -> str:
         """Automatic replies, newest first: what was sent, or why not. pending may mean waiting
-        for the per-minute pace. already_answered: this rule already answered this person on this
-        post. window_closed includes public replies 24 hours after the comment. hourly_cap is the
-        overall cap or the lower one on public replies."""
+        for the per-minute pace or an hourly cap. already_answered: this rule already answered this
+        person on this post. window_closed includes public replies 24 hours after the comment.
+        hourly_cap appears only on older replies: a reply over a cap now waits as pending."""
         query = {
             "status": status,
             "reason": reason,

@@ -62,14 +62,14 @@ class Settings:
     # 32 random bytes that encrypt the stored Instagram credential. `migrate` creates it; keep it
     # out of the database backups, or a stolen backup carries everything needed to read the token.
     secret_key_file: Path = Path("data/secret.key")
-    # Automatic replies: how often comments and messages are polled, the most replies sent in any
-    # hour (Meta allows 750 private replies an hour; this stays well below), the most of those that
-    # may be public (reported to be the riskier kind, on community evidence only), the most replies
-    # sent in any minute (the rest wait for a later pass), and how long events, deliveries and
-    # conversations are kept.
+    # Automatic replies: how often comments and messages are polled, the most private replies sent
+    # in any hour (Meta allows 750 an hour; this stays below), the most public replies (Meta
+    # publishes no limit: this is a safety net against a runaway rule), the most replies of any kind
+    # sent in any minute (the rest of these, and of any cap, wait for a later pass), and how long
+    # events, deliveries and conversations are kept.
     reply_poll_seconds: float = 120.0
-    hourly_reply_cap: int = 200
-    hourly_public_reply_cap: int = 30
+    hourly_private_reply_cap: int = 500
+    hourly_public_reply_cap: int = 300
     replies_per_minute: int = 12
     retention_days: int = 90
     # A message rule answers the same person at most once in this many minutes.
@@ -130,8 +130,8 @@ class Settings:
             reply_poll_seconds=float(
                 env.get(f"{ENV_PREFIX}REPLY_POLL_SECONDS", defaults.reply_poll_seconds)
             ),
-            hourly_reply_cap=int(
-                env.get(f"{ENV_PREFIX}HOURLY_REPLY_CAP", defaults.hourly_reply_cap)
+            hourly_private_reply_cap=_positive(
+                env, "HOURLY_PRIVATE_REPLY_CAP", defaults.hourly_private_reply_cap
             ),
             hourly_public_reply_cap=_positive(
                 env, "HOURLY_PUBLIC_REPLY_CAP", defaults.hourly_public_reply_cap

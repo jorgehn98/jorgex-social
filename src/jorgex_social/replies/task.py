@@ -103,8 +103,8 @@ class ReplyTask:
         clock: Clock,
         *,
         poll_every: timedelta = timedelta(seconds=120),
-        hourly_cap: int = 200,
-        hourly_public_cap: int = 30,
+        hourly_private_cap: int = 500,
+        hourly_public_cap: int = 300,
         per_minute: int = 12,
         retention: timedelta = timedelta(days=90),
         cooldown: timedelta = timedelta(minutes=60),
@@ -115,8 +115,11 @@ class ReplyTask:
         self.instagram = instagram
         self.clock = clock
         self.poll_every = poll_every
-        self.hourly_cap = hourly_cap
-        self.hourly_public_cap = hourly_public_cap
+        # Messages have none: Meta allows 100 a second, and the pace limit already holds them.
+        self._hourly_caps = {
+            Action.PRIVATE_REPLY: hourly_private_cap,
+            Action.PUBLIC_REPLY: hourly_public_cap,
+        }
         self.per_minute = per_minute
         self.retention = retention
         self.cooldown = cooldown
@@ -223,8 +226,8 @@ class ReplyTask:
 
     def deliver(self, sessions: sessionmaker) -> None:
         with sessions() as session:
-            pending = session.scalars(
-                select(Delivery.id)
+            pending = session.execute(
+                select(Delivery.id, Delivery.action)
                 .join(Event)
                 .where(
                     Event.network == self.instagram.network,
@@ -232,10 +235,14 @@ class ReplyTask:
                 )
                 .order_by(Delivery.created_at, Delivery.id)
             ).all()
-        for delivery_id in pending:
-            # At the pace limit the rest stay pending, untouched, for a later pass.
+        for delivery_id, action in pending:
+            # At the pace or the hourly limit the rest stay pending, untouched, for a later pass:
+            # they go out once enough of the last hour has passed.
             if self._hold_sends or self._at_pace_limit(sessions):
                 return
+            # Each kind waits for its own cap; the others go on.
+            if self._at_hourly_cap(sessions, Action(action)):
+                continue
             try:
                 send = self._prepare(sessions, delivery_id)
                 if send is not None:
@@ -247,6 +254,13 @@ class ReplyTask:
     def _at_pace_limit(self, sessions: sessionmaker) -> bool:
         with sessions() as session:
             return self._attempted_since(session, self.clock.now() - MINUTE) >= self.per_minute
+
+    def _at_hourly_cap(self, sessions: sessionmaker, action: Action) -> bool:
+        cap = self._hourly_caps.get(action)
+        if cap is None:
+            return False
+        with sessions() as session:
+            return self._attempted_since(session, self.clock.now() - HOUR, action) >= cap
 
     def _attempted_since(
         self, session: Session, since: datetime, action: Action | None = None
@@ -355,14 +369,6 @@ class ReplyTask:
             )
             if answered is not None:
                 return Reason.ALREADY_ANSWERED
-        if self._attempted_since(session, now - HOUR) >= self.hourly_cap:
-            return Reason.HOURLY_CAP
-        if (
-            delivery.action == Action.PUBLIC_REPLY
-            and self._attempted_since(session, now - HOUR, Action.PUBLIC_REPLY)
-            >= self.hourly_public_cap
-        ):
-            return Reason.HOURLY_CAP
         # No duplicate check here: one rule per event, so a second delivery of the same action
         # cannot be created. The unique indexes on deliveries are the safety net.
         return None

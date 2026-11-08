@@ -31,10 +31,11 @@ MAX_MESSAGE_BYTES = 1000
 MAX_PUBLIC_CHARS = 2200
 MAX_VARIANTS = 20
 MAX_KEYWORDS = 50
-# Our own floor, not a Meta rule: an automation tool's interface asks for 3 and users of these
-# tools suggest 3 to 5, with no number from Meta. Checked in `check`, not in `RuleContent`, so
-# content stored with fewer still loads.
-MIN_PUBLIC_VARIANTS = 3
+# Our own floors, not Meta rules: users of automation tools report that many identical replies
+# look like a bot, with no number from Meta. Checked in `check`, not in `RuleContent`, so content
+# stored with fewer still loads.
+MIN_PUBLIC_VARIANTS = 5
+MIN_PRIVATE_VARIANTS = 3
 LINK_MARKS = ("http://", "https://", "www.")
 # The evidence behind every warning is community reports, so none of them blocks a rule.
 _REPORTED = "Reported practice, not a published Meta rule: "
@@ -102,13 +103,17 @@ def check(
             raise ValueError("message rules cannot have public_replies")
     if media_ref is not None and post_id is not None:
         raise ValueError("give media_ref or post_id, not both")
-    distinct = {normalize(text) for text in content.public_replies}
-    if content.public_replies and len(distinct) < MIN_PUBLIC_VARIANTS:
-        raise ValueError(
-            f"public_replies needs at least {MIN_PUBLIC_VARIANTS} variants that differ in more "
-            f"than case, accents or spacing, or none at all (found {len(distinct)}); this is "
-            "this service's own floor, not a Meta rule"
-        )
+    for name, texts, minimum in (
+        ("public_replies", content.public_replies, MIN_PUBLIC_VARIANTS),
+        ("private_replies", content.private_replies, MIN_PRIVATE_VARIANTS),
+    ):
+        distinct = {normalize(text) for text in texts}
+        if texts and len(distinct) < minimum:
+            raise ValueError(
+                f"{name} needs at least {minimum} variants that differ in more than case, "
+                f"accents or spacing, or none at all (found {len(distinct)}); this is this "
+                "service's own floor, not a Meta rule"
+            )
 
 
 def rule_warnings(
