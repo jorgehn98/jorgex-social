@@ -516,10 +516,14 @@ Too many automatic replies can get an Instagram account restricted, so they are 
   comment on another post, or one matching another rule, is answered.
 - At most `JORGEX_SOCIAL_REPLIES_PER_MINUTE` (12) replies go out in any minute. The rest stay pending
   and the worker continues on later passes, oldest first.
-- At most `JORGEX_SOCIAL_HOURLY_REPLY_CAP` (200) replies go out in any hour, and at most
-  `JORGEX_SOCIAL_HOURLY_PUBLIC_REPLY_CAP` (30) of them public. Public replies are reported to be the
-  riskier kind, on community evidence only. A reply over a cap is skipped for good; when only the
-  public cap is reached, the private reply to the same comment still goes out.
+- At most `JORGEX_SOCIAL_HOURLY_PRIVATE_REPLY_CAP` (500) private replies go out in any hour: the
+  direct messages sent because of a comment. Meta allows 750 an hour. At most
+  `JORGEX_SOCIAL_HOURLY_PUBLIC_REPLY_CAP` (300) public replies go out in any hour. Meta publishes no
+  limit for those; the cap is a safety net against a runaway rule. Answers to a direct message have
+  no hourly cap: Meta allows 100 a second, and the per-minute pace holds them. A reply over a cap is
+  not skipped: it stays pending and goes out once enough of the last hour has passed, oldest first,
+  unless its window (24 hours for a public reply or a message, 7 days for a private reply) closes
+  first. Each kind waits on its own cap: reaching one does not hold the others.
 - A public reply not sent within 24 hours of the comment is skipped.
 - A direct message that is exactly one of `JORGEX_SOCIAL_OPT_OUT_WORDS` (`stop`, `unsubscribe`,
   `baja`) silences that person for good, as Meta's Developer Policies (5.2b) ask to respect opt-outs
@@ -530,10 +534,10 @@ Too many automatic replies can get an Instagram account restricted, so they are 
   seen matching in one test on an account with Instagram login, not documented by Meta. The person shows as `paused_forever` in `GET /v1/conversations`, with
   `conversation.opted_out` in the audit log. Only `POST /v1/conversations/{id}/resume` undoes it: a
   pause with `until` is refused. An empty value turns this off.
-- A rule that replies publicly needs at least 3 public variants that differ in more than case, accents
-  or spacing; anything less is refused with a 422. This is this service's own floor, not a Meta rule:
-  an automation tool's interface asks for 3 and users of these tools suggest 3 to 5, with no number
-  from Meta. Private replies have no minimum. A rule stored earlier with fewer keeps answering, but
+- A rule that replies publicly needs at least 5 public variants, and one with private replies (to a
+  comment or to a message) at least 3, that differ in more than case, accents or spacing; anything
+  less is refused with a 422. This is this service's own floor, not a Meta rule: users of automation
+  tools report that many identical replies look like a bot, with no number from Meta. A rule stored earlier with fewer keeps answering, but
   any edit to it, even of its name alone, is refused with that same message until its content is
   fixed.
 - Rules get `warnings` in the API, the MCP and the web interface: public replies on every post, a link

@@ -37,10 +37,23 @@ VERIFY_TOKEN = "verify-token-for-tests"
 APP_SECRET = "app-secret-for-tests"
 COMMENT_RULE = {
     "keywords": ["precio"],
-    "public_replies": ["Sent you a DM!", "Check your inbox", "Just wrote to you"],
-    "private_replies": ["The price is on the website."],
+    "public_replies": [
+        "Sent you a DM!",
+        "Check your inbox",
+        "Just wrote to you",
+        "Look at your DMs",
+        "Message on its way",
+    ],
+    "private_replies": [
+        "The price is on the website.",
+        "The price is on the website. 2",
+        "The price is on the website. 3",
+    ],
 }
-MESSAGE_RULE = {"keywords": ["precio"], "private_replies": ["DM answer"]}
+MESSAGE_RULE = {
+    "keywords": ["precio"],
+    "private_replies": ["DM answer", "DM answer 2", "DM answer 3"],
+}
 MARKERS = ["QZX-hook-comment-4411", "QZX-hook-message-8812", "qzx_hook_username_2290"]
 
 

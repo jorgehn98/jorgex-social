@@ -167,8 +167,9 @@ def _not_archived(rule: Rule) -> None:
 )
 def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Network):
     """Create a rule, inactive. Activate it to make it answer; only what arrives after that
-    is answered. `public_replies` needs at least 3 variants that differ in more than case, accents
-    or spacing, or none at all: this service's own floor, not a Meta rule. `warnings` lists what
+    is answered. `public_replies` needs at least 5 variants, and `private_replies` at least 3, that
+    differ in more than case, accents or spacing, or none at all: this service's own floor, not a
+    Meta rule. `warnings` lists what
     automation users report as risky; it blocks nothing. A comment rule can name a post of this
     service instead of a `media_ref`: with `post_id` it waits, answering nothing, until the post
     is published, and then answers on it alone."""
@@ -230,8 +231,9 @@ def update_rule(
     """Edit a rule; only the fields given change, and `media_ref: null` makes it apply to every
     post, ending any link to a post as well. `post_id` ties it to a post, replacing any
     `media_ref`; a value in `media_ref` ends that link. An active rule stays active and answers
-    with the new content from now on. `public_replies` needs at least 3 variants that differ in
-    more than case, accents or spacing, or none at all: this service's own floor, not a Meta rule.
+    with the new content from now on. `public_replies` needs at least 5 variants, and
+    `private_replies` at least 3, that differ in more than case, accents or spacing, or none at
+    all: this service's own floor, not a Meta rule.
     A rule stored with fewer keeps answering, but any edit, even of its name alone, gets that same
     refusal until `content` fixes it. `warnings` lists what automation users report as risky; it
     blocks nothing."""
@@ -424,10 +426,12 @@ def list_deliveries(
     offset: Offset = 0,
 ):
     """Replies, newest first, with what was sent or why not. A reply stays `pending` while the
-    per-minute pace holds it back. `reason` is one of: `kill_switch`, `paused`, `window_closed`
-    (past the private reply's 7 days, the message's 24 hours or the public reply's 24 hours),
+    per-minute pace or an hourly cap holds it back. `reason` is one of: `kill_switch`, `paused`,
+    `window_closed` (past the private reply's 7 days, the message's 24 hours or the public
+    reply's 24 hours),
     `cooldown`, `already_answered` (this rule already answered this person on this post),
-    `hourly_cap` (the overall cap, or the lower one on public replies), `refused` or `unknown`."""
+    `hourly_cap` (only on older replies: a reply over a cap now waits as `pending`), `refused` or
+    `unknown`."""
     query = select(Delivery).join(Event).where(Event.network == network)
     for column, value in (
         (Delivery.status, status),

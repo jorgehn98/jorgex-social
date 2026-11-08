@@ -24,8 +24,8 @@ START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
 PERSON = "17900000000000042"
 OTHER_PERSON = "17900000000000043"
-PRIVATE_ONLY = {"keywords": ["precio"], "private_replies": ["DM"]}
-PUBLIC_TOO = {**PRIVATE_ONLY, "public_replies": ["One", "Two", "Three"]}
+PRIVATE_ONLY = {"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+PUBLIC_TOO = {**PRIVATE_ONLY, "public_replies": ["One", "Two", "Three", "Four", "Five"]}
 
 
 @pytest.fixture
@@ -471,7 +471,9 @@ def test_a_comment_that_fired_another_rule_is_not_answered_twice(
 ):
     post_id = make_post(client, headers)
     make_rule(client, headers, post_id=post_id)
-    make_rule(client, headers, content={"keywords": ["hola"], "private_replies": ["Hi"]})
+    make_rule(
+        client, headers, content={"keywords": ["hola"], "private_replies": ["Hi", "Hi 2", "Hi 3"]}
+    )
     media = other_media(ig)
     clock.advance(minutes=1)
     fired = ig.add_comment(media, "hola, precio", author_id=PERSON)

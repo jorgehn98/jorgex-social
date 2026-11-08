@@ -27,12 +27,22 @@ from jorgex_social.replies.task import ReplyTask
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 PERSON = "17900000000000042"
 OTHER_PERSON = "17900000000000043"
-PRIVATE_ONLY = {"keywords": ["precio"], "private_replies": ["DM"]}
-PUBLIC_VARIANTS = ["One", "Two", "Three"]
+PRIVATE_ONLY = {"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+PUBLIC_VARIANTS = ["One", "Two", "Three", "Four", "Five"]
 PRICE_RULE = {
     "keywords": ["precio", "how much"],
-    "public_replies": ["Sent you a DM!", "Check your inbox", "Just wrote to you"],
-    "private_replies": ["The price is on the website."],
+    "public_replies": [
+        "Sent you a DM!",
+        "Check your inbox",
+        "Just wrote to you",
+        "Look at your DMs",
+        "Message on its way",
+    ],
+    "private_replies": [
+        "The price is on the website.",
+        "The price is on the website. 2",
+        "The price is on the website. 3",
+    ],
 }
 
 
@@ -213,14 +223,15 @@ def test_invalid_rules_are_refused(client, headers, body, message):
     ("variants", "accepted"),
     [
         (["One", "Two"], False),
+        (["One", "Two", "Three", "Four"], False),
         (PUBLIC_VARIANTS, True),
         # Copies that differ only in case, accents or spacing are one variant.
-        (["Qué tal", "QUE  TAL", "Hello"], False),
-        (["Qué tal", "QUE  TAL", "Hello", "Bye"], True),
+        (["Qué tal", "QUE  TAL", "Hello", "Bye", "Ciao"], False),
+        (["Qué tal", "QUE  TAL", "Hello", "Bye", "Ciao", "Hola"], True),
         ([], True),
     ],
 )
-def test_public_replies_need_three_distinct_variants_or_none(client, headers, variants, accepted):
+def test_public_replies_need_five_distinct_variants_or_none(client, headers, variants, accepted):
     content = {**PRIVATE_ONLY, "public_replies": variants}
     existing = make_rule(client, headers, activate=False)
 
@@ -231,8 +242,34 @@ def test_public_replies_need_three_distinct_variants_or_none(client, headers, va
 
     assert (created.status_code, edited.status_code) == ((201, 200) if accepted else (422, 422))
     if not accepted:
-        assert "at least 3" in created.text
-        assert "at least 3" in edited.text
+        assert "public_replies needs at least 5" in created.text
+        assert "public_replies needs at least 5" in edited.text
+
+
+@pytest.mark.parametrize(
+    ("channel", "variants", "accepted"),
+    [
+        ("message", ["Hi", "Hello"], False),
+        ("message", ["Hi", "HI", "Hello"], False),
+        ("message", ["Hi", "Hello", "Hey"], True),
+        ("comment", ["Hi", "Hello"], False),
+        ("comment", ["Hi", "Hello", "Hey"], True),
+    ],
+)
+def test_private_replies_need_three_distinct_variants(client, headers, channel, variants, accepted):
+    created = client.post(
+        "/v1/rules",
+        json={
+            "name": "r",
+            "channel": channel,
+            "content": {"keywords": ["precio"], "private_replies": variants},
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == (201 if accepted else 422)
+    if not accepted:
+        assert "private_replies needs at least 3" in created.text
 
 
 def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edited(
@@ -270,7 +307,7 @@ def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edit
     refused = client.patch(f"/v1/rules/{rule_id}", json={"priority": 5}, headers=headers)
     assert refused.status_code == 422
     assert refused.json()["detail"]["code"] == "invalid_rule"
-    assert "at least 3" in refused.json()["detail"]["message"]
+    assert "at least 5" in refused.json()["detail"]["message"]
     assert client.get(f"/v1/rules/{rule_id}", headers=headers).json()["priority"] == 1
 
     tested = client.post(
@@ -323,7 +360,11 @@ def test_rule_lifecycle(client, headers, clock):
 
 def test_rule_test_endpoint_stores_nothing(client, headers, settings):
     inactive = make_rule(client, headers, activate=False)
-    make_rule(client, headers, content={"keywords": ["hola"], "private_replies": ["Hi!"]})
+    make_rule(
+        client,
+        headers,
+        content={"keywords": ["hola"], "private_replies": ["Hi!", "Hi! 2", "Hi! 3"]},
+    )
 
     by_active = client.post(
         "/v1/rules/test", json={"channel": "comment", "text": "hola y precio"}, headers=headers
@@ -337,7 +378,10 @@ def test_rule_test_endpoint_stores_nothing(client, headers, settings):
         "/v1/rules/test", json={"channel": "message", "text": "hola"}, headers=headers
     ).json()
 
-    assert (by_active["rule"]["name"], by_active["private_replies"]) == ("price", ["Hi!"])
+    assert (by_active["rule"]["name"], by_active["private_replies"]) == (
+        "price",
+        ["Hi!", "Hi! 2", "Hi! 3"],
+    )
     assert by_id["rule"]["id"] == inactive["id"]
     assert by_id["public_replies"] == PRICE_RULE["public_replies"]
     assert none == {"rule": None, "public_replies": [], "private_replies": [], "note": None}
@@ -386,13 +430,18 @@ def test_a_matching_message_is_answered_and_its_window_recorded(
         client,
         headers,
         channel="message",
-        content={"keywords": ["info"], "private_replies": ["Here it is"]},
+        content={
+            "keywords": ["info"],
+            "private_replies": ["Here it is", "Here it is 2", "Here it is 3"],
+        },
     )
     ig.add_message(PERSON, "info please")
 
     task(sessions)
 
-    assert ig.sent == [("send_message", PERSON, "Here it is")]
+    [(op, target, text)] = ig.sent
+    assert (op, target) == ("send_message", PERSON)
+    assert text.startswith("Here it is")
     [conversation] = client.get("/v1/conversations", headers=headers).json()
     assert conversation["external_id"] == PERSON
     assert at(conversation["window_until"]) == START + timedelta(hours=24)
@@ -443,7 +492,10 @@ def test_third_party_text_never_reaches_the_database_or_the_logs(
         client,
         headers,
         channel="message",
-        content={"keywords": ["precio"], "private_replies": ["DM answer"]},
+        content={
+            "keywords": ["precio"],
+            "private_replies": ["DM answer", "DM answer 2", "DM answer 3"],
+        },
     )
     media = publish(ig)
     ig.add_comment(media, f"precio {MARKERS[0]}")
@@ -476,7 +528,13 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
         session.add(Connection(network="instagram", external_account_id="1784", username="own"))
         for channel, content in (
             ("comment", PRICE_RULE),
-            ("message", {"keywords": ["precio"], "private_replies": ["DM answer"]}),
+            (
+                "message",
+                {
+                    "keywords": ["precio"],
+                    "private_replies": ["DM answer", "DM answer 2", "DM answer 3"],
+                },
+            ),
         ):
             session.add(
                 Rule(
@@ -500,7 +558,9 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
         json.loads(p["message"][0])["text"] if "recipient" in p else p["message"][0] for p in posted
     ]
     assert set(sent_texts) <= set(
-        PRICE_RULE["public_replies"] + PRICE_RULE["private_replies"] + ["DM answer"]
+        PRICE_RULE["public_replies"]
+        + PRICE_RULE["private_replies"]
+        + ["DM answer", "DM answer 2", "DM answer 3"]
     )
     stored, logs = dump(settings), logged(caplog)
     for marker in MARKERS:
@@ -584,7 +644,9 @@ def test_one_private_reply_per_comment_even_across_restarts(
     assert count(sessions, Event) == 1
     # And the database refuses a second one, whichever rule it would come from.
     [private] = [d for d in deliveries(sessions) if d.action == "private_reply"]
-    other = make_rule(client, headers, content={"keywords": ["x"], "private_replies": ["y"]})
+    other = make_rule(
+        client, headers, content={"keywords": ["x"], "private_replies": ["y", "y 2", "y 3"]}
+    )
     with pytest.raises(IntegrityError), sessions() as session, session.begin():
         session.add(
             Delivery(
@@ -600,7 +662,9 @@ def test_one_private_reply_per_comment_even_across_restarts(
 def test_a_send_interrupted_by_a_crash_is_never_repeated(
     client, headers, ig, sessions, task, clock
 ):
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
+    make_rule(
+        client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+    )
     media = publish(ig)
     ig.add_comment(media, "precio")
     original = ig.reply_private
@@ -628,7 +692,10 @@ def test_the_accounts_own_comments_and_messages_never_fire_a_rule(
         client,
         headers,
         channel="message",
-        content={"keywords": ["price"], "private_replies": ["Our price list"]},
+        content={
+            "keywords": ["price"],
+            "private_replies": ["Our price list", "Our price list 2", "Our price list 3"],
+        },
     )
     media = publish(ig)
     ig.add_comment(media, "precio, says the account", author_id=ACCOUNT_ID)
@@ -680,7 +747,7 @@ def test_a_paused_conversation_is_skipped(client, headers, ig, sessions, task, c
         client,
         headers,
         channel="message",
-        content={"keywords": ["info"], "private_replies": ["Hi"]},
+        content={"keywords": ["info"], "private_replies": ["Hi", "Hi 2", "Hi 3"]},
     )
     ig.add_message(PERSON, "info")
     task.poll_messages(sessions, ACCOUNT_ID, clock.now())
@@ -714,12 +781,14 @@ def test_pause_needs_until_or_forever(client, headers, body, code):
 
 
 def test_windows_close(client, headers, ig, sessions, task, clock):
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
+    make_rule(
+        client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+    )
     make_rule(
         client,
         headers,
         channel="message",
-        content={"keywords": ["info"], "private_replies": ["Hi"]},
+        content={"keywords": ["info"], "private_replies": ["Hi", "Hi 2", "Hi 3"]},
     )
     ig.add_comment(publish(ig), "precio")
     ig.add_message(PERSON, "info")
@@ -736,10 +805,14 @@ def test_windows_close(client, headers, ig, sessions, task, clock):
     }
 
 
-def test_the_hourly_cap_skips_the_excess(client, headers, ig, sessions, clock):
+def test_the_hourly_cap_holds_the_excess_until_the_hour_passes(
+    client, headers, ig, sessions, clock
+):
     ConnectionTask(ig, clock, None)(sessions)
-    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_cap=1)
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
+    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_private_cap=1)
+    make_rule(
+        client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+    )
     media = publish(ig)
     ig.add_comment(media, "precio", author_id=PERSON)
     ig.add_comment(media, "precio", author_id=OTHER_PERSON)
@@ -747,7 +820,34 @@ def test_the_hourly_cap_skips_the_excess(client, headers, ig, sessions, clock):
     capped(sessions)
 
     assert len(ig.sent) == 1
-    assert sorted(by_status(sessions)) == [("sent", None), ("skipped", "hourly_cap")]
+    assert sorted(by_status(sessions)) == [("pending", None), ("sent", None)]
+
+    clock.advance(minutes=59)
+    capped(sessions)
+    assert len(ig.sent) == 1
+
+    clock.advance(minutes=1, seconds=1)
+    capped(sessions)
+
+    assert len(ig.sent) == 2
+    assert sorted(by_status(sessions)) == [("sent", None), ("sent", None)]
+
+
+def test_the_private_cap_does_not_hold_the_answer_to_a_message(
+    client, headers, ig, sessions, clock
+):
+    ConnectionTask(ig, clock, None)(sessions)
+    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_private_cap=1)
+    make_rule(client, headers, content=PRIVATE_ONLY)
+    make_rule(client, headers, channel="message", content={**PRIVATE_ONLY, "keywords": ["info"]})
+    media = publish(ig)
+    ig.add_comment(media, "precio", author_id=PERSON)
+    ig.add_comment(media, "precio", author_id=OTHER_PERSON)
+    ig.add_message("17900000000000044", "info")
+
+    capped(sessions)
+
+    assert sorted(op for op, _, _ in ig.sent) == ["reply_private", "send_message"]
 
 
 def by_status(sessions):
@@ -755,7 +855,9 @@ def by_status(sessions):
 
 
 def test_an_unavailable_send_is_never_retried(client, headers, ig, sessions, task, clock):
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
+    make_rule(
+        client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+    )
     ig.add_comment(publish(ig), "precio")
     # Instagram took it and then the connection broke: it did go out.
     ig.fail_next("reply_private", Unavailable("Instagram API 502"), after=True)
@@ -769,7 +871,9 @@ def test_an_unavailable_send_is_never_retried(client, headers, ig, sessions, tas
 
 
 def test_a_refused_send_records_metas_code(client, headers, ig, sessions, task):
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
+    make_rule(
+        client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+    )
     ig.add_comment(publish(ig), "precio")
     ig.fail_next("reply_private", Refused("Instagram API 400", code=10, subcode=2534022))
 
@@ -781,7 +885,9 @@ def test_a_refused_send_records_metas_code(client, headers, ig, sessions, task):
 
 
 def test_a_rate_limited_send_waits_for_the_next_poll(client, headers, ig, sessions, task):
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["DM"]})
+    make_rule(
+        client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
+    )
     ig.add_comment(publish(ig), "precio")
     ig.fail_next("reply_private", RateLimited("Instagram API 429", code=4))
 
@@ -849,7 +955,7 @@ def test_retention_purges_events_deliveries_and_conversations(
         client,
         headers,
         channel="message",
-        content={"keywords": ["info"], "private_replies": ["Hi"]},
+        content={"keywords": ["info"], "private_replies": ["Hi", "Hi 2", "Hi 3"]},
     )
     ig.add_comment(publish(ig), "precio")
     ig.add_message(PERSON, "info")
@@ -890,7 +996,10 @@ def test_a_message_rule_answers_a_person_once_per_cooldown(
         client,
         headers,
         channel="message",
-        content={"keywords": ["info"], "private_replies": ["Here it is"]},
+        content={
+            "keywords": ["info"],
+            "private_replies": ["Here it is", "Here it is 2", "Here it is 3"],
+        },
     )
     ig.add_message(PERSON, "info")
     ig.add_message(PERSON, "info?")
@@ -994,7 +1103,10 @@ def test_one_failing_media_or_conversation_stops_nothing_else(
 ):
     make_rule(client, headers, content={"keywords": ["precio"], "public_replies": PUBLIC_VARIANTS})
     make_rule(
-        client, headers, channel="message", content={"keywords": ["info"], "private_replies": ["B"]}
+        client,
+        headers,
+        channel="message",
+        content={"keywords": ["info"], "private_replies": ["B", "B 2", "B 3"]},
     )
     broken, fine = publish(ig), publish(ig)
     ig.add_comment(broken, f"precio {MARKERS[0]}")
@@ -1067,12 +1179,19 @@ def test_malformed_and_repeated_comments_from_meta_are_handled(sessions, clock):
 
 def test_a_message_that_is_one_of_our_sends_never_fires_a_rule(client, headers, ig, sessions, task):
     """Even when Instagram names its sender with an id the connection does not hold."""
-    make_rule(client, headers, content={"keywords": ["precio"], "private_replies": ["precio: 10"]})
+    make_rule(
+        client,
+        headers,
+        content={
+            "keywords": ["precio"],
+            "private_replies": ["precio: 10", "precio: 10 2", "precio: 10 3"],
+        },
+    )
     make_rule(
         client,
         headers,
         channel="message",
-        content={"keywords": ["precio"], "private_replies": ["B"]},
+        content={"keywords": ["precio"], "private_replies": ["B", "B 2", "B 3"]},
     )
     ig.add_comment(publish(ig), "precio", author_id=PERSON)
     task(sessions)
@@ -1261,14 +1380,18 @@ def test_a_second_rule_still_answers_the_same_person_on_the_same_post(
     client, headers, ig, sessions, task
 ):
     make_rule(client, headers, content=PRIVATE_ONLY)
-    make_rule(client, headers, content={"keywords": ["info"], "private_replies": ["Info"]})
+    make_rule(
+        client,
+        headers,
+        content={"keywords": ["info"], "private_replies": ["Info", "Info 2", "Info 3"]},
+    )
     media = publish(ig)
     ig.add_comment(media, "precio", author_id=PERSON)
     ig.add_comment(media, "info", author_id=PERSON)
 
     task(sessions)
 
-    assert sorted(text for _, _, text in ig.sent) == ["DM", "Info"]
+    assert sorted(text.split(" ")[0] for _, _, text in ig.sent) == ["DM", "Info"]
 
 
 def test_a_pause_reaches_the_comments_of_the_same_id(client, headers, ig, sessions, task, clock):
@@ -1344,13 +1467,18 @@ def test_the_public_cap_lets_the_private_reply_through(client, headers, ig, sess
 
     assert sorted(op for op, _, _ in ig.sent) == ["reply_private", "reply_private", "reply_public"]
     assert ("reply_private", second) in {(op, target) for op, target, _ in ig.sent}
-    skipped = [(d.action, d.reason) for d in deliveries(sessions) if d.status == "skipped"]
-    assert skipped == [("public_reply", "hourly_cap")]
+    waiting = [d.action for d in deliveries(sessions) if d.status == "pending"]
+    assert waiting == ["public_reply"]
+
+    clock.advance(hours=1, seconds=1)
+    capped(sessions)
+
+    assert sorted(op for op, _, _ in ig.sent) == ["reply_private"] * 2 + ["reply_public"] * 2
 
 
 # Opt-out
 
-INFO_RULE = {"keywords": ["info", "stop"], "private_replies": ["Hi"]}
+INFO_RULE = {"keywords": ["info", "stop"], "private_replies": ["Hi", "Hi 2", "Hi 3"]}
 
 
 def conversations(client, headers):
@@ -1400,7 +1528,7 @@ def test_a_sentence_with_the_word_is_no_opt_out_and_rules_still_fire(
 
     [conversation] = conversations(client, headers)
     assert conversation["paused_forever"] is False
-    assert [text for _, _, text in ig.sent] == ["Hi"]
+    assert [text.split(" ")[0] for _, _, text in ig.sent] == ["Hi"]
 
 
 def test_an_opt_out_skips_what_is_pending_for_that_person(
@@ -1437,7 +1565,7 @@ def test_an_empty_list_turns_opt_out_off(client, headers, ig, sessions, clock):
 
     [conversation] = conversations(client, headers)
     assert conversation["paused_forever"] is False
-    assert [text for _, _, text in ig.sent] == ["Hi"]
+    assert [text.split(" ")[0] for _, _, text in ig.sent] == ["Hi"]
 
 
 def test_resume_lifts_an_opt_out_and_seeing_the_message_again_does_not_undo_it(
@@ -1456,7 +1584,7 @@ def test_resume_lifts_an_opt_out_and_seeing_the_message_again_does_not_undo_it(
 
     assert resumed.json()["paused_forever"] is False
     assert conversations(client, headers)[0]["paused_forever"] is False
-    assert [text for _, _, text in ig.sent] == ["Hi"]
+    assert [text.split(" ")[0] for _, _, text in ig.sent] == ["Hi"]
 
 
 def test_an_opt_out_is_audited_without_its_text(client, headers, ig, sessions, clock):
@@ -1481,16 +1609,59 @@ def test_an_opt_out_is_audited_without_its_text(client, headers, ig, sessions, c
 @pytest.mark.parametrize(
     ("channel", "media_ref", "content", "codes"),
     [
-        ("comment", "m1", {"public_replies": PUBLIC_VARIANTS, "private_replies": ["DM"]}, []),
-        ("comment", None, {"private_replies": ["DM"]}, []),
-        ("message", None, {"private_replies": ["See https://x.test"]}, []),
+        (
+            "comment",
+            "m1",
+            {"public_replies": PUBLIC_VARIANTS, "private_replies": ["DM", "DM 2", "DM 3"]},
+            [],
+        ),
+        ("comment", None, {"private_replies": ["DM", "DM 2", "DM 3"]}, []),
+        (
+            "message",
+            None,
+            {
+                "private_replies": [
+                    "See https://x.test",
+                    "See https://x.test 2",
+                    "See https://x.test 3",
+                ]
+            },
+            [],
+        ),
         # A rule stored before the floor on public variants: no warning, it simply keeps working.
         ("comment", "m1", {"public_replies": ["One", "Two"]}, []),
         ("comment", None, {"public_replies": PUBLIC_VARIANTS}, ["public_on_every_post"]),
-        ("comment", "m1", {"private_replies": ["See http://x.test"]}, ["link_in_first_message"]),
-        ("comment", "m1", {"private_replies": ["See HTTPS://x.test"]}, ["link_in_first_message"]),
-        ("comment", "m1", {"private_replies": ["See Www.x.test"]}, ["link_in_first_message"]),
-        ("comment", "m1", {"private_replies": ["See x.test"]}, []),
+        (
+            "comment",
+            "m1",
+            {
+                "private_replies": [
+                    "See http://x.test",
+                    "See http://x.test 2",
+                    "See http://x.test 3",
+                ]
+            },
+            ["link_in_first_message"],
+        ),
+        (
+            "comment",
+            "m1",
+            {
+                "private_replies": [
+                    "See HTTPS://x.test",
+                    "See HTTPS://x.test 2",
+                    "See HTTPS://x.test 3",
+                ]
+            },
+            ["link_in_first_message"],
+        ),
+        (
+            "comment",
+            "m1",
+            {"private_replies": ["See Www.x.test", "See Www.x.test 2", "See Www.x.test 3"]},
+            ["link_in_first_message"],
+        ),
+        ("comment", "m1", {"private_replies": ["See x.test", "See x.test 2", "See x.test 3"]}, []),
         ("comment", "m1", {"private_replies": ["\U0001f525\U0001f525"]}, ["no_words"]),
         ("message", None, {"private_replies": ["ok", "!!!"]}, ["no_words"]),
         ("comment", "m1", {"public_replies": [*PUBLIC_VARIANTS, "..."]}, ["no_words"]),

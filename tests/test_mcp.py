@@ -267,7 +267,10 @@ async def test_tools_reach_their_endpoints_end_to_end(app, transport, tmp_path):
 
 async def test_reply_tools_reach_their_endpoints_end_to_end(app, transport):
     server = server_for(app, transport, rules="write", events="read")
-    content = {"keywords": ["price"], "private_replies": ["See the website."]}
+    content = {
+        "keywords": ["price"],
+        "private_replies": ["See the website.", "See the website. 2", "See the website. 3"],
+    }
 
     async with Client(server) as client:
         transport.calls.clear()
@@ -317,7 +320,11 @@ async def test_reply_tools_reach_their_endpoints_end_to_end(app, transport):
     assert [x["id"] for x in r["listed"][1]] == [rid]
     assert r["detail"][1]["content"]["keywords"] == ["price"]
     assert r["edited"][1]["priority"] == 5
-    assert r["tested"][1]["private_replies"] == ["See the website."]
+    assert r["tested"][1]["private_replies"] == [
+        "See the website.",
+        "See the website. 2",
+        "See the website. 3",
+    ]
     assert (r["active"][1]["active"], r["inactive"][1]["active"]) == (True, False)
     assert r["archived"][1]["archived_at"] is not None
     assert r["events"] == r["deliveries"] == r["conversations"] == ("ok", [])
@@ -331,7 +338,10 @@ async def test_rule_tools_tie_a_rule_to_a_post(app, transport):
         session.flush()
         post_id = post.id
     server = server_for(app, transport, rules="write")
-    content = {"keywords": ["price"], "private_replies": ["See the website."]}
+    content = {
+        "keywords": ["price"],
+        "private_replies": ["See the website.", "See the website. 2", "See the website. 3"],
+    }
 
     async with Client(server) as client:
         _, rule = await call(
