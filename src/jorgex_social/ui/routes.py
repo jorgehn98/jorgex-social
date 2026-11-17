@@ -1,4 +1,6 @@
-"""Web interface for the operator (docs: interfaz). Pages read through the read-only session and
+"""Web interface for the operator (docs: interfaz). Every page of an account lives under
+`/ui/a/{account}/…` and works on that account alone: the account comes from the URL, never from the
+session, so two tabs on two accounts cannot cross. Pages read through the read-only session and
 reuse the API's own query functions; only signing in and out and Settings write."""
 
 import hashlib
@@ -23,6 +25,7 @@ from jorgex_social.access.models import OperatorSession
 from jorgex_social.access.proxy import via_proxy
 from jorgex_social.account import appearance, scope
 from jorgex_social.account.api import account_out, incidents_page
+from jorgex_social.account.connection import status_at
 from jorgex_social.account.models import Connection
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
@@ -35,6 +38,12 @@ log = logging.getLogger(__name__)
 
 HERE = Path(__file__).parent
 COOKIE = "jxs_session"
+# The account the operator used last, for where `/ui/` and the old URLs send them next. It never
+# decides what a request works on: every page and form carries its account in the URL.
+ACCOUNT_COOKIE = "jxs_account"
+# A convenience, not a login: it lapses with the session, and `/ui/` falls back to the first
+# connected account.
+ACCOUNT_COOKIE_MAX_AGE = int(operator.SESSION_LIFETIME.total_seconds())
 INVALID = "Invalid credentials."
 TOO_MANY = "Too many attempts. Try again later."
 BUSY = "The server is busy. Try again in a moment."
@@ -79,6 +88,16 @@ class LoginRequired(Exception):
 
 class SignInTooOld(LoginRequired):
     """The session is valid but too old for this page: its cookie still serves the others."""
+
+
+class PageNotFound(Exception):
+    """A page's account that does not exist, belongs to the other mode or is not connected yet, or
+    a post or media of another account: 404, the same answer the API gives. Rendering it as a page
+    keeps the operator inside the interface instead of showing them a bare error."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        super().__init__(what)
 
 
 def _is_loopback(host: str | None) -> bool:
@@ -209,6 +228,73 @@ async def render_off_loop(
     return render(request, name, status_code, product_name=product_name, **context)
 
 
+def account_home(connection_id: str) -> str:
+    """The pages of one account live under this prefix; its home is the prefix and a slash."""
+    return f"/ui/a/{connection_id}"
+
+
+def page_account(request: Request, account: str, session: ReadSessionDep) -> Connection:
+    """The account a page works on, taken from its URL and from nowhere else. An id that is
+    unknown, of the other mode or not connected yet is not found, like another account's row in
+    the API: the answer never says which of the three it was."""
+    found = session.get(Connection, account)
+    if found is None or found.network != request.app.state.network or not scope.connected(found):
+        raise PageNotFound("account")
+    return found
+
+
+AccountPage = Annotated[Connection, Depends(page_account)]
+
+
+def remembered_account(request: Request, session) -> Connection | None:
+    """The account the operator used last, if it is still a connected account of this mode, else
+    the first connected one. Only `/ui/` and the old URLs read it: what a request works on is in
+    its URL. None: nothing is connected, and the home says so without an account to name."""
+    remembered = request.cookies.get(ACCOUNT_COOKIE)
+    if remembered:
+        found = session.get(Connection, remembered)
+        if found and found.network == request.app.state.network and scope.connected(found):
+            return found
+    first = scope.accounts_of(session, request.app.state.network, connected_only=True)
+    return first[0] if first else None
+
+
+def remember_account(request: Request, response: Response, connection_id: str) -> Response:
+    """Notes the account the operator is on, for where `/ui/` opens next: a preference, never a
+    decision about what a page or a form works on."""
+    if request.cookies.get(ACCOUNT_COOKIE) != connection_id:
+        response.set_cookie(
+            ACCOUNT_COOKIE,
+            connection_id,
+            max_age=ACCOUNT_COOKIE_MAX_AGE,
+            path="/ui",
+            secure=cookie_is_secure(request),
+            httponly=True,
+            samesite="strict",
+        )
+    return response
+
+
+def render_account_page(
+    request: Request, connection: Connection, name: str, status_code: int = 200, **context
+) -> Response:
+    """A page of one account. The templates build every link and image from `base`, so none of
+    them can point at another account or lose the account on the way."""
+    response = render(
+        request,
+        name,
+        status_code,
+        base=account_home(connection.id),
+        active_account=connection,
+        **context,
+    )
+    return remember_account(request, response, connection.id)
+
+
+def _not_found_page(request: Request, error: PageNotFound) -> Response:
+    return render(request, "not_found.html", 404, what=error.what)
+
+
 def _login_redirect(request: Request, reason: LoginRequired) -> Response:
     location = "/ui/login"
     back = request.url.path + (f"?{request.url.query}" if request.url.query else "")
@@ -218,9 +304,10 @@ def _login_redirect(request: Request, reason: LoginRequired) -> Response:
         # The form cannot be kept, but the operator goes back to it rather than to Home.
         location += "?" + urlencode({"next": SETTINGS_HOME})
     response = RedirectResponse(location, status_code=303, headers=HEADERS)
-    # Expired or unknown: no use keeping it.
+    # Expired or unknown: no use keeping it, nor the account it was used for.
     if COOKIE in request.cookies and not isinstance(reason, SignInTooOld):
         response.delete_cookie(COOKIE, path="/ui")
+        response.delete_cookie(ACCOUNT_COOKIE, path="/ui")
     return response
 
 
@@ -229,6 +316,14 @@ pages = APIRouter(
     prefix="/ui",
     include_in_schema=False,
     dependencies=[Depends(same_origin), Depends(require_operator)],
+)
+
+# Everything of one account, from that account's id in the path: the dependency refuses every
+# request that would work on another account, the other mode or a row not connected yet.
+account_pages = APIRouter(
+    prefix="/ui/a/{account}",
+    include_in_schema=False,
+    dependencies=[Depends(same_origin), Depends(require_operator), Depends(page_account)],
 )
 
 # Every section of Settings needs a recent sign-in, here rather than on each route.
@@ -391,41 +486,91 @@ def logout(request: Request):
     _end_presented_session(request)
     response = RedirectResponse("/ui/login", status_code=303, headers=HEADERS)
     response.delete_cookie(COOKIE, path="/ui")
+    # The account was a convenience of that session, not something to keep after signing out.
+    response.delete_cookie(ACCOUNT_COOKIE, path="/ui")
     return response
 
 
-# Pages
-
-
-def _account_id(request: Request, session) -> str | None:
-    """The account of the mode; none of the pages list anything before it exists.
-
-    Until T04 the interface carries no account: it works on the one of its mode. An API call
-    never comes here; its account is the token's (access/deps.py)."""
-    return scope.account_id_of(session, request.app.state.network)
-
-
-def _account(request: Request, session) -> Connection | None:
-    """The same account, as the row the pages read it from."""
-    return scope.account_of(session, request.app.state.network)
+# Where the operator keeps working, and the URLs from before the account was in the path.
 
 
 @pages.get("/")
-def home(request: Request, session: ReadSessionDep):
-    return render(
+def start(request: Request, session: ReadSessionDep):
+    """`/ui/` sends the operator to the account they used last, or to the first connected one. With
+    nothing connected there is no account to name, and the home says so, as it always has."""
+    account = remembered_account(request, session)
+    if account is None:
+        return render(
+            request,
+            "home.html",
+            account=account_out(request, session, None, installation=True),
+            accounts=[],
+            # The operator's own incidents are the installation's, so they outlive an account.
+            incidents=incidents_page(
+                session, None, request.app.state.network, installation=True, open=True, limit=20
+            ),
+            upcoming=[],
+        )
+    response = RedirectResponse(account_home(account.id) + "/", status_code=303, headers=HEADERS)
+    return remember_account(request, response, account.id)
+
+
+# The pages as they were before the account went into the URL. A GET opens the same page under the
+# account `/ui/` would open; only GET is routed, so no form can post to an account it does not name.
+LEGACY_PAGES = (
+    "/posts",
+    "/posts/{post_id}",
+    "/stats",
+    "/stats/{media_ref}",
+    "/rules",
+    "/events",
+    "/incidents",
+    "/media/{media_id}",
+)
+
+
+def _legacy_page(request: Request, session: ReadSessionDep) -> Response:
+    account = remembered_account(request, session)
+    if account is None:
+        return RedirectResponse(HOME, status_code=303, headers=HEADERS)
+    target = f"{account_home(account.id)}/{request.url.path.removeprefix('/ui/')}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    return RedirectResponse(target, status_code=303, headers=HEADERS)
+
+
+for _path in LEGACY_PAGES:
+    pages.add_api_route(_path, _legacy_page, methods=["GET"])
+
+
+def _switcher(request: Request, session) -> list[dict]:
+    """The connected accounts of the mode, one row each: the only place a page names more than one
+    account, and it never adds them up (decision 10, point 6)."""
+    now = request.app.state.clock.now()
+    return [
+        {
+            "base": account_home(row.id),
+            "username": row.username,
+            "network": row.network,
+            "status": status_at(row, now),
+        }
+        for row in scope.accounts_of(session, request.app.state.network, connected_only=True)
+    ]
+
+
+@account_pages.get("/")
+def home(request: Request, session: ReadSessionDep, account: AccountPage):
+    return render_account_page(
         request,
+        account,
         "home.html",
-        account=account_out(request, session, _account(request, session), installation=True),
+        account=account_out(request, session, account, installation=True),
+        accounts=_switcher(request, session),
         # The operator also sees the installation's own incidents, such as a leaked password.
         incidents=incidents_page(
-            session,
-            _account_id(request, session),
-            request.app.state.network,
-            installation=True,
-            open=True,
-            limit=20,
+            session, account.id, account.network, installation=True, open=True, limit=20
         ),
-        upcoming=next_scheduled(session, _account_id(request, session), limit=5),
+        upcoming=next_scheduled(session, account.id, limit=5),
     )
 
 
@@ -439,33 +584,34 @@ def _thumbnail(session, media_dir: Path, post: dict) -> str | None:
     return media.id if storage.path_of(media_dir, media).is_file() else None
 
 
-@pages.get("/posts")
-def posts(request: Request, session: ReadSessionDep):
-    account, media_dir = _account_id(request, session), request.app.state.settings.media_dir
+@account_pages.get("/posts")
+def posts(request: Request, session: ReadSessionDep, account: AccountPage):
+    media_dir = request.app.state.settings.media_dir
     sections = []
     for status, title in POST_SECTIONS + FOLDED_SECTIONS:
         # Scheduled ones soonest first; the rest newest first.
         if status is PostStatus.SCHEDULED:
-            found = next_scheduled(session, account, limit=100)
+            found = next_scheduled(session, account.id, limit=100)
         else:
-            found = list_posts(session, account, status=status, limit=100)
+            found = list_posts(session, account.id, status=status, limit=100)
         for post in found:
             post["thumbnail"] = _thumbnail(session, media_dir, post)
         sections.append((title, found, (status, title) in FOLDED_SECTIONS))
-    return render(request, "posts.html", sections=sections)
+    return render_account_page(request, account, "posts.html", sections=sections)
 
 
-@pages.get("/posts/{post_id}")
-def post_detail(post_id: str, request: Request, session: ReadSessionDep):
+@account_pages.get("/posts/{post_id}")
+def post_detail(post_id: str, request: Request, session: ReadSessionDep, account: AccountPage):
     try:
-        post = get_post(post_id, session, _account_id(request, session))
+        post = get_post(post_id, session, account.id)
     except HTTPException:
-        return render(request, "not_found.html", 404, what="post")
+        return render_account_page(request, account, "not_found.html", 404, what="post")
     media_dir = request.app.state.settings.media_dir
     items = [session.get(Media, media_id) for media_id in post["items"]]
     on_disk = {m.id: storage.path_of(media_dir, m).is_file() for m in items if m}
-    return render(
+    return render_account_page(
         request,
+        account,
         "post.html",
         post=post,
         items=items,
@@ -474,25 +620,30 @@ def post_detail(post_id: str, request: Request, session: ReadSessionDep):
     )
 
 
-@pages.get("/media/{media_id}")
-def media_file(media_id: str, request: Request, session: ReadSessionDep):
-    """The image of a post, for its thumbnail; only JPEGs still on disk."""
+@account_pages.get("/media/{media_id}")
+def media_file(media_id: str, request: Request, session: ReadSessionDep, account: AccountPage):
+    """The image of a post, for its thumbnail; only JPEGs of this account still on disk."""
     media = session.get(Media, media_id)
-    if media is None or media.type != MediaType.JPEG or media.deleted_at:
-        raise HTTPException(404)
-    path = storage.path_of(request.app.state.settings.media_dir, media)
-    if not path.is_file():
-        raise HTTPException(404)
-    return FileResponse(path, media_type="image/jpeg", headers=HEADERS)
+    if (
+        media is not None
+        and media.account_id == account.id
+        and media.type == MediaType.JPEG
+        and not media.deleted_at
+    ):
+        path = storage.path_of(request.app.state.settings.media_dir, media)
+        if path.is_file():
+            return FileResponse(path, media_type="image/jpeg", headers=HEADERS)
+    # Under the account's pages, like every other 404 of one: the account is still known.
+    return render_account_page(request, account, "not_found.html", 404, what="media")
 
 
-@pages.get("/stats")
-def stats(request: Request, session: ReadSessionDep):
-    account = _account_id(request, session)
-    history = account_history(session, account, limit=90)
+@account_pages.get("/stats")
+def stats(request: Request, session: ReadSessionDep, account: AccountPage):
+    history = account_history(session, account.id, limit=90)
     oldest_first = list(reversed(history))
-    return render(
+    return render_account_page(
         request,
+        account,
         "stats.html",
         history=history,
         reach_chart=line_chart(
@@ -505,61 +656,62 @@ def stats(request: Request, session: ReadSessionDep):
             title="Followers",
             series="secondary",
         ),
-        media=latest_per_media(session, account, limit=100),
+        media=latest_per_media(session, account.id, limit=100),
     )
 
 
-@pages.get("/stats/{media_ref}")
-def media_stats(media_ref: str, request: Request, session: ReadSessionDep):
-    snapshots = media_history(media_ref, session, _account_id(request, session), limit=365)
+@account_pages.get("/stats/{media_ref}")
+def media_stats(media_ref: str, request: Request, session: ReadSessionDep, account: AccountPage):
+    snapshots = media_history(media_ref, session, account.id, limit=365)
     if not snapshots:
-        return render(request, "not_found.html", 404, what="media")
+        return render_account_page(request, account, "not_found.html", 404, what="media")
     metrics = sorted({name for s in snapshots for name in s.metrics})
-    return render(
-        request, "media_stats.html", media_ref=media_ref, snapshots=snapshots, metrics=metrics
+    return render_account_page(
+        request,
+        account,
+        "media_stats.html",
+        media_ref=media_ref,
+        snapshots=snapshots,
+        metrics=metrics,
     )
 
 
-@pages.get("/rules")
-def rules(request: Request, session: ReadSessionDep):
-    account = _account_id(request, session)
-
+@account_pages.get("/rules")
+def rules(request: Request, session: ReadSessionDep, account: AccountPage):
     def out(found) -> list[RuleOut]:
         return [RuleOut.model_validate(rule, from_attributes=True) for rule in found]
 
-    return render(
+    return render_account_page(
         request,
+        account,
         "rules.html",
-        rules=out(list_rules(session, account, limit=1000)),
-        archived=out(list_rules(session, account, archived=True, limit=1000)),
+        rules=out(list_rules(session, account.id, limit=1000)),
+        archived=out(list_rules(session, account.id, archived=True, limit=1000)),
     )
 
 
-@pages.get("/events")
-def events(request: Request, session: ReadSessionDep):
-    account = _account_id(request, session)
-    names = {rule.id: rule.name for rule in list_rules(session, account, limit=1000)}
-    names |= {r.id: r.name for r in list_rules(session, account, archived=True, limit=1000)}
-    return render(
+@account_pages.get("/events")
+def events(request: Request, session: ReadSessionDep, account: AccountPage):
+    names = {rule.id: rule.name for rule in list_rules(session, account.id, limit=1000)}
+    names |= {r.id: r.name for r in list_rules(session, account.id, archived=True, limit=1000)}
+    return render_account_page(
         request,
+        account,
         "events.html",
-        events=list_events(session, account, limit=100),
-        deliveries=list_deliveries(session, account, limit=100),
+        events=list_events(session, account.id, limit=100),
+        deliveries=list_deliveries(session, account.id, limit=100),
         rule_names=names,
     )
 
 
-@pages.get("/incidents")
-def incidents(request: Request, session: ReadSessionDep):
-    return render(
+@account_pages.get("/incidents")
+def incidents(request: Request, session: ReadSessionDep, account: AccountPage):
+    return render_account_page(
         request,
+        account,
         "incidents.html",
         incidents=incidents_page(
-            session,
-            _account_id(request, session),
-            request.app.state.network,
-            installation=True,
-            limit=200,
+            session, account.id, account.network, installation=True, limit=200
         ),
     )
 
@@ -643,7 +795,9 @@ async def appearance_save(request: Request):
 
 def install(app: FastAPI) -> None:
     app.add_exception_handler(LoginRequired, _login_redirect)
+    app.add_exception_handler(PageNotFound, _not_found_page)
     app.mount("/ui/static", StaticFiles(directory=HERE / "static"), name="ui-static")
     app.include_router(public)
     app.include_router(pages)
+    app.include_router(account_pages)
     app.include_router(settings_pages)

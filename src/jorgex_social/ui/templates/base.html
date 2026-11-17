@@ -12,14 +12,28 @@
 </head>
 <body>
 {% block body %}
+{# Every page of an account builds its links from `base`, `/ui/a/{account}`. A page that is not
+   one account's (Settings, an unknown account, the home with nothing connected) has none: it
+   offers only Home, which opens the account the operator last used or lets them pick one. #}
+{% set nav_base = base or "/ui" %}
 <header class="top">
   <div class="top-inner">
-    <a class="wordmark" href="/ui/">{% include "_wordmark.html" %}</a>
+    <a class="wordmark" href="{{ nav_base }}/">{% include "_wordmark.html" %}</a>
     <nav aria-label="Sections">
-      {% for href, label in [("/ui/", "Home"), ("/ui/posts", "Posts"), ("/ui/stats", "Stats"), ("/ui/rules", "Rules"), ("/ui/events", "Events"), ("/ui/incidents", "Incidents")] %}
-      <a href="{{ href }}"{% if request.url.path == href or (href != "/ui/" and request.url.path.startswith(href)) %} aria-current="page"{% endif %}>{{ label }}</a>
+      {% if base %}
+      {% for path, label in [("/", "Home"), ("/posts", "Posts"), ("/stats", "Stats"), ("/rules", "Rules"), ("/events", "Events"), ("/incidents", "Incidents")] %}
+      {% set href = nav_base ~ path %}
+      <a href="{{ href }}"{% if request.url.path == href or (path != "/" and request.url.path.startswith(href)) %} aria-current="page"{% endif %}>{{ label }}</a>
       {% endfor %}
+      {% else %}
+      {# A page that is not one account's has no section to open: the sections need an account, and
+         `/ui/` is where the operator picks the one they mean. #}
+      <a href="{{ nav_base }}/"{% if request.url.path == nav_base ~ "/" %} aria-current="page"{% endif %}>Home</a>
+      {% endif %}
     </nav>
+    {% if active_account %}
+    <a class="account-chip" href="{{ nav_base }}/" title="The account these pages work on">@{{ active_account.username }}</a>
+    {% endif %}
     <details class="profile-menu">
       <summary aria-label="Account menu">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7z"/></svg>

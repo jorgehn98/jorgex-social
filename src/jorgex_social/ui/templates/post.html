@@ -2,7 +2,7 @@
 {% from "_macros.html" import pill, empty %}
 {% block title %}Post{% endblock %}
 {% block main %}
-<p><a href="/ui/posts">Posts</a></p>
+<p><a href="{{ base }}/posts">Posts</a></p>
 <h1>{{ post.type | capitalize }} {{ pill(post.status) }}</h1>
 <div class="grid">
   <div class="card">
@@ -12,14 +12,14 @@
       <dt>Published</dt><dd class="mono">{{ post.published_at | when }}</dd>
       {% if post.trial %}<dt>Trial reel</dt><dd class="mono">{{ post.trial }}</dd>{% endif %}
       <dt>Failure</dt><dd class="mono">{{ post.failure or "—" }}</dd>
-      <dt>Media ref</dt><dd class="mono">{% if post.external_ref %}<a href="/ui/stats/{{ post.external_ref }}">{{ post.external_ref }}</a>{% else %}—{% endif %}</dd>
+      <dt>Media ref</dt><dd class="mono">{% if post.external_ref %}<a href="{{ base }}/stats/{{ post.external_ref }}">{{ post.external_ref }}</a>{% else %}—{% endif %}</dd>
       <dt>Link</dt><dd>{% if post.permalink %}<a href="{{ post.permalink }}" rel="noreferrer noopener" target="_blank">{{ post.permalink }}</a>{% else %}—{% endif %}</dd>
       <dt>Hash</dt><dd class="mono">{{ post.content_hash }}</dd>
       <dt>Source</dt><dd class="mono">{{ post.source_ref or "—" }}</dd>
       <dt>Created</dt><dd class="mono">{{ post.created_at | when }}</dd>
     </dl>
   </div>
-  {% if thumbnail %}<div><img class="thumb-large" src="/ui/media/{{ thumbnail }}" alt="First image of the post"></div>{% endif %}
+  {% if thumbnail %}<div><img class="thumb-large" src="{{ base }}/media/{{ thumbnail }}" alt="First image of the post"></div>{% endif %}
 </div>
 
 <h2>Caption</h2>

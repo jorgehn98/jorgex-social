@@ -3,8 +3,8 @@
 Every row of the domain carries `account_id`, never the network: with two accounts of one network
 the network identifies nothing (decision 10). This module is the one place the *service's own* code
 asks which account that is: the worker, which goes account by account; the webhook, which finds the
-account Meta names in each notification; and the operator's web interface, which still works on the
-one account of each mode until the interface carries the account in its URL (T04).
+account Meta names in each notification; and the first account of each mode, for the commands. The
+operator's web interface takes its account from the URL (`ui/routes.py`).
 
 An API call never comes here: its account is the caller's, resolved from the token or the OAuth
 grant in `access/deps.py` (T02).

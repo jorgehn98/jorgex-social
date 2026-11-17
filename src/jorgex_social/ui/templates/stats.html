@@ -34,7 +34,7 @@
   {% for s in media %}
     <tr>
       <td class="when">{{ s.published_at | when }}</td>
-      <td class="mono"><a href="/ui/stats/{{ s.media_ref }}">{{ s.media_ref }}</a></td>
+      <td class="mono"><a href="{{ base }}/stats/{{ s.media_ref }}">{{ s.media_ref }}</a></td>
       <td class="mono">{{ s.product_type }}</td>
       {% for name in ["reach", "views", "likes"] %}
       <td class="num">{{ "{:,}".format(s.metrics[name]) if s.metrics.get(name) is not none else "—" }}</td>

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Media stats{% endblock %}
 {% block main %}
-<p><a href="/ui/stats">Stats</a></p>
+<p><a href="{{ base }}/stats">Stats</a></p>
 <h1 class="mono">{{ media_ref }}</h1>
 <p class="muted">{{ snapshots[0].product_type }} · published {{ snapshots[0].published_at | when }}{% if snapshots[0].permalink %} · <a href="{{ snapshots[0].permalink }}" rel="noreferrer noopener" target="_blank">open</a>{% endif %}</p>
 <div class="table-wrap"><table>

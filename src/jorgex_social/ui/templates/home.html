@@ -4,8 +4,31 @@
 {% block main %}
 <section class="hero">
   {% include "_particles.svg" %}
-  <h1>{% if account.account %}@{{ account.account.username }}{% else %}No account connected{% endif %}</h1>
+  {% if account.account %}
+  {# The card of the account these pages work on. Opening it lists the other accounts of the mode:
+     choosing one only navigates, it changes nothing. #}
+  <details class="account-switcher">
+    <summary>
+      <h1>@{{ account.account.username }}</h1>
+      <span class="muted mono">{{ account.network }}</span>
+      {{ pill(account.status.value) }}
+    </summary>
+    <ul class="account-list">
+      {% for other in accounts %}
+      <li>
+        <a href="{{ other.base }}/"{% if other.base == base %} aria-current="page"{% endif %}>
+          <span>@{{ other.username }}</span>
+          <span class="muted mono">{{ other.network }}</span>
+          {{ pill(other.status.value) }}
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% else %}
+  <h1>No account connected</h1>
   <p class="muted">{{ account.network }}</p>
+  {% endif %}
 </section>
 
 <div class="grid">
@@ -60,7 +83,7 @@
     <tr>
       <td class="when">{{ p.scheduled_for | when }}</td>
       <td class="mono">{{ p.type }}</td>
-      <td><a href="/ui/posts/{{ p.id }}">{{ p.caption | truncate(80) or "(no caption)" }}</a></td>
+      <td><a href="{{ base }}/posts/{{ p.id }}">{{ p.caption | truncate(80) or "(no caption)" }}</a></td>
     </tr>
   {% endfor %}
   </tbody>
