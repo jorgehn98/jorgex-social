@@ -214,16 +214,18 @@ def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
     clock = SystemClock()
     # "me" until the account is known: connecting only reads /me and renews the token.
     instagram = FakeInstagram(clock) if settings.simulation else InstagramClient(token, "me")
-    connection = connect(
+    result = connect(
         make_sessionmaker(make_engine(settings)),
         instagram,
         token,
         key,
         clock.now(),
     )
+    connection = result.connection
     print(
         json.dumps(
             {
+                "result": "added" if result.added else "refreshed",
                 "network": connection.network,
                 "username": connection.username,
                 "account_type": connection.account_type,

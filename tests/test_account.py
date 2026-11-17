@@ -182,7 +182,7 @@ def test_credential_is_stored_only_encrypted_and_never_shown(
     transport = StubTransport()
     instagram = InstagramClient(PASTED, "me", transport=transport)
 
-    stored = connect(sessions, instagram, PASTED, key, clock.now())
+    stored = connect(sessions, instagram, PASTED, key, clock.now()).connection
 
     client = TestClient(real)
     headers = headers_for(real, account="write")
@@ -310,7 +310,7 @@ def test_connecting_fills_the_row_a_draft_created(real, key, clock):
 
     stored = connect(
         sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
-    )
+    ).connection
 
     assert stored.id == created
     assert (stored.external_account_id, stored.username) == ("1784", "account_1784")
@@ -367,7 +367,7 @@ def test_a_token_too_young_to_renew_is_stored_with_an_estimated_expiry(
     young = FakeInstagram(clock, credential_issued_at=clock.now())  # generated today
     refreshes = count_calls(young, "refresh_token")
 
-    stored = connect(sessions, young, PASTED, key, clock.now())
+    stored = connect(sessions, young, PASTED, key, clock.now()).connection
 
     assert stored.credential_expires_at == clock.now() + timedelta(days=59)
     assert stored.credential_refreshed_at == clock.now()
@@ -401,7 +401,7 @@ def test_connecting_the_same_account_again_refreshes_its_row(real, key, clock):
     sessions = real.state.sessionmaker
     first = connect(
         sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
-    )
+    ).connection
     with sessions() as session, session.begin():
         session.add(Post(account_id=first.id, type="image", content_hash="h"))
         create_token(session, "agent", {"posts": "read"}, first.id)
@@ -412,7 +412,7 @@ def test_connecting_the_same_account_again_refreshes_its_row(real, key, clock):
         "new-pasted",
         key,
         clock.now(),
-    )
+    ).connection
 
     assert refreshed.id == first.id
     with sessions() as session:
@@ -429,7 +429,7 @@ def test_connecting_another_account_adds_it_and_leaves_the_first_alone(real, key
     sessions = real.state.sessionmaker
     first = connect(
         sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
-    )
+    ).connection
     with sessions() as session, session.begin():
         session.add(Post(account_id=first.id, type="image", content_hash="h"))
         create_token(session, "agent", {"posts": "read"}, first.id)
@@ -441,7 +441,7 @@ def test_connecting_another_account_adds_it_and_leaves_the_first_alone(real, key
         "b-pasted",
         key,
         clock.now(),
-    )
+    ).connection
 
     assert second.id != first.id
     assert (second.external_account_id, second.username) == ("2048", "account_2048")
@@ -587,7 +587,7 @@ def test_a_second_account_does_not_change_the_first_account_s_client(real, key, 
     sessions = real.state.sessionmaker
     first = connect(
         sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
-    )
+    ).connection
     transport = StubTransport()
     worker_client = InstagramClient.from_source(
         StoredCredential(sessions, key, first.id), transport=transport
@@ -616,7 +616,9 @@ def test_a_reconnect_during_renewal_wins(sessions, ig, key, clock, task):
         nonlocal reconnected
         renewal = original()
         # The same account again, with a newer token: its row changes under the worker's renewal.
-        reconnected = connect(sessions, FakeInstagram(clock), "new-pasted", key, clock.now())
+        reconnected = connect(
+            sessions, FakeInstagram(clock), "new-pasted", key, clock.now()
+        ).connection
         return renewal
 
     ig.refresh_token = refresh_while_reconnecting

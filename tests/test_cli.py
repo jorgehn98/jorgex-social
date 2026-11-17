@@ -200,6 +200,7 @@ def test_connect_instagram_reads_the_token_from_stdin(settings, monkeypatch, cap
     out = capsys.readouterr()
     shown = json.loads(out.out)
     assert (shown["network"], shown["username"]) == ("simulation", "simulated_account")
+    assert shown["result"] == "added"
     assert shown["credential_expires_at"]
     assert "pasted-token-not-real" not in out.out + out.err
     with make_sessionmaker(make_engine(settings))() as session:
@@ -232,7 +233,9 @@ def test_connect_instagram_refreshes_the_same_account(settings, monkeypatch, cap
 
     connect_accounts(settings, monkeypatch, "1784")
 
-    assert json.loads(capsys.readouterr().out)["credential_expires_at"]
+    refreshed = json.loads(capsys.readouterr().out)
+    assert refreshed["result"] == "refreshed"
+    assert refreshed["credential_expires_at"]
     with sessions() as session:
         rows = session.scalars(select(Connection)).all()
         assert [row.id for row in rows] == [first_id]
@@ -258,7 +261,9 @@ def test_connect_instagram_adds_a_second_account_and_keeps_the_first(settings, m
 
     connect_accounts(settings, monkeypatch, "2048")
 
-    assert json.loads(capsys.readouterr().out)["credential_expires_at"]
+    added = json.loads(capsys.readouterr().out)
+    assert added["result"] == "added"
+    assert added["credential_expires_at"]
     with sessions() as session:
         rows = session.scalars(select(Connection).order_by(Connection.id)).all()
         assert [row.external_account_id for row in rows] == ["1784", "2048"]
@@ -294,7 +299,9 @@ def test_connect_instagram_fills_the_draft_row(settings, monkeypatch, capsys):
 
     connect_accounts(settings, monkeypatch, "1784")
 
-    assert json.loads(capsys.readouterr().out)["credential_expires_at"]
+    filled = json.loads(capsys.readouterr().out)
+    assert filled["result"] == "added"
+    assert filled["credential_expires_at"]
     with sessions() as session:
         rows = session.scalars(select(Connection)).all()
         assert [row.id for row in rows] == [draft_id]

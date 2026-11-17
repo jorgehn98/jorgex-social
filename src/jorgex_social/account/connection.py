@@ -1,6 +1,7 @@
 """Connecting the account, renewing its credential and checking the connection's health."""
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
@@ -70,13 +71,22 @@ def _limits(limit: PublishingLimit) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class ConnectResult:
+    """What `connect` did: the account's row, and whether it was added (a new row, or the draft
+    row filled) rather than refreshed in place."""
+
+    connection: Connection
+    added: bool
+
+
 def connect(
     sessions: sessionmaker,
     instagram: Instagram,
     token: str,
     key: bytes,
     now: datetime,
-) -> Connection:
+) -> ConnectResult:
     """Stores the credential `instagram` was built with (`token`), after checking which account
     it opens and renewing it once: the renewal is how its expiry becomes known. The account is
     the one Instagram answers for that token: a row already bound to it is refreshed in place, the
@@ -130,7 +140,7 @@ def connect(
             detail={"expiry_estimated": True} if estimated else None,
         )
     log.info("connected", extra={"network": network, "username": account.username})
-    return connection
+    return ConnectResult(connection, added)
 
 
 def mark_unreadable(sessions: sessionmaker, account_id: str, now: datetime) -> None:

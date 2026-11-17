@@ -99,6 +99,8 @@ to delete a connection or its data.
 
 The web interface shows one account at a time. Each account lives at `/ui/a/{account}/`, and the
 header switches between the accounts you have connected; `/ui/` opens the one you used last.
+`{account}` is the connection id this installation gives the account (`account_id` in
+`list-tokens`, `connection_id` in `GET /v1/token`), not Instagram's user id.
 
 These belong to the installation, not to one account:
 
@@ -252,8 +254,10 @@ Point the MCP server at `http://localhost:8000` while the tunnel is open (see
 A web interface shows one account at a time at `/ui/a/{account}/`: the connection, scheduled and
 published posts, insights, rules, events and incidents, with a switcher in the header for the
 accounts you connected. Only Settings can change anything, and only with a recent sign-in (see
-[Your own look](#your-own-look)); agents and scripts keep using the API. It is for one operator, who
-signs in with a password and a TOTP code from an authenticator app:
+[Your own look](#your-own-look)); agents and scripts keep using the API. Settings belongs to the
+whole installation, so its header offers only Home: the section links need an account and live under
+`/ui/a/{account}/`. It is for one operator, who signs in with a password and a TOTP code from an
+authenticator app:
 
 ```sh
 docker compose exec api jorgex-social create-operator   # asks for the password (12+ characters)
