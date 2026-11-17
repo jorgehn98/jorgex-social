@@ -91,8 +91,9 @@ def sessions(app):
 @pytest.fixture
 def headers(app):
     with app.state.sessionmaker() as session, session.begin():
+        account = scope.current_account(session, app.state.network)
         _, secret = create_token(
-            session, "agent", {"rules": "write", "events": "read", "account": "read"}
+            session, "agent", {"rules": "write", "events": "read", "account": "read"}, account.id
         )
     return {"Authorization": f"Bearer {secret}"}
 

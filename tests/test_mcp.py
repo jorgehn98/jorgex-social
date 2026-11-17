@@ -75,7 +75,8 @@ def transport(client):
 
 def make_secret(app, name="agent", **grants):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, name, grants)
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, name, grants, account.id)
     return secret
 
 

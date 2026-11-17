@@ -74,14 +74,20 @@ ANY = "any"
 # and what each error code asks of the agent. A backticked identifier here is always a tool name
 # (tests check it), so the guide never points at a tool the server does not have.
 _INSTRUCTIONS = """\
-jorgex-social runs one Instagram account: posts (prepare, schedule, publish), automatic replies \
-to comments and direct messages, and stored statistics. Each tool is one call to its REST API, \
-which checks this token's permissions and enforces every rule.
+jorgex-social publishes to and answers on your own Instagram accounts: posts (prepare, schedule, \
+publish), automatic replies to comments and direct messages, and stored statistics. Each tool is \
+one call to its REST API, which checks this token's permissions and enforces every rule.
 
-Start with `get_token`, to see what this token may do, and `get_account`. With simulation \
-false, `publish_now`, `schedule_post` (at its time), `activate_rule` and turning the kill \
-switch off act on the real account, and a publication cannot be undone from here. With \
-simulation true nothing reaches Instagram.
+This token works on one account, the one `get_token` reports, and that is the account every tool \
+acts on: posts, media, rules, events, statistics, incidents, the audit log and the kill switch are \
+that account's. There is no account parameter, and nothing of another account is ever returned: an \
+id of another account answers not_found or unknown_media, exactly as a made-up one does. For \
+another account, the operator gives you another token with its own permissions.
+
+Start with `get_token`, to see what this token may do and which account it works on, and \
+`get_account`. With simulation false, `publish_now`, `schedule_post` (at its time), \
+`activate_rule` and turning the kill switch off act on the real account, and a publication cannot \
+be undone from here. With simulation true nothing reaches Instagram.
 
 Publishing:
 1. `get_catalog`: post types, item and caption limits, accepted files.
@@ -166,12 +172,13 @@ same condition as a pause. Never `resume_conversation` a paused_forever conversa
 human asks: it lifts the opt-out, and it is the only way to. `pause_conversation` with until is \
 refused there with invalid_state. `test_rules` does not apply opt-out words.
 
-Kill switch (`set_kill_switch`): on, nothing is written to Instagram. Scheduled posts wait, \
-and replies due meanwhile are skipped for good. Off, publishing resumes; posts past their grace \
-window fail as missed_schedule, and a post whose containers were being made when it turned on \
-fails with failure kill_switch; both must be scheduled again. It also turns on by itself when \
-Instagram reports the account as restricted, with an account_restricted incident holding Meta's \
-code and subcode. Never turn it off on your own after that: ask a human to check the account \
+Kill switch (`set_kill_switch`): on, nothing is written to Instagram for this token's account; \
+the other accounts of the installation are untouched. Scheduled posts wait, and replies due \
+meanwhile are skipped for good. Off, publishing resumes; posts past their grace window fail as \
+missed_schedule, and a post whose containers were being made when it turned on fails with failure \
+kill_switch; both must be scheduled again. It also turns on by itself when Instagram reports the \
+account as restricted, with an account_restricted incident holding Meta's code and subcode (its \
+`list_incidents`). Never turn it off on your own after that: ask a human to check the account \
 first. Turning it off closes that incident, and if Instagram refuses again both come back. Open \
 incidents (`list_incidents`) need a human; acknowledging one does not close it. After a \
 restriction the API can keep answering while the account is limited, so calls that succeed prove \
@@ -182,11 +189,6 @@ accent colour, its CSS, its icon, the CSS variables that can be overridden and w
 likely typos in the CSS. `set_appearance` changes the name, its highlight and the icon; nothing \
 reaches Instagram. CSS is only editable by the operator in Settings: to change it, ask them to \
 paste it there, and do not try to work around this.
-
-sign_in_password_accepted: sign-ins to the web interface with the right password kept failing on \
-the code, so the password may have leaked. Tell the operator at once; if it was not them, they \
-should change the password on the server (set-password), which is what closes it. You cannot \
-close it, and a successful sign-in does not either.
 
 Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
 a page comes back shorter than limit; tools without offset say how to page in their \
@@ -271,9 +273,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     # access
 
     def get_token() -> str:
-        """What this token may do: its permissions per group (posts, scheduling, stats,
-        account, rules, events), each deny, read or write. Call it first; a tool whose group
-        is not granted at its level fails with forbidden."""
+        """The account this token works on (its id in this service, its network and the account's
+        username) and what it may do: its permissions per group (posts, scheduling, stats,
+        account, rules, events), each deny, read or write. No other account is reachable with it.
+        Call it first; a tool whose group is not granted at its level fails with forbidden."""
         return call("GET", "/v1/token")
 
     # posts
@@ -504,10 +507,11 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     # account
 
     def get_account() -> str:
-        """Whether the service runs in simulation (true: nothing reaches Instagram; false:
-        publishing, rules and the kill switch act on the real account), connection status,
-        publishing limits, kill switch, number of open incidents and the webhook (configured,
-        time of the last valid notification). Never includes the credential."""
+        """The account this token works on, as the service sees it: whether the service runs in
+        simulation (true: nothing reaches Instagram; false: publishing, rules and the kill switch
+        act on the real account), connection status, publishing limits, kill switch, number of
+        this account's open incidents and its webhook (configured, time of the last valid
+        notification). Never includes the credential, and never another account."""
         return call("GET", "/v1/account")
 
     def list_incidents(
@@ -517,10 +521,10 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         limit: Limit = None,
         offset: Offset = None,
     ) -> str:
-        """Channel incidents, newest first. An open incident's cause is still there, except
-        account_restricted, which stays open until the kill switch is turned off.
-        sign_in_password_accepted needs the operator, who should change the password if they did
-        not cause it: sign-ins had the right password and a wrong code (detail: wrong_codes)."""
+        """This account's channel incidents, newest first: another account's, and the
+        installation's own (the operator's sign-ins), never appear. An open incident's cause is
+        still there, except account_restricted, which stays open until the kill switch is turned
+        off."""
         return call(
             "GET",
             "/v1/account/incidents",
@@ -533,28 +537,29 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         limit: Limit = None,
         offset: Offset = None,
     ) -> str:
-        """Audit log of writes and denied calls, newest first. operator.login entries give the
-        client address in detail, and reason wrong_code when a denied sign-in had the right
-        password. Denied sign-ins older than 90 days are deleted at the next successful sign-in;
-        everything else stays."""
+        """This account's audit log of writes and denied calls, newest first: never another
+        account's and never the installation's own (the operator's sign-ins and Settings).
+        Everything else stays."""
         query = {"object_type": object_type, "object_id": object_id, "limit": limit}
         return call("GET", "/v1/account/audit", query={**query, "offset": offset})
 
     def acknowledge_incident(
         incident_id: Annotated[str, Field(description="Incident id, from list_incidents.")],
     ) -> str:
-        """Mark an incident as seen. It stays open until its cause is gone, or for
-        account_restricted until the kill switch is turned off."""
+        """Mark one of this account's incidents as seen. It stays open until its cause is gone, or
+        for account_restricted until the kill switch is turned off. Another account's incident
+        answers not_found."""
         return call("POST", "/v1/account/incidents/{}/acknowledge", incident_id)
 
     def set_kill_switch(enabled: bool) -> str:
-        """On: the service stops writing to the network (no publishing, no replies); scheduled
-        posts stay scheduled and replies due meanwhile are skipped for good. Off: due posts
-        publish and active rules answer again on the real account, unless the service runs in
-        simulation; posts past their grace window fail as missed_schedule and can be
-        rescheduled. It also turns on by itself when Instagram reports the account as restricted
-        (account_restricted incident); turning it off closes that incident, so a human should
-        check the account first."""
+        """Act on the kill switch of this token's account alone; no other account's can be read or
+        set from here. On: the service stops writing to the network for that account (no
+        publishing, no replies); scheduled posts stay scheduled and replies due meanwhile are
+        skipped for good. Off: due posts publish and active rules answer again on the real
+        account, unless the service runs in simulation; posts past their grace window fail as
+        missed_schedule and can be rescheduled. It also turns on by itself when Instagram reports
+        the account as restricted (account_restricted incident); turning it off closes that
+        incident, so a human should check the account first."""
         return call("PUT", "/v1/account/kill-switch", json_body={"enabled": enabled})
 
     def get_appearance() -> str:

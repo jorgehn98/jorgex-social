@@ -3,16 +3,17 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import false, func, select
 from sqlalchemy.orm import Session
 
-from jorgex_social.access.deps import ReadSessionDep, SessionDep, require
+from jorgex_social.access.deps import AccountDep, AccountIdDep, ReadSessionDep, SessionDep, require
 from jorgex_social.access.tokens import Group, Level
 from jorgex_social.account import appearance, audit, incidents, kill_switch, scope
 from jorgex_social.account.connection import status_at
 from jorgex_social.account.models import (
     AuditEntry,
     ChannelIncident,
+    Connection,
     ConnectionStatus,
     IncidentType,
 )
@@ -139,17 +140,27 @@ class AppearanceIn(BaseModel):
 
 
 @router.get("", response_model=AccountOut, dependencies=AccountRead)
-def get_account(request: Request, session: SessionDep):
-    network = request.app.state.network
+def get_account(request: Request, session: SessionDep, account: AccountDep):
+    """The account of this token, as the service sees it. The credential itself is never part of
+    it, and no other account appears in any field."""
+    return account_out(request, session, account, installation=False)
+
+
+def account_out(
+    request: Request, session: Session, account: Connection | None, *, installation: bool
+) -> AccountOut:
+    """The account as the API reports it. `account` is None when nothing exists for the mode yet:
+    the web interface, which still resolves the one account of the mode until T04.
+
+    `installation` adds the installation's own incidents to the count (the operator's sign-ins,
+    which belong to no account): the web interface's view, never a token's."""
     now = request.app.state.clock.now()
-    account = scope.account_of(session, network)
-    account_id = account and account.id
-    # The operator's own incidents have no account; they concern the whole installation.
-    of_the_account = (ChannelIncident.account_id == account_id) | (
-        ChannelIncident.account_id.is_(None)
-    )
+    network = account.network if account else request.app.state.network
+    of_account = ChannelIncident.account_id == account.id if account else false()
+    if installation:
+        of_account = of_account | ChannelIncident.account_id.is_(None)
     open_incidents = session.scalar(
-        select(func.count()).where(of_the_account, ChannelIncident.closed_at.is_(None))
+        select(func.count()).where(of_account, ChannelIncident.closed_at.is_(None))
     )
     common = {
         "simulation": request.app.state.settings.simulation,
@@ -201,59 +212,90 @@ def _incident_out(incident: ChannelIncident, network: str) -> IncidentOut:
     )
 
 
+def incidents_page(
+    session: Session,
+    account_id: str | None,
+    network: str,
+    *,
+    installation: bool,
+    open: bool | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[IncidentOut]:
+    """Newest first. `installation` adds the installation's own incidents (the operator's sign-in
+    attempts, which belong to no account): the web interface's view, never a token's.
+
+    `account_id` None means nothing exists for the mode yet, so there is nothing of an account to
+    list, and never every row without one."""
+    of_account = ChannelIncident.account_id == account_id if account_id is not None else false()
+    if installation:
+        of_account = of_account | ChannelIncident.account_id.is_(None)
+    query = select(ChannelIncident).where(of_account)
+    if open is not None:
+        closed = ChannelIncident.closed_at
+        query = query.where(closed.is_(None) if open else closed.is_not(None))
+    query = query.order_by(ChannelIncident.opened_at.desc(), ChannelIncident.id.desc())
+    found = session.scalars(query.limit(limit).offset(offset)).all()
+    return [_incident_out(incident, network) for incident in found]
+
+
 @router.get("/incidents", response_model=list[IncidentOut], dependencies=AccountRead)
 def list_incidents(
-    request: Request,
     session: SessionDep,
+    account: AccountDep,
     open: bool | None = None,
     limit: Limit = 100,
     offset: Offset = 0,
 ):
     """Newest first. `open=true` lists the ones whose cause is still there.
 
-    `sign_in_password_accepted` means sign-ins with the right password kept failing on the code,
-    so the password may have leaked. It needs the operator: if it was not them, they change the
-    password (`set-password`), which is what closes it; signing in does not."""
-    account_id = scope.account_id_of(session, request.app.state.network)
-    query = select(ChannelIncident).where(
-        (ChannelIncident.account_id == account_id) | ChannelIncident.account_id.is_(None)
+    Only this account's, and never the installation's own: `sign_in_password_accepted` means
+    sign-ins with the right password kept failing on the code, so the password may have leaked,
+    and it belongs to the operator, who sees it in the web interface. If it was not them, they
+    change the password (`set-password`), which is what closes it; signing in does not."""
+    return incidents_page(
+        session,
+        account.id,
+        account.network,
+        installation=False,
+        open=open,
+        limit=limit,
+        offset=offset,
     )
-    if open is not None:
-        closed = ChannelIncident.closed_at
-        query = query.where(closed.is_(None) if open else closed.is_not(None))
-    query = query.order_by(ChannelIncident.opened_at.desc(), ChannelIncident.id.desc())
-    found = session.scalars(query.limit(limit).offset(offset)).all()
-    return [_incident_out(incident, request.app.state.network) for incident in found]
 
 
 @router.post(
     "/incidents/{incident_id}/acknowledge", response_model=IncidentOut, dependencies=AccountWrite
 )
-def acknowledge_incident(incident_id: str, request: Request, session: SessionDep):
-    """Marks the incident as seen. It stays open until its cause is gone."""
+def acknowledge_incident(
+    incident_id: str, request: Request, session: SessionDep, account: AccountDep
+):
+    """Marks the incident as seen. It stays open until its cause is gone. Another account's
+    incident, or the installation's own, is `not_found`: this token has no such incident."""
     incident = session.get(ChannelIncident, incident_id)
-    account_id = scope.account_id_of(session, request.app.state.network)
-    if incident is None or incident.account_id not in {None, account_id}:
+    if incident is None or incident.account_id != account.id:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             detail={"code": "not_found", "message": "No such incident."},
         )
     incident.acknowledged_at = incident.acknowledged_at or request.app.state.clock.now()
-    return _incident_out(incident, request.app.state.network)
+    return _incident_out(incident, account.network)
 
 
 @router.put("/kill-switch", response_model=KillSwitchOut, dependencies=AccountWrite)
-def set_kill_switch(body: KillSwitchIn, request: Request, session: SessionDep):
+def set_kill_switch(body: KillSwitchIn, request: Request, session: SessionDep, account: AccountDep):
     """On: the worker stops writing to the network for this account (no containers, no publishing,
     no replies). Scheduled posts stay scheduled; those past the grace window when it is turned off
     fail as `missed_schedule` and can be rescheduled. Replies due while it is on are skipped.
+
+    It acts on this token's account alone: another account's switch cannot be read or set from
+    here, and turning it off leaves every other account as it was.
 
     It also turns on by itself when Instagram reports the account as restricted, with an
     `account_restricted` incident. Only turning it off here closes that incident; if Instagram
     refuses again, both come back."""
     audit.set_detail(request, {"enabled": body.enabled})
     now = request.app.state.clock.now()
-    account = scope.current_account(session, request.app.state.network)
     kill_switch.set_state(session, account, body.enabled, now)
     if not body.enabled:
         incidents.sync(session, account.id, IncidentType.ACCOUNT_RESTRICTED, False, now)
@@ -263,13 +305,15 @@ def set_kill_switch(body: KillSwitchIn, request: Request, session: SessionDep):
 @router.get("/audit", response_model=list[AuditEntryOut], dependencies=AccountRead)
 def list_audit(
     session: SessionDep,
+    account: AccountIdDep,
     object_type: str | None = None,
     object_id: str | None = None,
     limit: Limit = 100,
     offset: Offset = 0,
 ):
-    """Newest first."""
-    query = select(AuditEntry)
+    """Newest first. This account's entries only: never another account's, and never the
+    installation's own (the operator's sign-ins and Settings), which this token cannot see."""
+    query = select(AuditEntry).where(AuditEntry.account_id == account)
     if object_type is not None:
         query = query.where(AuditEntry.object_type == object_type)
     if object_id is not None:

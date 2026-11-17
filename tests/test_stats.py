@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import func, select, text
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account import scope
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.errors import AccountRestricted, AuthError, RateLimited, Refused
 from jorgex_social.instagram.fake import FakeInstagram
@@ -125,7 +126,8 @@ def test_invalid_credential_stops_the_sweep(sessions, ig, clock):
 
 def auth(app, **grants):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", grants)
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "agent", grants, account.id)
     return {"Authorization": f"Bearer {secret}"}
 
 

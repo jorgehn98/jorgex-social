@@ -6,9 +6,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
-from jorgex_social.access.deps import SessionDep, require
+from jorgex_social.access.deps import AccountIdDep, SessionDep, require
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import scope
 from jorgex_social.publishing.models import Post, PostStatus, PostType
 from jorgex_social.replies import rules
 from jorgex_social.replies.models import (
@@ -39,13 +38,9 @@ def _error(status_code: int, code: str, message: str, **extra) -> HTTPException:
     return HTTPException(status_code, detail={"code": code, "message": message, **extra})
 
 
-def _account(request: Request, session: SessionDep) -> str | None:
-    # The account of the mode: simulated rules and events never show in real mode, and the other
-    # way round. None before anything exists for the mode, which matches no row.
-    return scope.account_id_of(session, request.app.state.network)
-
-
-Account = Annotated[str | None, Depends(_account)]
+# The account of the call: the token's or its OAuth grant's. The web interface passes the one
+# account of the mode, which it still resolves itself.
+Account = AccountIdDep
 
 # A post in one of these goes nowhere on its own. `failed` can still be scheduled again.
 NOT_GOING_OUT = {PostStatus.FAILED, PostStatus.CANCELLED}
@@ -176,13 +171,12 @@ def create_rule(body: RuleIn, request: Request, session: SessionDep, account: Ac
     service instead of a `media_ref`: with `post_id` it waits, answering nothing, until the post
     is published, and then answers on it alone."""
     _check(body.channel, body.media_ref, body.content, body.post_id)
-    account_id = account or scope.current_account(session, request.app.state.network).id
     media_ref = body.media_ref
     if body.post_id is not None:
-        media_ref = _media_of_post(session, account_id, body.post_id)
+        media_ref = _media_of_post(session, account, body.post_id)
     now = request.app.state.clock.now()
     rule = Rule(
-        account_id=account_id,
+        account_id=account,
         name=body.name,
         channel=body.channel,
         media_ref=media_ref,

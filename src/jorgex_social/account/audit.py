@@ -1,7 +1,11 @@
 """Append-only audit log: every authenticated API request that writes, and the transitions the
 worker makes on its own. Entries carry identifiers only: never a request body, a secret or
 third-party text. The one exception to append-only is old denied sign-ins, which anyone can make
-it write (access/operator.py purges them)."""
+it write (access/operator.py purges them).
+
+An entry belongs to the account it was about, so a token reads its account's and never another's.
+Null means the installation's own: the operator's sign-ins, Settings, and every row written before
+the log was indexed by account."""
 
 import logging
 from datetime import datetime
@@ -29,6 +33,7 @@ def record(
     action: str,
     outcome: Outcome = Outcome.OK,
     *,
+    account_id: str | None = None,
     actor_type: ActorType = ActorType.SYSTEM,
     actor_ref: str | None = None,
     object_type: str | None = None,
@@ -38,6 +43,7 @@ def record(
     session.add(
         AuditEntry(
             occurred_at=now,
+            account_id=account_id,
             actor_type=actor_type,
             actor_ref=actor_ref,
             action=action,
@@ -68,6 +74,11 @@ def _object(path_params: dict[str, Any]) -> tuple[str | None, str | None]:
 def set_actor(request: Request, token_prefix: str) -> None:
     """Called by authentication, so the entry names the token even when it was then denied."""
     request.state.audit_actor = token_prefix
+
+
+def set_account(request: Request, account_id: str) -> None:
+    """Called by authentication too: a write through a credential is that account's."""
+    request.state.audit_account = account_id
 
 
 def set_detail(request: Request, detail: dict[str, Any]) -> None:
@@ -121,6 +132,7 @@ class AuditMiddleware:
                     app.state.clock.now(),
                     action,
                     outcome_of(status_code),
+                    account_id=state.get("audit_account"),
                     actor_type=ActorType.TOKEN,
                     actor_ref=state.get("audit_actor"),
                     object_type=object_type,

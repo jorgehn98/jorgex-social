@@ -42,13 +42,15 @@ class OAuthRequest(Base):
 
 
 class OAuthGrant(Base):
-    """What the operator allowed one client: the groups and levels of an API token. Every token
-    issued from one consent belongs to it, so revoking it ends that whole family."""
+    """What the operator allowed one client: the groups and levels of an API token, and the one
+    account they act on. Every token issued from one consent belongs to it, so revoking it ends
+    that whole family."""
 
     __tablename__ = "oauth_grants"
 
     id: Mapped[str] = mapped_column(String(16), primary_key=True)
     client_id: Mapped[str] = mapped_column(ForeignKey("oauth_clients.id"), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     permissions: Mapped[dict[str, str]] = mapped_column(JSON)
     resource: Mapped[str] = mapped_column(String(300))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)

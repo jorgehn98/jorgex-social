@@ -66,13 +66,18 @@ Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
 ```sh
 uv sync
 uv run jorgex-social migrate
-uv run jorgex-social create-token --name my-agent --grant posts=write --grant stats=read
+uv run jorgex-social connect-instagram   # simulation: the fake account takes any placeholder token
+uv run jorgex-social create-token --name my-agent --account simulated_account \
+  --grant posts=write --grant stats=read
 uv run jorgex-social create-operator && uv run jorgex-social enroll-totp   # for /ui
 uv run jorgex-social serve        # API on http://127.0.0.1:8000, docs at /docs, web interface at /ui
 uv run jorgex-social worker       # background worker
 uv run pytest
 uv run ruff check . && uv run ruff format --check .
 ```
+
+A token works on the one account named with `--account` (its username or id) and can read and write
+nothing of any other: with two accounts, create two tokens, one per account.
 
 Configuration comes from `JORGEX_SOCIAL_*` environment variables; see `.env.example`. A fresh install runs
 in simulation mode and never calls Meta.
@@ -116,10 +121,11 @@ Most agent clients take a JSON entry like this one (the exact file and key depen
 }
 ```
 
-Give the agent its own token with only the groups it needs. The URL must use HTTPS unless the API is
-on the same machine (`localhost`, `127.0.0.0/8` or `::1`): the token travels in every request. With
-the recommended proxy the API is not public, so `http://localhost:8000` goes through the SSH tunnel
-described in [INSTALL.md](INSTALL.md#reverse-proxy).
+Give the agent its own token with only the groups it needs, for the account it should work on: that
+token reaches that account and no other, and `GET /v1/token` says which one. The URL must use HTTPS
+unless the API is on the same machine (`localhost`, `127.0.0.0/8` or `::1`): the token travels in
+every request. With the recommended proxy the API is not public, so `http://localhost:8000` goes
+through the SSH tunnel described in [INSTALL.md](INSTALL.md#reverse-proxy).
 
 ## License
 

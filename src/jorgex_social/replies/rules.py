@@ -228,6 +228,7 @@ def bind_to_published(session: Session, post: Post, now: datetime) -> None:
             session,
             now,
             "rule.bound_to_post",
+            account_id=post.account_id,
             object_type="rule",
             object_id=rule.id,
             detail={"post_id": post.id, "media_ref": post.external_ref},

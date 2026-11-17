@@ -18,10 +18,11 @@ from jorgex_social import logs, worker
 from jorgex_social.access import operator
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
-from jorgex_social.account import appearance
+from jorgex_social.account import appearance, scope
 from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
 from jorgex_social.account.credential import NotConnected
 from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
+from jorgex_social.account.models import Connection
 from jorgex_social.clock import SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
@@ -65,11 +66,38 @@ def parse_grants(values: list[str]) -> dict[str, str]:
     return grants
 
 
+def token_account(session, value: str) -> Connection:
+    """The connected account `value` names: its username, or its id as list-tokens shows it. A
+    token works on one account and cannot be moved, so an install connects the account first."""
+    accounts = scope.connected_accounts(session)
+    if not accounts:
+        raise TokenError(
+            "no account is connected: connect one first with `jorgex-social connect-instagram`"
+        )
+    for account in accounts:
+        if account.username == value:
+            return account
+    for account in accounts:
+        if account.id == value:
+            return account
+    raise TokenError(f"no connected account is named or identified by {value!r}")
+
+
 def cmd_create_token(args: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
-        token, secret = create_token(session, args.name, parse_grants(args.grant))
-        result = {"name": token.name, "permissions": token.permissions, "token": secret}
+        account = token_account(session, args.account)
+        token, secret = create_token(session, args.name, parse_grants(args.grant), account.id)
+        result = {
+            "name": token.name,
+            "account": {
+                "id": account.id,
+                "network": account.network,
+                "username": account.username,
+            },
+            "permissions": token.permissions,
+            "token": secret,
+        }
     print(json.dumps(result, indent=2))
     print("Store the token now; it cannot be shown again.", file=sys.stderr)
 
@@ -84,9 +112,12 @@ def cmd_revoke_token(args: argparse.Namespace, settings: Settings) -> None:
 def cmd_list_tokens(_: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
+        # The account each token works on: with two accounts, a token's name alone no longer says.
+        accounts = {c.id: c for c in session.scalars(select(Connection))}
         tokens = [
             {
                 "name": t.name,
+                "account": accounts[t.account_id].username,
                 "prefix": t.prefix,
                 "permissions": t.permissions,
                 "created_at": t.created_at.isoformat(),
@@ -290,8 +321,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("migrate", help="apply database migrations")
 
-    token = sub.add_parser("create-token", help="create an API token and print it once")
+    token = sub.add_parser(
+        "create-token", help="create an API token for one account and print it once"
+    )
     token.add_argument("--name", required=True)
+    token.add_argument(
+        "--account",
+        required=True,
+        metavar="USERNAME|ID",
+        help=(
+            "the connected account the token works on, by username or by id (list-tokens shows "
+            "both); a token can reach that account only"
+        ),
+    )
     token.add_argument(
         "--grant",
         action="append",

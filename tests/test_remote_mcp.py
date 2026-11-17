@@ -38,7 +38,7 @@ from test_oauth import (  # the OAuth fixtures and helpers
 )
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import appearance
+from jorgex_social.account import appearance, scope
 from jorgex_social.api import create_app
 from jorgex_social.logs import hide_query_strings
 from jorgex_social.oauth import store
@@ -204,7 +204,8 @@ async def test_a_token_for_another_resource_is_refused(app, agent, browser):
 @pytest.mark.anyio
 async def test_an_api_token_does_not_open_mcp(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", {"posts": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "agent", {"posts": "write"}, account.id)
 
     async with app.router.lifespan_context(app):
         http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=PUBLIC)
@@ -379,7 +380,8 @@ def test_an_upload_url_refuses_what_is_too_large(agent, browser):
 def test_only_the_url_opens_the_upload_route(app, agent, browser):
     _, tokens = connect(agent, browser, posts="write")
     with app.state.sessionmaker() as session, session.begin():
-        _, api_secret = create_token(session, "agent", {"posts": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, api_secret = create_token(session, "agent", {"posts": "write"}, account.id)
 
     for token in (tokens["access_token"], api_secret):
         response = agent.post("/upload/made-up", content=JPEG, headers=bearer(token))
@@ -391,7 +393,8 @@ def test_only_the_url_opens_the_upload_route(app, agent, browser):
 def test_upload_urls_need_posts_write_and_an_oauth_grant(app, agent, browser):
     _, read_only = connect(agent, browser, posts="read")
     with app.state.sessionmaker() as session, session.begin():
-        _, api_secret = create_token(session, "agent", {"posts": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, api_secret = create_token(session, "agent", {"posts": "write"}, account.id)
 
     denied = api(agent, read_only["access_token"], "/v1/upload-urls", "POST")
     not_oauth = api(agent, api_secret, "/v1/upload-urls", "POST")

@@ -36,6 +36,6 @@ def trip(session: Session, account_id: str, error: AccountRestricted, now: datet
     detail = {"code": error.code, "subcode": error.subcode}
     if not account.kill_switch:
         set_state(session, account, True, now)
-        audit.record(session, now, "kill_switch.on", detail=detail)
+        audit.record(session, now, "kill_switch.on", account_id=account_id, detail=detail)
         log.error("account restricted; kill switch on", extra=detail)
     incidents.sync(session, account_id, IncidentType.ACCOUNT_RESTRICTED, True, now, detail)

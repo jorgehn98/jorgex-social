@@ -25,6 +25,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from jorgex_social.access.limits import RateLimiter, client_key
 from jorgex_social.access.tokens import Group, Level, TokenError, normalize_permissions
+from jorgex_social.account import scope
 from jorgex_social.oauth import store
 from jorgex_social.oauth.provider import Provider
 from jorgex_social.ui.routes import (
@@ -46,6 +47,14 @@ ENDPOINT_LIMITS = [(30, timedelta(minutes=1)), (300, timedelta(hours=1))]
 GONE = (
     "This authorization request is unknown, expired, already answered or was opened in another "
     "browser. Start the connection again from the client."
+)
+NO_ACCOUNT = (
+    "No account is connected yet. A client can only be allowed over a connected account: add one "
+    "on the server with `jorgex-social connect-instagram`, then open this page again."
+)
+NOT_CONNECTED = (
+    "That account is not connected to this service. Choose one of the accounts listed and allow "
+    "the client again."
 )
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
@@ -142,8 +151,13 @@ def consent_page(request: Request, signed_in: RecentSignIn, req: str = ""):
         if opened is not None:
             pending, client, nonce = opened
             client_name, redirect_uri = client.name, pending.params["redirect_uri"]
+            accounts = scope.connected_accounts(session)
     if opened is None:
         return render(request, "consent.html", 400, error=GONE)
+    if not accounts:
+        # Nothing to authorize: a grant works on one account, so without one there is none to
+        # grant anything over. The request is left open, so connecting and reloading finishes it.
+        return render(request, "consent.html", 409, error=NO_ACCOUNT)
     target = urlsplit(redirect_uri)
     response = render(
         request,
@@ -151,6 +165,9 @@ def consent_page(request: Request, signed_in: RecentSignIn, req: str = ""):
         client_name=client_name,
         host=target.hostname,
         port=target.port,
+        accounts=accounts,
+        # One connected account: chosen already, the only answer there is.
+        chosen=accounts[0].id if len(accounts) == 1 else None,
         groups=[group.value for group in Group],
         levels=[Level.WRITE.value, Level.READ.value, Level.DENY.value],
         req=req,
@@ -188,10 +205,15 @@ async def consent_answer(request: Request, signed_in: RecentSignIn):
                 form.get("nonce", ""),
                 signed_in.id_hash,
                 permissions,
+                # Never trusted for itself: the store checks it against the connected accounts.
+                form.get("account_id", ""),
                 state.clock.now(),
             )
 
-    location = await run_in_threadpool(answer)
+    try:
+        location = await run_in_threadpool(answer)
+    except store.Unconnected:
+        return await render_off_loop(request, "consent.html", 400, error=NOT_CONNECTED)
     if location is None:
         # Never a redirect: nothing about this request can be trusted to say where to.
         return await render_off_loop(request, "consent.html", 400, error=GONE)

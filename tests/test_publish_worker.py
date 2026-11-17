@@ -46,7 +46,10 @@ def sessions(app):
 @pytest.fixture
 def headers(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", {"posts": "write", "scheduling": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(
+            session, "agent", {"posts": "write", "scheduling": "write"}, account.id
+        )
     return {"Authorization": f"Bearer {secret}"}
 
 
@@ -257,7 +260,8 @@ def test_the_resolvers_listing_refreshes_the_recent_media(app, client, api, task
     task.resolve(sessions)
 
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "reader", {"stats": "read"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "reader", {"stats": "read"}, account.id)
     recent = client.get("/v1/instagram-media", headers={"Authorization": f"Bearer {secret}"})
     [live] = published(ig)
     assert [m["id"] for m in recent.json()["items"]] == [live.id]
@@ -878,7 +882,8 @@ def test_a_restarted_worker_resolves_the_dead_attempt_at_once(api, task, session
 @pytest.fixture
 def switch(app, client):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "operator", {"account": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "operator", {"account": "write"}, account.id)
     account_headers = {"Authorization": f"Bearer {secret}"}
 
     def set_switch(enabled):

@@ -413,8 +413,8 @@ def sample(app, settings, clock, enrolled):
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     (settings.media_dir / "photo.jpeg").write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 64)
     with app.state.sessionmaker() as session, session.begin():
-        _, api_secret = create_token(session, API_TOKEN_NAME, {"posts": "read"})
         connection = scope.current_account(session, network)
+        _, api_secret = create_token(session, API_TOKEN_NAME, {"posts": "read"}, connection.id)
         connection.external_account_id = "17840000000000001"
         connection.username = "sample_account"
         connection.account_type = "BUSINESS"

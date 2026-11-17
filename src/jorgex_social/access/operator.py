@@ -75,7 +75,7 @@ def _end_sessions(session: Session, now: datetime) -> None:
     session.execute(delete(OperatorSession))
     oauth.revoke_all(session, now, "credentials_changed")
     # Not an account's: the operator is one for the whole installation.
-    incidents.sync(session, None, IncidentType.SIGN_IN_PASSWORD_ACCEPTED, False, now)
+    incidents.sync_operator(session, IncidentType.SIGN_IN_PASSWORD_ACCEPTED, False, now)
 
 
 def _hash_password(password: str) -> str:
@@ -280,9 +280,8 @@ def log_in(
         # and takes as long.
         count = _wrong_codes(session, now)
         if wrong_code and count >= WRONG_CODE_LIMIT:
-            incidents.sync(
+            incidents.sync_operator(
                 session,
-                None,
                 IncidentType.SIGN_IN_PASSWORD_ACCEPTED,
                 True,
                 now,

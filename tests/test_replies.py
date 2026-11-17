@@ -15,7 +15,6 @@ from jorgex_social.account.connection import ConnectionTask
 from jorgex_social.account.models import AuditEntry, ChannelIncident
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
-from jorgex_social.config import Settings
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import AccountRestricted, RateLimited, Refused, Unavailable
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
@@ -70,7 +69,8 @@ def sessions(app):
 @pytest.fixture
 def headers(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", {"rules": "write", "events": "read"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "agent", {"rules": "write", "events": "read"}, account.id)
     return {"Authorization": f"Bearer {secret}"}
 
 
@@ -392,7 +392,8 @@ def test_rule_test_endpoint_stores_nothing(client, headers, settings):
 
 def test_permissions(app, client, headers):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "reader", {"rules": "read", "events": "read"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "reader", {"rules": "read", "events": "read"}, account.id)
     reader = {"Authorization": f"Bearer {secret}"}
 
     assert client.get("/v1/rules", headers=reader).status_code == 200
@@ -1248,7 +1249,8 @@ def kill_switch_is_on(sessions):
 @pytest.fixture
 def operator(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "operator", {"account": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "operator", {"account": "write"}, account.id)
     return {"Authorization": f"Bearer {secret}"}
 
 
@@ -1782,12 +1784,11 @@ def test_a_timed_pause_cannot_lift_an_opt_out(client, headers, ig, sessions, tas
     assert client.post(pause, json={"until": until}, headers=headers).status_code == 200
 
 
-def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
-    settings, clock, app, client, headers
-):
-    """The simulation and the real account have one of each, and neither lists the other's."""
-    from fastapi.testclient import TestClient
+def test_each_account_sees_only_its_own_events_deliveries_and_conversations(app, client, headers):
+    """The simulation and the real account have one of each, and neither lists the other's.
 
+    The account decides what a call sees, not the mode of the installation: a token of the
+    simulated account never reaches the real one's rows, and the other way round (SC-06)."""
     with app.state.sessionmaker() as session, session.begin():
         for network, person in (("simulation", "person-simulated"), ("instagram", "person-real")):
             account = scope.current_account(session, network)
@@ -1836,22 +1837,25 @@ def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
                 )
             )
 
-    real = TestClient(
-        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
-    )
+        # A second token, on the other account: what an installation with both connected has.
+        real_account = scope.current_account(session, "instagram")
+        _, real_secret = create_token(
+            session, "real-agent", {"rules": "read", "events": "read"}, real_account.id
+        )
+    other = {"Authorization": f"Bearer {real_secret}"}
 
-    for mode in (client, real):
+    for token in (headers, other):
         for resource in ("events", "deliveries", "conversations"):
-            assert len(mode.get(f"/v1/{resource}", headers=headers).json()) == 1, resource
+            assert len(client.get(f"/v1/{resource}", headers=token).json()) == 1, resource
     assert [e["external_ref"] for e in client.get("/v1/events", headers=headers).json()] == [
         "message-simulation"
     ]
-    assert [e["external_ref"] for e in real.get("/v1/events", headers=headers).json()] == [
+    assert [e["external_ref"] for e in client.get("/v1/events", headers=other).json()] == [
         "message-instagram"
     ]
     assert [c["external_id"] for c in client.get("/v1/conversations", headers=headers).json()] == [
         "person-simulated"
     ]
-    assert [c["external_id"] for c in real.get("/v1/conversations", headers=headers).json()] == [
+    assert [c["external_id"] for c in client.get("/v1/conversations", headers=other).json()] == [
         "person-real"
     ]

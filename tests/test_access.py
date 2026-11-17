@@ -10,14 +10,21 @@ from jorgex_social.access import deps
 from jorgex_social.access.deps import require
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token
+from jorgex_social.account import scope
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.db import utcnow
 
 
+def make_token_account(app) -> str:
+    with app.state.sessionmaker() as session, session.begin():
+        return scope.current_account(session, app.state.network).id
+
+
 def make_token(app, name="agent", **grants):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, name, grants)
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, name, grants, account.id)
     return secret
 
 
@@ -98,15 +105,18 @@ def test_group_permissions(app, client, granted, required, allowed):
 
 @pytest.mark.parametrize("grants", [{"unknown": "read"}, {"posts": "admin"}])
 def test_rejects_unknown_group_or_level(app, grants):
+    account = make_token_account(app)
+
     with pytest.raises(TokenError), app.state.sessionmaker() as session:
-        create_token(session, "agent", grants)
+        create_token(session, "agent", grants, account)
 
 
 def test_rejects_duplicate_name(app):
+    account = make_token_account(app)
     make_token(app, "agent")
 
     with pytest.raises(TokenError), app.state.sessionmaker() as session:
-        create_token(session, "agent", {})
+        create_token(session, "agent", {}, account)
 
 
 def test_unknown_token_is_rejected_while_the_database_is_being_written(app, client):

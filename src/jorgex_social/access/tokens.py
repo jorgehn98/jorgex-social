@@ -54,8 +54,11 @@ def normalize_permissions(grants: dict[str, str]) -> dict[str, str]:
     return permissions
 
 
-def create_token(session: Session, name: str, grants: dict[str, str]) -> tuple[ApiToken, str]:
-    """Returns the stored token and its secret, which is never stored and cannot be shown again."""
+def create_token(
+    session: Session, name: str, grants: dict[str, str], account_id: str
+) -> tuple[ApiToken, str]:
+    """Returns the stored token and its secret, which is never stored and cannot be shown again.
+    The token works on `account_id` and on no other account (decision 10)."""
     name = name.strip()
     if not name:
         raise TokenError("token name is required")
@@ -64,6 +67,7 @@ def create_token(session: Session, name: str, grants: dict[str, str]) -> tuple[A
     secret = TOKEN_PREFIX + secrets.token_urlsafe(32)
     token = ApiToken(
         name=name,
+        account_id=account_id,
         prefix=secret[:PREFIX_LENGTH],
         hash=hash_token(secret),
         permissions=normalize_permissions(grants),
