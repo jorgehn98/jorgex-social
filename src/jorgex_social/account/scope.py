@@ -48,6 +48,17 @@ def current_account(session: Session, network: str) -> Connection:
     return account
 
 
+def draft_account(session: Session, network: str) -> Connection | None:
+    """The row a first write created before anything was connected, if it is still there:
+    connecting an account fills that row instead of adding a second one."""
+    return session.scalars(
+        select(Connection)
+        .where(Connection.network == network, Connection.external_account_id == "")
+        .order_by(Connection.id)
+        .limit(1)
+    ).first()
+
+
 def connected_accounts(session: Session) -> list[Connection]:
     """The accounts a credential can be bound to: the ones that have been connected, oldest
     first. A row created by a first write is not one of them yet."""

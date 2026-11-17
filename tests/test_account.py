@@ -1,16 +1,16 @@
 import base64
 import json
 import logging
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account import appearance, crypto, scope
-from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
+from jorgex_social.account.connection import ConnectionTask, connect
 from jorgex_social.account.credential import (
     NotConnected,
     StoredCredential,
@@ -26,7 +26,7 @@ from jorgex_social.config import Settings
 from jorgex_social.instagram import make_instagram
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import AuthError, CredentialUnavailable, Unavailable
-from jorgex_social.instagram.fake import FakeInstagram
+from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.publishing.models import Post
 
@@ -301,7 +301,7 @@ def test_a_failed_reseal_leaves_the_token_usable(sessions, key, caplog):
 
 def test_connecting_fills_the_row_a_draft_created(real, key, clock):
     """A write before connecting already owns the account of the mode: connecting names that same
-    row, without a second one and without --replace."""
+    row, without a second one and without replacing anything."""
     sessions = real.state.sessionmaker
     with sessions() as session, session.begin():
         account = scope.current_account(session, "instagram")
@@ -395,31 +395,75 @@ def test_an_invalid_token_is_not_stored(sessions, key, clock):
     assert connection(sessions) is None
 
 
-def other_account(clock):
-    other = FakeInstagram(clock)
-    real_account = other.account
-    other.account = lambda: replace(real_account(), id="999", username="other_account")
-    return other
-
-
-def test_another_account_needs_replace(sessions, ig, key, clock, client, headers):
-    first = connect(sessions, ig, PASTED, key, clock.now())
-
-    with pytest.raises(ConnectError, match="--replace"):
-        connect(sessions, other_account(clock), "other-token-not-real", key, clock.now())
-    assert connection(sessions).external_account_id == first.external_account_id
-
-    connect(sessions, other_account(clock), "other-token-not-real", key, clock.now(), replace=True)
-
-    assert (connection(sessions).external_account_id, connection(sessions).username) == (
-        "999",
-        "other_account",
+def test_connecting_the_same_account_again_refreshes_its_row(real, key, clock):
+    """A second connect for the same account renews its credential in place: no second row, and
+    nothing it already owns moves."""
+    sessions = real.state.sessionmaker
+    first = connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
     )
+    with sessions() as session, session.begin():
+        session.add(Post(account_id=first.id, type="image", content_hash="h"))
+        create_token(session, "agent", {"posts": "read"}, first.id)
+
+    refreshed = connect(
+        sessions,
+        InstagramClient("new-pasted", "me", transport=StubTransport()),
+        "new-pasted",
+        key,
+        clock.now(),
+    )
+
+    assert refreshed.id == first.id
     with sessions() as session:
-        actions = session.scalars(
-            select(AuditEntry.action).where(AuditEntry.actor_type == "operator")
-        ).all()
-    assert sorted(actions) == ["connection.connected", "connection.replaced"]
+        assert session.scalar(select(func.count()).select_from(Connection)) == 1
+        assert session.scalar(select(func.count()).select_from(Post)) == 1
+        assert session.scalar(select(func.count()).select_from(ApiToken)) == 1
+        actions = session.scalars(select(AuditEntry.action).order_by(AuditEntry.occurred_at)).all()
+    assert sorted(actions) == ["connection.added", "connection.refreshed"]
+
+
+def test_connecting_another_account_adds_it_and_leaves_the_first_alone(real, key, clock):
+    """The point of several own accounts: a second account is a second row with its own
+    credential. The first one's row, credential, posts and tokens stay exactly as they were."""
+    sessions = real.state.sessionmaker
+    first = connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
+    )
+    with sessions() as session, session.begin():
+        session.add(Post(account_id=first.id, type="image", content_hash="h"))
+        create_token(session, "agent", {"posts": "read"}, first.id)
+        first_credential = session.get_one(Connection, first.id).credential_encrypted
+
+    second = connect(
+        sessions,
+        InstagramClient("b-pasted", "me", transport=StubTransport("b-renewed", user_id="2048")),
+        "b-pasted",
+        key,
+        clock.now(),
+    )
+
+    assert second.id != first.id
+    assert (second.external_account_id, second.username) == ("2048", "account_2048")
+    with sessions() as session:
+        untouched = session.get_one(Connection, first.id)
+        assert (untouched.external_account_id, untouched.username) == ("1784", "account_1784")
+        assert untouched.credential_encrypted == first_credential
+        assert session.scalar(select(func.count()).select_from(Connection)) == 2
+        assert (
+            session.scalar(
+                select(func.count()).select_from(Post).where(Post.account_id == first.id)
+            )
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count()).select_from(ApiToken).where(ApiToken.account_id == first.id)
+            )
+            == 1
+        )
+        actions = session.scalars(select(AuditEntry.action).order_by(AuditEntry.occurred_at)).all()
+    assert sorted(actions) == ["connection.added", "connection.added"]
 
 
 # Renewal
@@ -537,14 +581,16 @@ def test_unreadable_credential_is_reported_and_nothing_is_sent(real, key, clock)
     assert open_incidents(sessions) == []
 
 
-def test_replacing_the_account_applies_at_once_to_token_and_id(real, key, clock):
+def test_a_second_account_does_not_change_the_first_account_s_client(real, key, clock):
+    """Each worker client reads the credential of its own row: adding another account must not
+    send the first account's work with the second account's token."""
     sessions = real.state.sessionmaker
-    connect(
+    first = connect(
         sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
     )
     transport = StubTransport()
     worker_client = InstagramClient.from_source(
-        StoredCredential(sessions, key, current_connection_id(sessions)), transport=transport
+        StoredCredential(sessions, key, first.id), transport=transport
     )
     worker_client.publish("1")
     connect(
@@ -553,25 +599,24 @@ def test_replacing_the_account_applies_at_once_to_token_and_id(real, key, clock)
         "b-pasted",
         key,
         clock.now(),
-        replace=True,
     )
     worker_client.publish("1")
 
     (_, before, before_headers), (_, after, after_headers) = transport.calls
-    assert (
-        "/1784/media_publish" in before and before_headers["Authorization"] == f"Bearer {RENEWED}"
-    )
-    assert "/2048/media_publish" in after and after_headers["Authorization"] == "Bearer b-renewed"
+    assert "/1784/media_publish" in before and before == after
+    assert before_headers["Authorization"] == after_headers["Authorization"] == f"Bearer {RENEWED}"
 
 
 def test_a_reconnect_during_renewal_wins(sessions, ig, key, clock, task):
     connect(sessions, ig, PASTED, key, clock.now())
-    other = other_account(clock)
     original = ig.refresh_token
+    reconnected = None
 
     def refresh_while_reconnecting():
+        nonlocal reconnected
         renewal = original()
-        connect(sessions, other, "other-pasted", key, clock.now(), replace=True)
+        # The same account again, with a newer token: its row changes under the worker's renewal.
+        reconnected = connect(sessions, FakeInstagram(clock), "new-pasted", key, clock.now())
         return renewal
 
     ig.refresh_token = refresh_while_reconnecting
@@ -580,9 +625,11 @@ def test_a_reconnect_during_renewal_wins(sessions, ig, key, clock, task):
     task.check(sessions, clock.now())
 
     stored = connection(sessions)
+    assert stored.id == reconnected.id
+    assert stored.credential_encrypted == reconnected.credential_encrypted  # the reconnect won
     token = crypto.decrypt(key, stored.credential_encrypted, credential_context(stored.id))
     assert token == "simulated-token-1"  # the reconnect's renewal, not the worker's
-    assert stored.external_account_id == "999"
+    assert stored.external_account_id == ACCOUNT_ID
     assert stored.credential_expires_at == reconnected_at + timedelta(days=60)
     with sessions() as session:
         details = session.scalars(

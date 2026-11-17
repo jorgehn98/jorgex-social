@@ -20,7 +20,7 @@ from jorgex_social.access import operator
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
 from jorgex_social.account import appearance, scope
-from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
+from jorgex_social.account.connection import ConnectionTask, connect
 from jorgex_social.account.credential import NotConnected
 from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
 from jorgex_social.account.models import Connection
@@ -220,7 +220,6 @@ def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
         token,
         key,
         clock.now(),
-        replace=args.replace,
     )
     print(
         json.dumps(
@@ -352,6 +351,18 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
     loop.join()
 
 
+class RemovedOption(argparse.Action):
+    """A flag that existed and does not any more: the operator gets the reason, not argparse's
+    "unrecognized arguments"."""
+
+    def __init__(self, option_strings, dest, reason, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+        self.reason = reason
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(f"{option_string} was removed: {self.reason}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jorgex-social")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -398,12 +409,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect_ig = sub.add_parser(
         "connect-instagram",
-        help="store an Instagram access token, read from standard input, encrypted",
+        help=(
+            "add one of your own Instagram accounts, or refresh its credential, with a token read "
+            "from standard input"
+        ),
     )
     connect_ig.add_argument(
         "--replace",
-        action="store_true",
-        help="switch this installation to a different account than the one connected",
+        action=RemovedOption,
+        reason=(
+            "connecting a different Instagram account now adds it as another account of the "
+            "installation; no account, post or token is replaced"
+        ),
+        help=argparse.SUPPRESS,
     )
 
     sub.add_parser(
@@ -467,7 +485,6 @@ def main(argv: list[str] | None = None) -> None:
         operator.OperatorError,
         SecretKeyError,
         NotConnected,
-        ConnectError,
         InstagramError,
     ) as exc:
         raise SystemExit(f"error: {exc}") from None

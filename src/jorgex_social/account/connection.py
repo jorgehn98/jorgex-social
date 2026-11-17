@@ -41,10 +41,6 @@ UNRESOLVED_AFTER = timedelta(hours=1)
 ESTIMATED_LIFETIME = timedelta(days=59)
 
 
-class ConnectError(Exception):
-    pass
-
-
 def status_at(connection: Connection, now: datetime) -> ConnectionStatus:
     """Expiry is known without asking the network, so the status is right between checks."""
     expires_at = connection.credential_expires_at
@@ -80,23 +76,14 @@ def connect(
     token: str,
     key: bytes,
     now: datetime,
-    *,
-    replace: bool = False,
 ) -> Connection:
     """Stores the credential `instagram` was built with (`token`), after checking which account
-    it opens and renewing it once: the renewal is how its expiry becomes known. `replace` lets
-    the installation switch to a different account; without it, that is refused."""
+    it opens and renewing it once: the renewal is how its expiry becomes known. The account is
+    the one Instagram answers for that token: a row already bound to it is refreshed in place, the
+    row a first write created is filled, or a new row is added. Another account's row, posts and
+    tokens are never touched, and no row is deleted."""
     network = instagram.network
     account = instagram.account()
-    with sessions() as session:
-        current = scope.account_of(session, network)
-    switching = scope.connected(current) and current.external_account_id != account.id
-    if switching and not replace:
-        raise ConnectError(
-            f"this installation is already connected to another {network} account, and adding a "
-            "second one is not available yet; --replace switches to a different account, "
-            "replacing the one connected"
-        )
     try:
         renewal = instagram.refresh_token()
         stored, expires_at, estimated = renewal.access_token, now + renewal.expires_in, False
@@ -112,14 +99,21 @@ def connect(
             extra={"error": str(exc), "expires_at": expires_at},
         )
     with sessions() as session, session.begin():
-        connection = scope.current_account(session, network)
+        connection = scope.connection_by_external_id(session, network, account.id)
+        added = connection is None
+        if connection is None:
+            connection = scope.draft_account(session, network)
+        if connection is None:
+            connection = Connection(
+                network=network, external_account_id=account.id, username=account.username
+            )
+            session.add(connection)
         connection.external_account_id = account.id
         connection.username = account.username
         connection.account_type = account.account_type
         connection.credential_expires_at = expires_at
         connection.credential_refreshed_at = now
         connection.status = ConnectionStatus.OK
-        connection.limits = None if switching else connection.limits
         connection.checked_at = now
         session.flush()
         # Sealed for its row: the context needs the id the flush just gave it.
@@ -128,7 +122,7 @@ def connect(
         audit.record(
             session,
             now,
-            "connection.replaced" if switching else "connection.connected",
+            "connection.added" if added else "connection.refreshed",
             account_id=connection.id,
             actor_type=ActorType.OPERATOR,
             object_type="connection",

@@ -1,19 +1,21 @@
 # Installing jorgex-social
 
 This guide takes you from a clean server to a running installation connected to your own Instagram
-professional account. Start in simulation, which needs no Meta account, and switch to real mode only
-once the service runs.
+professional accounts. Start in simulation, which needs no Meta account, and switch to real mode
+only once the service runs.
 
-Every installation uses its own Meta app, its own credentials and one Instagram account. Nothing is
-shared between installations, and nobody provides accounts, hosting or support for you.
+Every installation uses its own Meta app and its own credentials, and serves one or more of your
+own Instagram accounts. Each account has its own credential. Nothing is shared between installations
+or between accounts, and nobody provides accounts, hosting or support for you.
 
 **Never paste a token, an app secret or a verify token into a chat, an issue, a pull request or a
 screenshot.** If one leaks, assume generating a new token does not invalidate the old one: remove the app from
 the account's app permissions in Instagram (or reset the app secret in Meta's dashboard), then
-connect again with `connect-instagram --replace`.
+connect again with `connect-instagram`.
 
 - [Requirements](#requirements)
 - [Start in simulation](#start-in-simulation)
+- [One installation, several accounts](#one-installation-several-accounts)
 - [Reverse proxy](#reverse-proxy)
 - [Web interface](#web-interface)
 - [Your own look](#your-own-look)
@@ -27,8 +29,8 @@ connect again with `connect-instagram --replace`.
 
 - Docker with the Compose plugin.
 - For real mode only:
-  - an Instagram **professional** account (Business or Creator). A personal account cannot use the
-    API;
+  - one or more of your own Instagram **professional** accounts (Business or Creator). A personal
+    account cannot use the API;
   - a Meta developer account, to create your own Meta app;
   - a public domain served over HTTPS. Instagram downloads the media to publish from this service,
     and Meta sends webhook notifications to it, so real mode does not work without it;
@@ -58,8 +60,9 @@ database, so a second one (`--scale worker=2`) exits with an error and restarts 
 reliable on a local Docker volume, not necessarily on a network filesystem; keep `/data` local.
 
 A fresh install runs in simulation mode: a fake Instagram with synthetic data, and no call ever
-reaches Meta. A token works on one account and can reach nothing of any other, so connect the
-account first and then create a token for it, granting only the groups the client needs:
+reaches Meta. Simulation has a single fake account, so connecting again refreshes it. In real mode a
+token works on one account and can reach nothing of any other, so connect each account first and
+then create a token for it, granting only the groups the client needs:
 
 ```sh
 # In simulation the fake account accepts any placeholder token; nothing reaches Meta.
@@ -77,6 +80,37 @@ publishes to the accounts of its own mode. Create a token per mode instead of re
 alone. `jorgex-social list-tokens` and `revoke-token --name ...` manage them the same way. The API
 reference is at `/docs` in simulation; in real mode it answers 404 unless
 `JORGEX_SOCIAL_API_DOCS=true`.
+
+## One installation, several accounts
+
+An installation has one operator, one Meta app and one public domain, and serves one or more
+Instagram professional accounts, all of them yours. Serving accounts of other people needs Meta's
+advanced access and is out of scope: with standard access the app only reaches accounts that have a
+role (tester) in it, so add each of your own accounts there (see
+[Create your Meta app](#create-your-meta-app)).
+
+Each account has its own credential, posts, scheduled publications, rules, replies, statistics,
+audit log, incidents and kill switch. Connect each one with `connect-instagram`; then create one
+token per account per agent with `create-token --account`, because a token sees one account and can
+reach no other. Run `connect-instagram` again whenever a token needs renewing or replacing:
+connecting the same account refreshes its credential in place and leaves its posts and tokens
+alone, and connecting a different account adds it without touching the others. There is no command
+to delete a connection or its data.
+
+The web interface shows one account at a time. Each account lives at `/ui/a/{account}/`, and the
+header switches between the accounts you have connected; `/ui/` opens the one you used last.
+
+These belong to the installation, not to one account:
+
+- **Appearance**: product name, icon and CSS. `PUT /v1/appearance` with `account:write` of any
+  account changes them for every account and for the sign-in page; so do the MCP tools.
+- **The catalog** of post types, sizes and limits.
+- **`/health`**, which reports the service, not an account.
+- **The webhook configuration**: callback URL, verify token and app secret. Each account still
+  subscribes to the app separately (see [Webhook](#webhook)).
+
+There is no combined view and no total across accounts: every page, number and API answer is one
+account's.
 
 ## Reverse proxy
 
@@ -215,8 +249,9 @@ Point the MCP server at `http://localhost:8000` while the tunnel is open (see
 
 ## Web interface
 
-A web interface at `/ui` shows the connection, scheduled and published posts, insights, rules, events
-and incidents. Only Settings can change anything, and only with a recent sign-in (see
+A web interface shows one account at a time at `/ui/a/{account}/`: the connection, scheduled and
+published posts, insights, rules, events and incidents, with a switcher in the header for the
+accounts you connected. Only Settings can change anything, and only with a recent sign-in (see
 [Your own look](#your-own-look)); agents and scripts keep using the API. It is for one operator, who
 signs in with a password and a TOTP code from an authenticator app:
 
@@ -331,13 +366,15 @@ right and go to Settings, Appearance:
   A custom property that is not on the list gets a notice in case it is a typo, and is saved all the
   same. The pages' Content-Security-Policy limits your CSS to resources from this site, with no script.
   It applies everywhere except the OAuth consent page, which keeps only your name and icon: that page
-  grants access to your account, and CSS could disguise what you are granting.
+  grants access to one of your accounts, and CSS could disguise what you are granting.
 - **Icon**, a PNG, ICO or SVG file up to 256 KB, used as the favicon and beside the name.
 
 The name, CSS and icon are public, because the sign-in page needs them, so put nothing private there.
 They live in the database, so your backups carry them. Saving requires a sign-in under an hour old
 and a refused save loses what you typed, so long CSS edits are safer in a file. Agents use `GET` and `PUT /v1/appearance` with
 the `account` group, or the MCP tools `get_appearance` and `set_appearance`, for the name and icon.
+The appearance is the installation's, not one account's: `PUT /v1/appearance` with `account:write`
+of any account changes it for every account and its sign-in page.
 
 CSS is the exception: only the Settings page can write it. The API and MCP can read it but refuse to
 change it, whatever the token's permissions, because valid CSS can change what a page shows, for
@@ -356,9 +393,9 @@ Upgrading an existing installation: raise your proxy's request body limit for `/
 ## Create your Meta app
 
 The service uses the Instagram API with Instagram login (`graph.instagram.com`). Your app only serves
-your own account, which has a role in the app. On the app this guide was tested with, **standard
-access** was enough: no App Review, no advanced access and no business verification. That has not
-been re-verified on a newly created app; see the note below.
+your own accounts, each of which has a role in the app. On the app this guide was tested with,
+**standard access** was enough: no App Review, no advanced access and no business verification. That
+has not been re-verified on a newly created app; see the note below.
 
 Meta's dashboard changes often, so names and places below may differ slightly from what you see.
 
@@ -410,6 +447,10 @@ On **API setup with Instagram login**, in the step to generate access tokens, ad
 account and generate a token for it. If the dashboard asks for it, add the account as an Instagram
 tester under **App roles > Roles** first and accept the invitation from the account.
 
+With standard access the app only reaches accounts that have a role in it, so repeat this for each
+own account you want to connect: add it as a tester, accept the invitation from that account, and
+generate its token.
+
 The token is long-lived (60 days). Copy it straight into the connect command in
 [Switch to real mode](#switch-to-real-mode); do not save it in a file, a note or a chat. The service
 renews it before it expires. If it ever expires, generate a new one here and connect again.
@@ -427,9 +468,10 @@ accounts, and this one serves only yours. If a new app behaves differently, plea
 
 ## Switch to real mode
 
-1. Connect your account while the service is still in simulation. The command reads the long-lived
-   Instagram access token from standard input, without echoing it, checks it against Instagram and
-   stores it encrypted. There is no `--token` argument: it would stay in the shell history.
+1. Connect each of your own accounts while the service is still in simulation. The command reads
+   the long-lived Instagram access token from standard input, without echoing it, checks it
+   against Instagram and stores it encrypted. There is no `--token` argument: it would stay in the
+   shell history.
 
    ```sh
    docker compose run --rm -e JORGEX_SOCIAL_SIMULATION=false api jorgex-social connect-instagram
@@ -445,11 +487,13 @@ accounts, and this one serves only yours. If a new app behaves differently, plea
    unset IG_TOKEN
    ```
 
-   To switch an installation to a different account later, add `--replace`.
+   Run it once per account. Connecting the same account again refreshes its credential and leaves
+   its posts and tokens alone; a different account is added as another account, and no existing
+   account is replaced.
 2. In `.env`, set `JORGEX_SOCIAL_PUBLIC_URL=https://social.example.com` (your domain) and
    `JORGEX_SOCIAL_SIMULATION=false`.
 3. Apply the change with `docker compose up -d`. `GET /v1/account` reports the connection, open
-   incidents, the kill switch and the webhook. Create a token for the real account, since the one
+   incidents, the kill switch and the webhook. Create a token for each real account, since the one
    you made in simulation works on the simulated account alone:
 
    ```sh
@@ -459,16 +503,18 @@ accounts, and this one serves only yours. If a new app behaves differently, plea
 
    `list-tokens` shows which account each token works on.
 
-In real mode the worker starts even before an account is connected: it has nothing to publish until
-there is one, picks it up on its next pass and does not need a restart when you connect.
+In real mode the worker starts even before any account is connected: it has nothing to publish
+until there is one, picks up each account you connect on its next pass, and does not need a restart
+when you add another.
 
 ## Webhook
 
 Without it, automatic replies still work: the worker polls comments and messages every two minutes.
 With it, Meta notifies each new comment and message as it happens and the reply goes out within
 seconds (Meta's messaging policy documentation, at the time of writing, asks automated replies to
-answer within 30 seconds). Polling keeps running and
-catches anything a notification missed; a comment seen both ways is answered once.
+answer within 30 seconds). Polling keeps running and catches anything a notification missed; a
+comment seen both ways is answered once. The callback URL, verify token and app secret are the
+installation's, shared by every account; what each account subscribes is its own.
 
 The app must be published (Live) first.
 
@@ -484,9 +530,10 @@ The app must be published (Live) first.
    `https://social.example.com/webhook` and the verify token, and verify. Meta calls the URL and the
    service answers its challenge.
 5. Subscribe to the `comments` and `messages` fields.
-6. Subscribe your account to the app: turn on the webhook subscription for your account in the same
-   step (the alternative is `POST /<IG_ID>/subscribed_apps` with
+6. Subscribe each of your accounts to the app: turn on the webhook subscription for the account in
+   the same step (the alternative is `POST /<IG_ID>/subscribed_apps` with
    `subscribed_fields=comments,messages`, described in Meta's "Set up Instagram Webhooks" guide).
+   Repeat for every account you connected.
 
 Meta's guide says comment notifications need advanced access and a public account. On the tested
 app, they arrived with standard access. If yours never arrive, polling still answers them, and the
@@ -536,12 +583,13 @@ Too many automatic replies can get an Instagram account restricted, so they are 
 
 - A rule answers one person once per post, however many times they repeat the keyword. A later
   comment on another post, or one matching another rule, is answered.
-- At most `JORGEX_SOCIAL_REPLIES_PER_MINUTE` (12) replies go out in any minute. The rest stay pending
-  and the worker continues on later passes, oldest first.
-- At most `JORGEX_SOCIAL_HOURLY_PRIVATE_REPLY_CAP` (500) private replies go out in any hour: the
-  direct messages sent because of a comment. Meta allows 750 an hour. At most
-  `JORGEX_SOCIAL_HOURLY_PUBLIC_REPLY_CAP` (300) public replies go out in any hour. Meta publishes no
-  limit for those; the cap is a safety net against a runaway rule. Answers to a direct message have
+- At most `JORGEX_SOCIAL_REPLIES_PER_MINUTE` (12) replies go out in any minute, per account. The rest
+  stay pending and the worker continues on later passes, oldest first.
+- At most `JORGEX_SOCIAL_HOURLY_PRIVATE_REPLY_CAP` (500) private replies go out in any hour, per
+  account: the direct messages sent because of a comment. Meta allows 750 an hour. At most
+  `JORGEX_SOCIAL_HOURLY_PUBLIC_REPLY_CAP` (300) public replies go out in any hour, per account. Meta
+  publishes no limit for those; the cap is a safety net against a runaway rule. Answers to a direct
+  message have
   no hourly cap: Meta allows 100 a second, and the per-minute pace holds them. A reply over a cap is
   not skipped: it stays pending and goes out once enough of the last hour has passed, oldest first,
   unless its window (24 hours for a public reply or a message, 7 days for a private reply) closes
@@ -565,18 +613,18 @@ Too many automatic replies can get an Instagram account restricted, so they are 
 - Rules get `warnings` in the API, the MCP and the web interface: public replies on every post, a link
   in a comment's first private message, or a variant with no letter or digit. These are reported by
   automation users, not published by Meta, so a rule with warnings can still be activated.
-- At most 50 posts are published in any 24 hours, the lower of the two figures Meta's page gives. Over
-  that, the next due post fails as `daily_limit` without calling Instagram, and can be scheduled again.
-  Only posts published by this service count; Meta's own count, with the ones you publish by hand, is
-  the real limit.
+- At most 50 posts are published in any 24 hours per account, the lower of the two figures Meta's
+  page gives. Over that, the next due post fails as `daily_limit` without calling Instagram, and can
+  be scheduled again. Only posts published by this service count; Meta's own count, with the ones
+  you publish by hand, is the real limit.
 
-If Instagram reports the account as restricted (error code 368, or code and subcode 10/1893063,
-100/2534029, 613/2018338, 4/2207051, 9/2018352 or 25/2207050), the service stops on its own: the kill
-switch turns on and the incident
-`account_restricted` opens with the code and subcode. Scheduled posts wait and replies due meanwhile
-are skipped for good. Check the account in Instagram, deal with the cause, and only then turn the
-switch off with `PUT /v1/account/kill-switch`, which closes the incident. If Instagram refuses again,
-both come back.
+If Instagram reports an account as restricted (error code 368, or code and subcode 10/1893063,
+100/2534029, 613/2018338, 4/2207051, 9/2018352 or 25/2207050), the service stops work on that
+account alone: its kill switch turns on and its incident
+`account_restricted` opens with the code and subcode. The other accounts keep running. Scheduled
+posts wait and replies due meanwhile are skipped for good. Check the account in Instagram, deal with
+the cause, and only then turn that account's switch off with `PUT /v1/account/kill-switch` using a
+token of that account, which closes the incident. If Instagram refuses again, both come back.
 
 What the service cannot do for you:
 
