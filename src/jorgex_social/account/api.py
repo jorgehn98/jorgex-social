@@ -8,9 +8,8 @@ from sqlalchemy.orm import Session
 
 from jorgex_social.access.deps import ReadSessionDep, SessionDep, require
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import appearance, audit, incidents, kill_switch
+from jorgex_social.account import appearance, audit, incidents, kill_switch, scope
 from jorgex_social.account.connection import status_at
-from jorgex_social.account.credential import connection_of
 from jorgex_social.account.models import (
     AuditEntry,
     ChannelIncident,
@@ -143,22 +142,25 @@ class AppearanceIn(BaseModel):
 def get_account(request: Request, session: SessionDep):
     network = request.app.state.network
     now = request.app.state.clock.now()
-    connection = connection_of(session, network)
+    account = scope.account_of(session, network)
+    account_id = account and account.id
+    # The operator's own incidents have no account; they concern the whole installation.
+    of_the_account = (ChannelIncident.account_id == account_id) | (
+        ChannelIncident.account_id.is_(None)
+    )
     open_incidents = session.scalar(
-        select(func.count()).where(
-            ChannelIncident.network == network, ChannelIncident.closed_at.is_(None)
-        )
+        select(func.count()).where(of_the_account, ChannelIncident.closed_at.is_(None))
     )
     common = {
         "simulation": request.app.state.settings.simulation,
-        "kill_switch": kill_switch.is_on(session),
+        "kill_switch": bool(account and account.kill_switch),
         "open_incidents": open_incidents,
         "webhook": WebhookOut(
             configured=request.app.state.settings.webhook_enabled,
-            last_notification_at=connection and connection.webhook_notified_at,
+            last_notification_at=account and account.webhook_notified_at,
         ),
     }
-    if connection is None:
+    if not scope.connected(account):
         # The fake needs no credential, so simulation works before the worker's first check.
         simulated = network == FakeInstagram.network
         return AccountOut(
@@ -172,16 +174,30 @@ def get_account(request: Request, session: SessionDep):
         )
     return AccountOut(
         network=network,
-        status=status_at(connection, now),
+        status=status_at(account, now),
         account=ConnectedAccount(
-            id=connection.external_account_id,
-            username=connection.username,
-            account_type=connection.account_type,
+            id=account.external_account_id,
+            username=account.username,
+            account_type=account.account_type,
         ),
-        credential_expires_at=connection.credential_expires_at,
-        checked_at=connection.checked_at,
-        limits=connection.limits,
+        credential_expires_at=account.credential_expires_at,
+        checked_at=account.checked_at,
+        limits=account.limits,
         **common,
+    )
+
+
+def _incident_out(incident: ChannelIncident, network: str) -> IncidentOut:
+    """The network comes from the connection, never from the row; an incident with no account (the
+    operator's) is reported in the mode that shows it."""
+    return IncidentOut(
+        id=incident.id,
+        network=network,
+        type=incident.type,
+        opened_at=incident.opened_at,
+        closed_at=incident.closed_at,
+        acknowledged_at=incident.acknowledged_at,
+        detail=incident.detail,
     )
 
 
@@ -198,12 +214,16 @@ def list_incidents(
     `sign_in_password_accepted` means sign-ins with the right password kept failing on the code,
     so the password may have leaked. It needs the operator: if it was not them, they change the
     password (`set-password`), which is what closes it; signing in does not."""
-    query = select(ChannelIncident).where(ChannelIncident.network == request.app.state.network)
+    account_id = scope.account_id_of(session, request.app.state.network)
+    query = select(ChannelIncident).where(
+        (ChannelIncident.account_id == account_id) | ChannelIncident.account_id.is_(None)
+    )
     if open is not None:
         closed = ChannelIncident.closed_at
         query = query.where(closed.is_(None) if open else closed.is_not(None))
     query = query.order_by(ChannelIncident.opened_at.desc(), ChannelIncident.id.desc())
-    return session.scalars(query.limit(limit).offset(offset)).all()
+    found = session.scalars(query.limit(limit).offset(offset)).all()
+    return [_incident_out(incident, request.app.state.network) for incident in found]
 
 
 @router.post(
@@ -212,32 +232,32 @@ def list_incidents(
 def acknowledge_incident(incident_id: str, request: Request, session: SessionDep):
     """Marks the incident as seen. It stays open until its cause is gone."""
     incident = session.get(ChannelIncident, incident_id)
-    if incident is None or incident.network != request.app.state.network:
+    account_id = scope.account_id_of(session, request.app.state.network)
+    if incident is None or incident.account_id not in {None, account_id}:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             detail={"code": "not_found", "message": "No such incident."},
         )
     incident.acknowledged_at = incident.acknowledged_at or request.app.state.clock.now()
-    return incident
+    return _incident_out(incident, request.app.state.network)
 
 
 @router.put("/kill-switch", response_model=KillSwitchOut, dependencies=AccountWrite)
 def set_kill_switch(body: KillSwitchIn, request: Request, session: SessionDep):
-    """On: the worker stops writing to the network (no containers, no publishing, no replies).
-    Scheduled posts stay scheduled; those past the grace window when it is turned off fail as
-    `missed_schedule` and can be rescheduled. Replies due while it is on are skipped.
+    """On: the worker stops writing to the network for this account (no containers, no publishing,
+    no replies). Scheduled posts stay scheduled; those past the grace window when it is turned off
+    fail as `missed_schedule` and can be rescheduled. Replies due while it is on are skipped.
 
     It also turns on by itself when Instagram reports the account as restricted, with an
     `account_restricted` incident. Only turning it off here closes that incident; if Instagram
     refuses again, both come back."""
     audit.set_detail(request, {"enabled": body.enabled})
     now = request.app.state.clock.now()
-    setting = kill_switch.set_state(session, body.enabled, now)
+    account = scope.current_account(session, request.app.state.network)
+    kill_switch.set_state(session, account, body.enabled, now)
     if not body.enabled:
-        incidents.sync(
-            session, request.app.state.network, IncidentType.ACCOUNT_RESTRICTED, False, now
-        )
-    return KillSwitchOut(enabled=setting.value, updated_at=setting.updated_at)
+        incidents.sync(session, account.id, IncidentType.ACCOUNT_RESTRICTED, False, now)
+    return KillSwitchOut(enabled=account.kill_switch, updated_at=account.kill_switch_updated_at)
 
 
 @router.get("/audit", response_model=list[AuditEntryOut], dependencies=AccountRead)

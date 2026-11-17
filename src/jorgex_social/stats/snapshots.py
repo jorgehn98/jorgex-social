@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from jorgex_social.account import scope
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.errors import (
     AccountRestricted,
@@ -57,7 +58,7 @@ def closed_days(now: datetime) -> list[tuple[datetime, datetime]]:
 
 
 def store_recent_media(
-    sessions: sessionmaker, network: str, items: list[Media], now: datetime
+    sessions: sessionmaker, account_id: str, items: list[Media], now: datetime
 ) -> None:
     """Replaces the stored recent media with the newest of `items`, a listing the caller already
     made: storing it costs no call to the network. Best effort: a database failure here is
@@ -75,21 +76,27 @@ def store_recent_media(
     ]
     try:
         with sessions() as session, session.begin():
-            session.merge(RecentMedia(network=network, fetched_at=now, items=rows))
+            session.merge(RecentMedia(account_id=account_id, fetched_at=now, items=rows))
     except SQLAlchemyError as exc:
         log.warning(
             "could not store the recent media",
-            extra={"network": network, "error": type(exc).__name__},
+            extra={"account_id": account_id, "error": type(exc).__name__},
         )
 
 
+def _account_id(sessions: sessionmaker, instagram: Instagram) -> str:
+    """The account the sweep is for. The sweep is a write, so it creates the row of the mode when
+    nothing has been connected yet, as the first listing of a simulation does today."""
+    with sessions() as session, session.begin():
+        return scope.current_account(session, instagram.network).id
+
+
 def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
+    account_id = _account_id(sessions, instagram)
     with sessions() as session:
         recorded = set(
             session.scalars(
-                select(AccountSnapshot.period_start).where(
-                    AccountSnapshot.network == instagram.network
-                )
+                select(AccountSnapshot.period_start).where(AccountSnapshot.account_id == account_id)
             )
         )
     missing = [(start, end) for start, end in closed_days(now) if start not in recorded]
@@ -108,7 +115,7 @@ def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime
         with sessions() as session, session.begin():
             session.add(
                 AccountSnapshot(
-                    network=instagram.network,
+                    account_id=account_id,
                     period_start=start,
                     period_end=end,
                     taken_at=now,
@@ -136,13 +143,14 @@ def snapshot_media(
     failed_at: dict[str, datetime] | None = None,
 ) -> int:
     """Feed posts and reels, including the ones published by hand."""
+    account_id = _account_id(sessions, instagram)
     items = instagram.list_media()
-    store_recent_media(sessions, instagram.network, items, now)
+    store_recent_media(sessions, account_id, items, now)
     with sessions() as session:
         last_taken = dict(
             session.execute(
                 select(PostSnapshot.media_ref, func.max(PostSnapshot.taken_at))
-                .where(PostSnapshot.network == instagram.network)
+                .where(PostSnapshot.account_id == account_id)
                 .group_by(PostSnapshot.media_ref)
             ).all()
         )
@@ -168,7 +176,7 @@ def snapshot_media(
         with sessions() as session, session.begin():
             session.add(
                 PostSnapshot(
-                    network=instagram.network,
+                    account_id=account_id,
                     media_ref=media.id,
                     taken_at=now,
                     product_type=media.product_type.value,
@@ -184,10 +192,11 @@ def snapshot_media(
 def snapshot_stories(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
     """Stories published by this service, every 6 hours during their first 24. A failed one is
     retried on the next hourly sweep: a day of backoff would outlive the story."""
+    account_id = _account_id(sessions, instagram)
     with sessions() as session:
         stories = session.execute(
             select(Post.external_ref, Post.published_at, Post.permalink).where(
-                Post.network == instagram.network,
+                Post.account_id == account_id,
                 Post.type == PostType.STORY,
                 Post.status == PostStatus.PUBLISHED,
                 Post.external_ref.is_not(None),
@@ -198,7 +207,7 @@ def snapshot_stories(sessions: sessionmaker, instagram: Instagram, now: datetime
             session.execute(
                 select(PostSnapshot.media_ref, func.max(PostSnapshot.taken_at))
                 .where(
-                    PostSnapshot.network == instagram.network,
+                    PostSnapshot.account_id == account_id,
                     PostSnapshot.media_ref.in_([ref for ref, _, _ in stories]),
                 )
                 .group_by(PostSnapshot.media_ref)
@@ -219,7 +228,7 @@ def snapshot_stories(sessions: sessionmaker, instagram: Instagram, now: datetime
         with sessions() as session, session.begin():
             session.add(
                 PostSnapshot(
-                    network=instagram.network,
+                    account_id=account_id,
                     media_ref=media_ref,
                     taken_at=now,
                     product_type=ProductType.STORY.value,

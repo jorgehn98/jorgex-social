@@ -10,11 +10,12 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import kill_switch
+from jorgex_social.account import kill_switch, scope
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
+from jorgex_social.account.models import AuditEntry, ChannelIncident
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
+from jorgex_social.config import Settings
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import AccountRestricted, RateLimited, Refused, Unavailable
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
@@ -279,7 +280,7 @@ def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edit
         now = clock.now()
         with sessions() as session, session.begin():
             rule = Rule(
-                network=app.state.network,
+                account_id=scope.current_account(session, app.state.network).id,
                 name="old",
                 channel="comment",
                 priority=1,
@@ -525,7 +526,9 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
     meta = FakeMeta(now)
     ig = InstagramClient("token-not-real", "1784", transport=meta)
     with sessions() as session, session.begin():
-        session.add(Connection(network="instagram", external_account_id="1784", username="own"))
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.username = "own"
         for channel, content in (
             ("comment", PRICE_RULE),
             (
@@ -538,7 +541,7 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
         ):
             session.add(
                 Rule(
-                    network="instagram",
+                    account_id=account.id,
                     name=channel,
                     channel=channel,
                     priority=1,
@@ -650,6 +653,7 @@ def test_one_private_reply_per_comment_even_across_restarts(
     with pytest.raises(IntegrityError), sessions() as session, session.begin():
         session.add(
             Delivery(
+                account_id=private.account_id,
                 event_id=private.event_id,
                 rule_id=other["id"],
                 action="private_reply",
@@ -731,7 +735,9 @@ def test_kill_switch_skips_with_its_reason(client, headers, ig, sessions, task, 
     make_rule(client, headers)
     ig.add_comment(publish(ig), "precio")
     with sessions() as session, session.begin():
-        kill_switch.set_state(session, True, clock.now())
+        kill_switch.set_state(
+            session, scope.current_account(session, "simulation"), True, clock.now()
+        )
 
     task(sessions)
 
@@ -1153,10 +1159,12 @@ def test_malformed_and_repeated_comments_from_meta_are_handled(sessions, clock):
 
     ig = InstagramClient("token-not-real", "1784", transport=transport)
     with sessions() as session, session.begin():
-        session.add(Connection(network="instagram", external_account_id="1784", username="own"))
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.username = "own"
         session.add(
             Rule(
-                network="instagram",
+                account_id=account.id,
                 name="price",
                 channel="comment",
                 priority=1,
@@ -1233,7 +1241,8 @@ def restriction_incidents(sessions):
 
 def kill_switch_is_on(sessions):
     with sessions() as session:
-        return kill_switch.is_on(session)
+        account = scope.current_account(session, "simulation")
+        return kill_switch.is_on(session, account.id)
 
 
 @pytest.fixture
@@ -1771,3 +1780,78 @@ def test_a_timed_pause_cannot_lift_an_opt_out(client, headers, ig, sessions, tas
     client.post(f"/v1/conversations/{conversation['id']}/resume", headers=headers)
     until = (clock.now() + timedelta(hours=1)).isoformat()
     assert client.post(pause, json={"until": until}, headers=headers).status_code == 200
+
+
+def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
+    settings, clock, app, client, headers
+):
+    """The simulation and the real account have one of each, and neither lists the other's."""
+    from fastapi.testclient import TestClient
+
+    with app.state.sessionmaker() as session, session.begin():
+        for network, person in (("simulation", "person-simulated"), ("instagram", "person-real")):
+            account = scope.current_account(session, network)
+            conversation = Conversation(
+                account_id=account.id,
+                external_id=person,
+                last_user_message_at=START,
+                window_until=START,
+                paused_forever=False,
+                created_at=START,
+                updated_at=START,
+                purge_at=START,
+            )
+            rule = Rule(
+                account_id=account.id,
+                name=person,
+                channel="message",
+                priority=1,
+                active=True,
+                content={"keywords": ["info"], "private_replies": ["Hi"]},
+                created_at=START,
+                updated_at=START,
+            )
+            session.add_all([conversation, rule])
+            session.flush()
+            event = Event(
+                account_id=account.id,
+                type="message",
+                external_ref=f"message-{network}",
+                conversation_id=conversation.id,
+                occurred_at=START,
+                received_at=START,
+                rule_id=rule.id,
+            )
+            session.add(event)
+            session.flush()
+            session.add(
+                Delivery(
+                    account_id=account.id,
+                    event_id=event.id,
+                    rule_id=rule.id,
+                    action="message",
+                    status="sent",
+                    text="Hi",
+                    created_at=START,
+                )
+            )
+
+    real = TestClient(
+        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
+    )
+
+    for mode in (client, real):
+        for resource in ("events", "deliveries", "conversations"):
+            assert len(mode.get(f"/v1/{resource}", headers=headers).json()) == 1, resource
+    assert [e["external_ref"] for e in client.get("/v1/events", headers=headers).json()] == [
+        "message-simulation"
+    ]
+    assert [e["external_ref"] for e in real.get("/v1/events", headers=headers).json()] == [
+        "message-instagram"
+    ]
+    assert [c["external_id"] for c in client.get("/v1/conversations", headers=headers).json()] == [
+        "person-simulated"
+    ]
+    assert [c["external_id"] for c in real.get("/v1/conversations", headers=headers).json()] == [
+        "person-real"
+    ]

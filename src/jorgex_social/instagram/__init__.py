@@ -29,6 +29,9 @@ def make_instagram(settings: Settings, clock: Clock, key: bytes | None = None) -
         make_sessionmaker(make_engine(settings, write=False)),
         key or load_key(settings.secret_key_file),
         InstagramClient.network,
+        # A credential sealed before the schema was indexed by account is re-sealed on first
+        # read, which is a write: one short transaction, once.
+        writes=make_sessionmaker(make_engine(settings)),
     )
     credential()  # decrypts once now: a wrong key stops the worker here, not mid-publish
     return InstagramClient.from_source(credential)

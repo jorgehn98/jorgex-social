@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select, text
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import kill_switch
+from jorgex_social.account import kill_switch, scope
 from jorgex_social.account.models import AuditEntry, ChannelIncident
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
@@ -353,7 +353,8 @@ def test_a_restriction_fails_the_post_as_refused_and_stops_the_next_ones(
     assert api.get(waiting)["status"] == "scheduled"
     assert published(ig) == []
     with sessions() as session:
-        assert kill_switch.is_on(session)
+        account = scope.account_of(session, "simulation")
+        assert kill_switch.is_on(session, account.id)
         incident = session.scalar(select(ChannelIncident))
         entry = session.scalar(select(AuditEntry).where(AuditEntry.action == "kill_switch.on"))
     assert (incident.type, incident.closed_at) == ("account_restricted", None)
@@ -1054,9 +1055,10 @@ def test_credential_lost_mid_attempt_fails_the_post_without_leaving_it_stuck(
 
 def seed_published(sessions, count, published_at, network="simulation"):
     with sessions() as session, session.begin():
+        account = scope.current_account(session, network)
         session.add_all(
             Post(
-                network=network,
+                account_id=account.id,
                 type="image",
                 status="published",
                 published_at=published_at,

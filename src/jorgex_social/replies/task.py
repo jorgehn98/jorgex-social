@@ -19,8 +19,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from jorgex_social.account import incidents, kill_switch
-from jorgex_social.account.credential import connection_of
+from jorgex_social.account import incidents, kill_switch, scope
 from jorgex_social.account.models import IncidentType
 from jorgex_social.clock import Clock
 from jorgex_social.config import Settings
@@ -159,8 +158,8 @@ class ReplyTask:
 
     def _own_account(self, sessions: sessionmaker) -> str | None:
         with sessions() as session:
-            connection = connection_of(session, self.instagram.network)
-        return connection.external_account_id if connection else None
+            account = scope.account_of(session, self.instagram.network)
+        return account.external_account_id if scope.connected(account) else None
 
     # Polling
 
@@ -175,7 +174,9 @@ class ReplyTask:
             step(sessions, own, now)
         except AccountRestricted as exc:
             with sessions() as session, session.begin():
-                kill_switch.trip(session, self.instagram.network, exc, self.clock.now())
+                account_id = scope.account_id_of(session, self.instagram.network)
+                if account_id is not None:
+                    kill_switch.trip(session, account_id, exc, self.clock.now())
             raise
 
     def poll_comments(self, sessions: sessionmaker, own: str, now: datetime) -> None:
@@ -185,9 +186,8 @@ class ReplyTask:
             if now - m.timestamp < RECENT_MEDIA
         ]
         with sessions() as session:
-            named = {
-                r.media_ref for r in active_rules(session, self.instagram.network, Channel.COMMENT)
-            }
+            account_id = scope.account_id_of(session, self.instagram.network)
+            named = {r.media_ref for r in active_rules(session, account_id, Channel.COMMENT)}
         # One odd media never stops the others; a failure that affects every call stops the poll.
         for media_ref in recent + sorted(named - {None} - set(recent)):
             try:
@@ -228,9 +228,8 @@ class ReplyTask:
         with sessions() as session:
             pending = session.execute(
                 select(Delivery.id, Delivery.action)
-                .join(Event)
                 .where(
-                    Event.network == self.instagram.network,
+                    Delivery.account_id == scope.account_id_of(session, self.instagram.network),
                     Delivery.status == DeliveryStatus.PENDING,
                 )
                 .order_by(Delivery.created_at, Delivery.id)
@@ -268,8 +267,10 @@ class ReplyTask:
         query = (
             select(func.count())
             .select_from(Delivery)
-            .join(Event)
-            .where(Event.network == self.instagram.network, Delivery.attempted_at > since)
+            .where(
+                Delivery.account_id == scope.account_id_of(session, self.instagram.network),
+                Delivery.attempted_at > since,
+            )
         )
         return session.scalar(query if action is None else query.where(Delivery.action == action))
 
@@ -308,7 +309,7 @@ class ReplyTask:
         conversation: Conversation | None,
         now: datetime,
     ) -> Reason | None:
-        if kill_switch.is_on(session):
+        if kill_switch.is_on(session, delivery.account_id):
             return Reason.KILL_SWITCH
         person = conversation
         if event.author_ref is not None:
@@ -317,7 +318,7 @@ class ReplyTask:
             # match, this finds nobody.
             person = session.scalar(
                 select(Conversation).where(
-                    Conversation.network == event.network,
+                    Conversation.account_id == event.account_id,
                     Conversation.external_id == event.author_ref,
                 )
             )
@@ -356,7 +357,7 @@ class ReplyTask:
                 select(Delivery.id)
                 .join(Event)
                 .where(
-                    Event.network == event.network,
+                    Event.account_id == event.account_id,
                     Event.media_ref == event.media_ref,
                     Event.author_ref == event.author_ref,
                     Delivery.rule_id == delivery.rule_id,
@@ -419,7 +420,7 @@ class ReplyTask:
                 delivery.error_code, delivery.error_subcode = error.code, error.subcode
             self._finish(delivery, status, self.clock.now(), reason)
             if isinstance(error, AccountRestricted):
-                kill_switch.trip(session, self.instagram.network, error, self.clock.now())
+                kill_switch.trip(session, delivery.account_id, error, self.clock.now())
 
     def _finish(
         self, delivery: Delivery, status: DeliveryStatus, now: datetime, reason: Reason | None
@@ -469,20 +470,20 @@ class ReplyTask:
         (counting from this worker's start if it never has), and polling found a comment or a
         message from that day first. A valid notification closes it (replies/webhook.py); so does
         turning the webhook off."""
-        network = self.instagram.network
         with sessions() as session, session.begin():
+            account = scope.account_of(session, self.instagram.network)
+            account_id = account and account.id
             if not self.webhook:
-                incidents.sync(session, network, IncidentType.WEBHOOK_SILENT, False, now)
+                incidents.sync(session, account_id, IncidentType.WEBHOOK_SILENT, False, now)
                 return
-            connection = connection_of(session, network)
-            silent_since = (connection and connection.webhook_notified_at) or self._started
+            silent_since = (account and account.webhook_notified_at) or self._started
             if now - silent_since < WEBHOOK_SILENCE:
                 return
             missed = session.scalar(
                 select(func.count())
                 .select_from(Event)
                 .where(
-                    Event.network == network,
+                    Event.account_id == account_id,
                     Event.source == Source.POLL,
                     Event.occurred_at > now - WEBHOOK_SILENCE,
                 )
@@ -490,7 +491,7 @@ class ReplyTask:
             if missed:
                 incidents.sync(
                     session,
-                    network,
+                    account_id,
                     IncidentType.WEBHOOK_SILENT,
                     True,
                     now,

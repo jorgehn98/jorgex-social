@@ -87,8 +87,8 @@ Publishing:
 1. `get_catalog`: post types, item and caption limits, accepted files.
 2. {upload}
 3. `create_post` with the media ids and an idempotency_key, so a retry does not make a second \
-draft. Fix its errors with `update_post`; content edits change content_hash, so review the \
-one it returns.
+draft. The key is unique within the account this token acts on. Fix its errors with `update_post`; \
+content edits change content_hash, so review the one it returns.
 4. Review the post (`get_post`), then `schedule_post` for a future time (ISO 8601 with offset) \
 or `publish_now`. Always pass expected_hash, the content_hash you reviewed.
 5. Follow it with `get_post`: scheduled or publishing means wait; then published (permalink \
@@ -204,8 +204,7 @@ do not exist (unused uploads are purged); upload the files again.
 - in_the_past: use a future time, or publish_now. invalid_value, invalid_rule, \
 invalid_appearance, or http_error \
 with status 422: fix the arguments as the message or detail says.
-- idempotency_key_taken: use another key. media_ref_taken: another post already has that \
-media id; check it.
+- media_ref_taken: another post already has that media id; check it.
 - public_url_missing: the operator must set the service's public URL; nothing to do from here.
 - too_large, unsupported_media_type: the file is over the catalog's max_bytes or is not JPEG, \
 MP4 or MOV.
@@ -353,7 +352,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             str | None,
             Field(
                 description="Recommended: sending the same key again returns the post created "
-                "first instead of a second one."
+                "first instead of a second one. It is unique within the account, so another "
+                "account may use the same one."
             ),
         ] = None,
     ) -> str:

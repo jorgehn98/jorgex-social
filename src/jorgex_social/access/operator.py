@@ -69,12 +69,13 @@ def get_operator(session: Session) -> Operator | None:
     return session.scalar(select(Operator))
 
 
-def _end_sessions(session: Session, network: str, now: datetime) -> None:
+def _end_sessions(session: Session, now: datetime) -> None:
     """Every browser signs out and every OAuth grant ends: they were all given on the strength of
     the credentials that just changed. Changing them also removes what the incident warns of."""
     session.execute(delete(OperatorSession))
     oauth.revoke_all(session, now, "credentials_changed")
-    incidents.sync(session, network, IncidentType.SIGN_IN_PASSWORD_ACCEPTED, False, now)
+    # Not an account's: the operator is one for the whole installation.
+    incidents.sync(session, None, IncidentType.SIGN_IN_PASSWORD_ACCEPTED, False, now)
 
 
 def _hash_password(password: str) -> str:
@@ -113,13 +114,13 @@ def create_operator(session: Session, password: str, now: datetime) -> Operator:
     return operator
 
 
-def set_password(session: Session, network: str, password: str, now: datetime) -> Operator:
+def set_password(session: Session, password: str, now: datetime) -> Operator:
     """Also signs every browser out, ends every OAuth grant and closes the incident."""
     operator = get_operator(session)
     if operator is None:
         raise OperatorError("there is no operator yet; run create-operator first")
     operator.password_hash = _hash_password(password)
-    _end_sessions(session, network, now)
+    _end_sessions(session, now)
     _audit(session, now, "operator.password_set", operator)
     return operator
 
@@ -150,9 +151,7 @@ def totp_step(secret: str, code: str, now: datetime, after: int | None) -> int |
     return None
 
 
-def enroll_totp(
-    session: Session, network: str, key: bytes, secret: str, code: str, now: datetime
-) -> None:
+def enroll_totp(session: Session, key: bytes, secret: str, code: str, now: datetime) -> None:
     """Stores `secret` only once `code` proves the authenticator app has it. Signs every browser
     out, ends every OAuth grant and closes the incident, since the old second factor no longer
     applies."""
@@ -164,7 +163,7 @@ def enroll_totp(
         raise OperatorError("the code does not match; check the device's clock and try again")
     operator.totp_secret_encrypted = crypto.encrypt(key, secret, TOTP_CONTEXT)
     operator.totp_last_step = step  # the confirmation code cannot then sign in
-    _end_sessions(session, network, now)
+    _end_sessions(session, now)
     _audit(session, now, "operator.totp_enrolled", operator)
 
 
@@ -215,7 +214,6 @@ def log_in(
     write: sessionmaker,
     read: sessionmaker,
     key_file: Path,
-    network: str,
     password: str,
     code: str,
     client: str,
@@ -284,7 +282,7 @@ def log_in(
         if wrong_code and count >= WRONG_CODE_LIMIT:
             incidents.sync(
                 session,
-                network,
+                None,
                 IncidentType.SIGN_IN_PASSWORD_ACCEPTED,
                 True,
                 now,

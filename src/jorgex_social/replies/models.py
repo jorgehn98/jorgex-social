@@ -10,6 +10,7 @@ from sqlalchemy import JSON, Boolean, ForeignKey, Index, Integer, String, Text, 
 from sqlalchemy import text as sql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from jorgex_social.account.models import Connection
 from jorgex_social.db import Base, UTCDateTime
 from jorgex_social.publishing.models import Post
 
@@ -60,7 +61,7 @@ class Rule(Base):
     __tablename__ = "rules"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    network: Mapped[str] = mapped_column(String(32))
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     name: Mapped[str] = mapped_column(String(100))
     channel: Mapped[str] = mapped_column(String(16))
     # null: every post, unless `post_id` says the rule is waiting for one.
@@ -78,6 +79,12 @@ class Rule(Base):
     archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     post: Mapped[Post | None] = relationship(viewonly=True)
+    account: Mapped[Connection] = relationship(viewonly=True)
+
+    @property
+    def network(self) -> str:
+        """From the account: the rule belongs to an account, which says its network."""
+        return self.account.network
 
     @property
     def waiting_for_post(self) -> bool:
@@ -98,10 +105,14 @@ class Conversation(Base):
     pseudonymous third-party data, so the row is purged like the events."""
 
     __tablename__ = "conversations"
-    __table_args__ = (UniqueConstraint("network", "external_id"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "external_id", name="uq_conversations_account_id_external_id"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    network: Mapped[str] = mapped_column(String(32))
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     external_id: Mapped[str] = mapped_column(String(64))
     last_user_message_at: Mapped[datetime] = mapped_column(UTCDateTime)
     window_until: Mapped[datetime] = mapped_column(UTCDateTime)
@@ -111,6 +122,13 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
     purge_at: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
 
+    account: Mapped[Connection] = relationship(viewonly=True)
+
+    @property
+    def network(self) -> str:
+        """From the account: the conversation belongs to an account, which says its network."""
+        return self.account.network
+
 
 class Event(Base):
     """A comment or message by someone else, seen once. Its text was evaluated in memory and
@@ -119,12 +137,14 @@ class Event(Base):
 
     __tablename__ = "events"
     __table_args__ = (
-        UniqueConstraint("network", "type", "external_ref"),
-        Index("ix_events_network_media_ref_author_ref", "network", "media_ref", "author_ref"),
+        UniqueConstraint(
+            "account_id", "type", "external_ref", name="uq_events_account_id_type_external_ref"
+        ),
+        Index("ix_events_account_id_media_ref_author_ref", "account_id", "media_ref", "author_ref"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    network: Mapped[str] = mapped_column(String(32))
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     type: Mapped[str] = mapped_column(String(16))  # comment / message
     external_ref: Mapped[str] = mapped_column(String(64))
     media_ref: Mapped[str | None] = mapped_column(String(64))  # comments
@@ -136,6 +156,13 @@ class Event(Base):
     rule_id: Mapped[str | None] = mapped_column(ForeignKey("rules.id"))  # null: no rule matched
     # Existing rows (before the webhook) came by polling.
     source: Mapped[str] = mapped_column(String(16), server_default=Source.POLL.value)
+
+    account: Mapped[Connection] = relationship(viewonly=True)
+
+    @property
+    def network(self) -> str:
+        """From the account: the event belongs to an account, which says its network."""
+        return self.account.network
 
 
 class Delivery(Base):
@@ -154,6 +181,7 @@ class Delivery(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     event_id: Mapped[str] = mapped_column(ForeignKey("events.id"))
     rule_id: Mapped[str] = mapped_column(ForeignKey("rules.id"))
     action: Mapped[str] = mapped_column(String(16))

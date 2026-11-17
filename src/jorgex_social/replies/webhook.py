@@ -27,8 +27,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from jorgex_social.account import audit, incidents
-from jorgex_social.account.credential import connection_of
+from jorgex_social.account import audit, incidents, scope
 from jorgex_social.account.models import IncidentType
 from jorgex_social.instagram.types import Comment, Message
 from jorgex_social.replies.intake import Intake
@@ -193,7 +192,7 @@ def signature_valid(secret: str, body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected.encode(), header.encode("latin-1"))
 
 
-def _sending(session: Session, network: str, conversation: Conversation) -> bool:
+def _sending(session: Session, account_id: str, conversation: Conversation) -> bool:
     """Meta can echo a reply before the worker has stored its id, so an unknown echo may be a
     send still in flight: a message to this conversation, or any private reply (its comment's
     `author_ref` was seen matching the conversation's id in one test, but Meta does not document
@@ -203,7 +202,7 @@ def _sending(session: Session, network: str, conversation: Conversation) -> bool
             select(Delivery.id)
             .join(Event)
             .where(
-                Event.network == network,
+                Delivery.account_id == account_id,
                 Delivery.status == DeliveryStatus.PENDING,
                 Delivery.attempted_at.is_not(None),
                 or_(
@@ -237,7 +236,7 @@ def _sent_recently(session: Session, conversation: Conversation, now: datetime) 
 
 
 def _pause_for_echoes(
-    session: Session, network: str, echoes: list[Echo], now: datetime, pause: timedelta
+    session: Session, account_id: str, echoes: list[Echo], now: datetime, pause: timedelta
 ) -> int:
     """An echo that is none of our replies means someone answered by hand: the conversation
     with that person pauses. Returns how many conversations were paused."""
@@ -251,7 +250,8 @@ def _pause_for_echoes(
             continue
         conversation = session.scalar(
             select(Conversation).where(
-                Conversation.network == network, Conversation.external_id == echo.recipient_id
+                Conversation.account_id == account_id,
+                Conversation.external_id == echo.recipient_id,
             )
         )
         until = now + pause
@@ -259,7 +259,7 @@ def _pause_for_echoes(
             conversation is None  # nobody to pause: the person has not written within retention
             or conversation.paused_forever
             or (conversation.paused_until is not None and conversation.paused_until >= until)
-            or _sending(session, network, conversation)
+            or _sending(session, account_id, conversation)
             or _sent_recently(session, conversation, now)
         ):
             continue
@@ -279,11 +279,10 @@ def _pause_for_echoes(
 
 def _process(request: Request, payload: Any) -> None:
     state = request.app.state
-    network = state.network
     now = state.clock.now()
     with state.sessionmaker() as session, session.begin():
-        connection = connection_of(session, network)
-        if connection is None:
+        connection = scope.account_of(session, state.network)
+        if not scope.connected(connection):
             log.warning("webhook notification before any account is connected; ignored")
             return
         own = connection.external_account_id
@@ -297,11 +296,13 @@ def _process(request: Request, payload: Any) -> None:
         # Only a notification about our account shows that the webhook works for it.
         if notification.matched:
             connection.webhook_notified_at = now
-            incidents.sync(session, network, IncidentType.WEBHOOK_SILENT, False, now)
+            incidents.sync(session, connection.id, IncidentType.WEBHOOK_SILENT, False, now)
         intake: Intake = state.intake
         intake.comments(session, own, notification.comments, now, Source.WEBHOOK)
         intake.messages(session, own, notification.messages, now, Source.WEBHOOK)
-        paused = _pause_for_echoes(session, network, notification.echoes, now, state.human_pause)
+        paused = _pause_for_echoes(
+            session, connection.id, notification.echoes, now, state.human_pause
+        )
     log.info(
         "webhook notification",
         extra={

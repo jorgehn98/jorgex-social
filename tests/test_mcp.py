@@ -11,7 +11,7 @@ import pytest
 from mcp import Client
 
 from jorgex_social.access.tokens import create_token, revoke_token
-from jorgex_social.account import appearance
+from jorgex_social.account import appearance, scope
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.models import Post
 from jorgex_social_mcp import client as http_client
@@ -333,7 +333,11 @@ async def test_reply_tools_reach_their_endpoints_end_to_end(app, transport):
 
 async def test_rule_tools_tie_a_rule_to_a_post(app, transport):
     with app.state.sessionmaker() as session, session.begin():
-        post = Post(network=app.state.network, type="image", content_hash="hash")
+        post = Post(
+            account_id=scope.current_account(session, app.state.network).id,
+            type="image",
+            content_hash="hash",
+        )
         session.add(post)
         session.flush()
         post_id = post.id

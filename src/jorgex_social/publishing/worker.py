@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import func, or_, select, union
 from sqlalchemy.orm import Session, sessionmaker
 
-from jorgex_social.account import audit, kill_switch
+from jorgex_social.account import audit, kill_switch, scope
 from jorgex_social.account.models import Outcome
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.client import TIMEOUT_SECONDS
@@ -126,6 +126,7 @@ class _Plan:
     """What one attempt sends to Instagram, read in the transaction that starts it."""
 
     attempt_id: str
+    account_id: str
     type: PostType
     caption: str
     items: list[tuple[bool, str]]  # (is_video, url) in order
@@ -181,14 +182,14 @@ class PublishTask:
 
     def publish_due(self, sessions: sessionmaker) -> None:
         now = self.clock.now()
-        network = self.instagram.network
         with sessions() as session, session.begin():
-            if kill_switch.is_on(session):
+            account = scope.account_of(session, self.instagram.network)
+            if account is None or account.kill_switch:
                 # Posts stay scheduled; once it is off, those past the grace window fail below.
                 return
             missed = session.scalars(
                 select(Post).where(
-                    Post.network == network,
+                    Post.account_id == account.id,
                     Post.status == PostStatus.SCHEDULED,
                     Post.scheduled_for < now - self.grace,
                 )
@@ -212,12 +213,13 @@ class PublishTask:
     def _start(self, sessions: sessionmaker, now: datetime) -> _Plan | None:
         """Marks the next due post publishing, with an attempt and public URLs, in one commit."""
         with sessions() as session, session.begin():
-            if kill_switch.is_on(session):
+            account = scope.account_of(session, self.instagram.network)
+            if account is None or account.kill_switch:
                 return None
             post = session.scalar(
                 select(Post)
                 .where(
-                    Post.network == self.instagram.network,
+                    Post.account_id == account.id,
                     Post.status == PostStatus.SCHEDULED,
                     Post.scheduled_for <= now,
                 )
@@ -226,7 +228,10 @@ class PublishTask:
             )
             if post is None:
                 return None
-            if self._published_since(session, now - timedelta(hours=24)) >= MAX_POSTS_PER_DAY:
+            if (
+                self._published_since(session, account.id, now - timedelta(hours=24))
+                >= MAX_POSTS_PER_DAY
+            ):
                 # Any other post due now fails the same way on a later pass.
                 _fail_unattempted(session, now, post, "daily_limit")
                 return None
@@ -240,6 +245,7 @@ class PublishTask:
 
             return _Plan(
                 attempt_id=attempt.id,
+                account_id=post.account_id,
                 type=PostType(post.type),
                 caption=post.caption,
                 items=[
@@ -251,10 +257,10 @@ class PublishTask:
                 trial=TrialMode(post.trial) if post.trial else None,
             )
 
-    def _published_since(self, session: Session, since: datetime) -> int:
+    def _published_since(self, session: Session, account_id: str, since: datetime) -> int:
         return session.scalar(
             select(func.count()).where(
-                Post.network == self.instagram.network,
+                Post.account_id == account_id,
                 Post.status == PostStatus.PUBLISHED,
                 Post.published_at > since,
             )
@@ -314,7 +320,7 @@ class PublishTask:
                 )
                 return
             attempt.container_ref = container
-            stopped = kill_switch.is_on(session)
+            stopped = kill_switch.is_on(session, plan.account_id)
         if stopped:
             # Turned on while the containers were being made: media_publish is the step that
             # cannot be undone, so it is not called. Nothing went live.
@@ -419,11 +425,13 @@ class PublishTask:
         any more (another worker took it for dead), in which case nothing changes."""
         now = self.clock.now()
         with sessions() as session, session.begin():
+            attempt = session.get_one(PublishAttempt, attempt_id)
             if isinstance(error, AccountRestricted):
                 # The attempt ends as it would without this (rejected, or unknown if it may be
                 # live); the switch keeps the next posts from starting.
-                kill_switch.trip(session, self.instagram.network, error, now)
-            attempt = session.get_one(PublishAttempt, attempt_id)
+                kill_switch.trip(
+                    session, session.get_one(Post, attempt.post_id).account_id, error, now
+                )
             if attempt.result != AttemptResult.IN_PROGRESS:
                 log.error(
                     "attempt already closed; outcome not recorded",
@@ -468,11 +476,12 @@ class PublishTask:
         # safety net if the lock is ever bypassed).
         cutoff = max(now - STALE_ATTEMPT, self._started_at or now - STALE_ATTEMPT)
         with sessions() as session, session.begin():
+            account_id = scope.account_id_of(session, self.instagram.network)
             stale = session.scalars(
                 select(PublishAttempt)
                 .join(Post)
                 .where(
-                    Post.network == self.instagram.network,
+                    Post.account_id == account_id,
                     PublishAttempt.result == AttemptResult.IN_PROGRESS,
                     PublishAttempt.started_at < cutoff,
                 )
@@ -492,7 +501,7 @@ class PublishTask:
                     select(PublishAttempt, Post)
                     .join(Post)
                     .where(
-                        Post.network == self.instagram.network,
+                        Post.account_id == account_id,
                         Post.status == PostStatus.OUTCOME_UNKNOWN,
                         PublishAttempt.result == AttemptResult.UNKNOWN,
                         PublishAttempt.resolved_at.is_(None),
@@ -553,16 +562,17 @@ class PublishTask:
             return None
         product = ProductType.REELS if pending.type == PostType.REEL else ProductType.FEED
         with sessions() as session:
+            account_id = scope.account_id_of(session, self.instagram.network)
             taken = set(
                 session.scalars(
                     select(Post.external_ref).where(
-                        Post.network == self.instagram.network, Post.external_ref.is_not(None)
+                        Post.account_id == account_id, Post.external_ref.is_not(None)
                     )
                 )
             )
         listed = self.instagram.list_media(max_items=RECENT_MEDIA_TO_SEARCH)
         # Already paid for: it also refreshes what agents see of the account.
-        store_recent_media(sessions, self.instagram.network, listed, self.clock.now())
+        store_recent_media(sessions, account_id, listed, self.clock.now())
         candidates = [
             m
             for m in listed
@@ -591,7 +601,7 @@ class PublishTask:
             post = session.get_one(Post, attempt.post_id)
             if attempt.resolved_at is not None or post.status != PostStatus.OUTCOME_UNKNOWN:
                 return None  # settled by hand in the meantime
-            if retry_container is not None and kill_switch.is_on(session):
+            if retry_container is not None and kill_switch.is_on(session, post.account_id):
                 return None  # retrying would publish; it waits, unresolved, until it is off
             attempt.resolved_at = now
             attempt.resolved_as = resolution

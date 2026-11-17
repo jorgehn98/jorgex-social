@@ -173,13 +173,13 @@ def matches(content: dict, text: str) -> bool:
     return not any(_hit(mode, normalized, normalize(k)) for k in content.get("exclude", []))
 
 
-def active_rules(session: Session, network: str, channel: Channel) -> list[Rule]:
+def active_rules(session: Session, account_id: str | None, channel: Channel) -> list[Rule]:
     """In the order they are tried: lower priority first, then the oldest."""
     return list(
         session.scalars(
             select(Rule)
             .where(
-                Rule.network == network,
+                Rule.account_id == account_id,
                 Rule.channel == channel,
                 Rule.active.is_(True),
                 Rule.archived_at.is_(None),
@@ -245,7 +245,7 @@ def bind_to_published(session: Session, post: Post, now: datetime) -> None:
     # Timestamps come back from Instagram, so no reply window moves.
     session.execute(
         delete(Event).where(
-            Event.network == post.network,
+            Event.account_id == post.account_id,
             Event.type == Channel.COMMENT,
             Event.media_ref == post.external_ref,
             Event.rule_id.is_(None),

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account import scope
 from jorgex_social.account.connection import ConnectionTask
 from jorgex_social.account.models import ChannelIncident, Connection
 from jorgex_social.api import create_app
@@ -333,7 +334,11 @@ def test_a_notified_comment_does_not_fire_a_rule_waiting_for_its_post(
     client, headers, ig, sessions, task, clock
 ):
     with sessions() as session, session.begin():
-        post = Post(network=ig.network, type="image", content_hash="hash")
+        post = Post(
+            account_id=scope.current_account(session, ig.network).id,
+            type="image",
+            content_hash="hash",
+        )
         session.add(post)
         session.flush()
         post_id = post.id

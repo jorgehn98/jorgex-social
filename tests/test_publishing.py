@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account import scope
 from jorgex_social.account.models import AuditEntry
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
@@ -409,10 +410,11 @@ def set_status(app, post_id, status, **fields):
 
 def add_rule(app, clock, rule_id, post_id, *, archived=False):
     with app.state.sessionmaker() as session, session.begin():
+        account = scope.current_account(session, app.state.network)
         session.add(
             Rule(
                 id=rule_id,
-                network=app.state.network,
+                account_id=account.id,
                 name=rule_id,
                 channel="comment",
                 post_id=post_id,
@@ -618,6 +620,26 @@ def test_simulated_posts_never_show_in_real_mode(settings, clock, client, header
     real = create_app(Settings(database_path=settings.database_path, simulation=False), clock)
 
     assert TestClient(real).get("/v1/posts", headers=headers).json() == []
+
+
+def test_the_idempotency_key_is_the_caller_s_not_the_installation_s(
+    settings, clock, client, headers
+):
+    """Two accounts may use the same key: it is only unique within the one that sends it."""
+    simulated = reel(client, headers, idempotency_key="note-1")
+    real = TestClient(
+        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
+    )
+
+    same_key = real.post(
+        "/v1/posts",
+        json={"type": "image", "items": simulated["items"], "idempotency_key": "note-1"},
+        headers=headers,
+    )
+
+    assert same_key.status_code == 201
+    assert same_key.json()["id"] != simulated["id"]
+    assert same_key.json()["network"] == "instagram"
 
 
 # Public media URL

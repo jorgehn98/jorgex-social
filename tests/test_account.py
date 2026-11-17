@@ -5,13 +5,20 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import appearance, crypto
+from jorgex_social.account import appearance, crypto, scope
 from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
-from jorgex_social.account.credential import NotConnected, StoredCredential, credential_context
+from jorgex_social.account.credential import (
+    NotConnected,
+    StoredCredential,
+    credential_context,
+    network_context,
+    seal,
+    unseal,
+)
 from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
@@ -21,6 +28,7 @@ from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import AuthError, CredentialUnavailable, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
+from jorgex_social.publishing.models import Post
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 PASTED = "pasted-token-not-real"
@@ -173,16 +181,116 @@ def test_credential_is_stored_only_encrypted_and_never_shown(
         assert all(secret not in text for text in shown)
         assert secret.encode() not in on_disk
     assert json.loads(shown[0])["account"]["username"] == "account_1784"
-    assert crypto.decrypt(key, stored.credential_encrypted, credential_context("instagram")) == (
+    assert crypto.decrypt(key, stored.credential_encrypted, credential_context(stored.id)) == (
         RENEWED
     )
 
 
-def test_ciphertext_is_bound_to_its_network(key):
-    blob = crypto.encrypt(key, RENEWED, credential_context("instagram"))
+def test_ciphertext_is_bound_to_its_connection(key):
+    blob = crypto.encrypt(key, RENEWED, credential_context("connection-a"))
 
     with pytest.raises(crypto.SecretKeyError):
-        crypto.decrypt(key, blob, credential_context("other"))
+        crypto.decrypt(key, blob, credential_context("connection-b"))
+
+
+def test_a_credential_sealed_with_its_network_is_resealed_with_its_row(sessions, key):
+    """Before accounts indexed the schema the network named the row, so two accounts of one network
+    shared the context. The migration cannot re-seal it: it has no master key."""
+    with sessions() as session, session.begin():
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.credential_encrypted = crypto.encrypt(key, PASTED, network_context("instagram"))
+        account.credential_legacy = True
+        account_id = account.id
+
+    token, external_id = StoredCredential(sessions, key, "instagram", writes=sessions)()
+
+    assert (token, external_id) == (PASTED, "1784")
+    with sessions() as session:
+        stored = session.get(Connection, account_id)
+    assert crypto.decrypt(key, stored.credential_encrypted, credential_context(account_id)) == (
+        PASTED
+    )
+    assert stored.credential_legacy is False  # the row no longer opens the old context
+    with pytest.raises(crypto.SecretKeyError):
+        crypto.decrypt(key, stored.credential_encrypted, network_context("instagram"))
+
+
+def test_a_legacy_ciphertext_copied_to_another_account_does_not_decrypt(sessions, key):
+    """Two accounts of one network shared the context before, so a copy would open there: only the
+    row that says it is still sealed with it may try."""
+    with sessions() as session, session.begin():
+        first = scope.current_account(session, "instagram")
+        first.external_account_id = "1784"
+        first.credential_encrypted = crypto.encrypt(key, PASTED, network_context("instagram"))
+        first.credential_legacy = True
+        second = Connection(network="instagram", external_account_id="2048", username="other")
+        session.add(second)
+        session.flush()
+        second.credential_encrypted = first.credential_encrypted
+        second_id = second.id
+
+    with sessions() as session:
+        copied = session.get(Connection, second_id)
+        original = session.get(Connection, first.id)
+    with pytest.raises(crypto.SecretKeyError):
+        unseal(key, copied)  # its own context does not open it, and it is not flagged
+    assert unseal(key, original)[0] == PASTED
+
+
+def test_a_credential_copied_to_another_account_does_not_decrypt(sessions, key):
+    with sessions() as session, session.begin():
+        first = scope.current_account(session, "instagram")
+        first.external_account_id = "1784"
+        first.credential_encrypted = seal(key, first.id, PASTED)
+        second = Connection(network="instagram", external_account_id="2048", username="other")
+        session.add(second)
+        session.flush()
+        second.credential_encrypted = first.credential_encrypted
+        second_id = second.id
+
+    with sessions() as session:
+        copied = session.get(Connection, second_id)
+    with pytest.raises(crypto.SecretKeyError):
+        unseal(key, copied)
+
+
+def test_a_failed_reseal_leaves_the_token_usable(sessions, key, caplog):
+    """The read already has the token: losing it because the new context could not be written would
+    stop publishing for a write that is retried on the next read."""
+    with sessions() as session, session.begin():
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.credential_encrypted = crypto.encrypt(key, PASTED, network_context("instagram"))
+        account.credential_legacy = True
+
+    def locked():
+        raise OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+    token, _ = StoredCredential(sessions, key, "instagram", writes=locked)()
+
+    assert token == PASTED
+    assert "could not re-seal" in caplog.text
+    assert PASTED not in caplog.text
+
+
+def test_connecting_fills_the_row_a_draft_created(real, key, clock):
+    """A write before connecting already owns the account of the mode: connecting names that same
+    row, without a second one and without --replace."""
+    sessions = real.state.sessionmaker
+    with sessions() as session, session.begin():
+        account = scope.current_account(session, "instagram")
+        session.add(Post(account_id=account.id, type="image", content_hash="h"))
+        created = account.id
+
+    stored = connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
+    )
+
+    assert stored.id == created
+    assert (stored.external_account_id, stored.username) == ("1784", "account_1784")
+    with sessions() as session:
+        assert session.scalar(select(func.count()).select_from(Connection)) == 1
 
 
 def test_worker_client_uses_the_renewed_token_at_once(real, key, clock, settings):
@@ -237,7 +345,7 @@ def test_a_token_too_young_to_renew_is_stored_with_an_estimated_expiry(
 
     assert stored.credential_expires_at == clock.now() + timedelta(days=59)
     assert stored.credential_refreshed_at == clock.now()
-    assert crypto.decrypt(key, stored.credential_encrypted, credential_context("simulation")) == (
+    assert crypto.decrypt(key, stored.credential_encrypted, credential_context(stored.id)) == (
         PASTED
     )
     assert "expiry is estimated" in caplog.text
@@ -443,7 +551,7 @@ def test_a_reconnect_during_renewal_wins(sessions, ig, key, clock, task):
     task.check(sessions, clock.now())
 
     stored = connection(sessions)
-    token = crypto.decrypt(key, stored.credential_encrypted, credential_context("simulation"))
+    token = crypto.decrypt(key, stored.credential_encrypted, credential_context(stored.id))
     assert token == "simulated-token-1"  # the reconnect's renewal, not the worker's
     assert stored.external_account_id == "999"
     assert stored.credential_expires_at == reconnected_at + timedelta(days=60)
@@ -525,11 +633,27 @@ def test_checks_at_most_once_an_hour(sessions, ig, clock, task):
     assert len(checks) == 2
 
 
-def test_one_open_incident_per_cause_is_enforced_by_the_database(sessions, clock):
+def test_one_open_operator_incident_per_cause_is_enforced_by_the_database(sessions, clock):
+    """SQLite takes one NULL as different from another, so the incidents without an account need an
+    index of their own to open only once."""
+
     def add():
         with sessions() as session, session.begin():
             session.add(
-                ChannelIncident(network="simulation", type="credential_expired", opened_at=START)
+                ChannelIncident(account_id=None, type="sign_in_password_accepted", opened_at=START)
+            )
+
+    add()
+    with pytest.raises(IntegrityError):
+        add()
+
+
+def test_one_open_incident_per_cause_is_enforced_by_the_database(sessions, clock):
+    def add():
+        with sessions() as session, session.begin():
+            account = scope.current_account(session, "simulation")
+            session.add(
+                ChannelIncident(account_id=account.id, type="credential_expired", opened_at=START)
             )
 
     add()
@@ -561,6 +685,22 @@ def test_real_mode_without_a_connection_is_missing(real):
     response = TestClient(real).get("/v1/account", headers=headers_for(real, account="read"))
 
     assert (response.json()["status"], response.json()["simulation"]) == ("missing", False)
+
+
+def test_a_draft_written_before_connecting_does_not_make_the_account_appear(real):
+    """A row of the domain needs an account, so one is written for the mode; it is not connected,
+    and the API goes on saying so, as it did before the row existed."""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(real)
+    headers = headers_for(real, account="read", posts="write")
+
+    created = client.post("/v1/posts", json={"type": "image", "items": []}, headers=headers)
+    shown = client.get("/v1/account", headers=headers)
+
+    assert created.status_code == 201
+    assert created.json()["network"] == "instagram"
+    assert (shown.json()["status"], shown.json()["account"]) == ("missing", None)
 
 
 def test_acknowledging_does_not_close(client, headers, sessions, ig, task):

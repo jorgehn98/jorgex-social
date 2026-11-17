@@ -21,7 +21,7 @@ from jorgex_social.access.deps import ReadSessionDep
 from jorgex_social.access.limits import client_key, is_listed
 from jorgex_social.access.models import OperatorSession
 from jorgex_social.access.proxy import via_proxy
-from jorgex_social.account import appearance
+from jorgex_social.account import appearance, scope
 from jorgex_social.account.api import get_account, list_incidents
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
@@ -356,7 +356,6 @@ async def login(request: Request):
             state.sessionmaker,
             state.read_sessionmaker,
             state.settings.secret_key_file,
-            state.network,
             form.get("password", ""),
             form.get("code", ""),
             client,
@@ -397,19 +396,19 @@ def logout(request: Request):
 # Pages
 
 
-def _network(request: Request) -> str:
-    return request.app.state.network
+def _account_id(request: Request, session) -> str | None:
+    """The account of the mode; none of the pages list anything before it exists."""
+    return scope.account_id_of(session, request.app.state.network)
 
 
 @pages.get("/")
 def home(request: Request, session: ReadSessionDep):
-    network = _network(request)
     return render(
         request,
         "home.html",
         account=get_account(request, session),
         incidents=list_incidents(request, session, open=True, limit=20),
-        upcoming=next_scheduled(session, network, limit=5),
+        upcoming=next_scheduled(session, _account_id(request, session), limit=5),
     )
 
 
@@ -425,14 +424,14 @@ def _thumbnail(session, media_dir: Path, post: dict) -> str | None:
 
 @pages.get("/posts")
 def posts(request: Request, session: ReadSessionDep):
-    network, media_dir = _network(request), request.app.state.settings.media_dir
+    account, media_dir = _account_id(request, session), request.app.state.settings.media_dir
     sections = []
     for status, title in POST_SECTIONS + FOLDED_SECTIONS:
         # Scheduled ones soonest first; the rest newest first.
         if status is PostStatus.SCHEDULED:
-            found = next_scheduled(session, network, limit=100)
+            found = next_scheduled(session, account, limit=100)
         else:
-            found = list_posts(session, network, status=status, limit=100)
+            found = list_posts(session, account, status=status, limit=100)
         for post in found:
             post["thumbnail"] = _thumbnail(session, media_dir, post)
         sections.append((title, found, (status, title) in FOLDED_SECTIONS))
@@ -442,7 +441,7 @@ def posts(request: Request, session: ReadSessionDep):
 @pages.get("/posts/{post_id}")
 def post_detail(post_id: str, request: Request, session: ReadSessionDep):
     try:
-        post = get_post(post_id, session, _network(request))
+        post = get_post(post_id, session, _account_id(request, session))
     except HTTPException:
         return render(request, "not_found.html", 404, what="post")
     media_dir = request.app.state.settings.media_dir
@@ -472,8 +471,8 @@ def media_file(media_id: str, request: Request, session: ReadSessionDep):
 
 @pages.get("/stats")
 def stats(request: Request, session: ReadSessionDep):
-    network = _network(request)
-    history = account_history(session, network, limit=90)
+    account = _account_id(request, session)
+    history = account_history(session, account, limit=90)
     oldest_first = list(reversed(history))
     return render(
         request,
@@ -489,13 +488,13 @@ def stats(request: Request, session: ReadSessionDep):
             title="Followers",
             series="secondary",
         ),
-        media=latest_per_media(session, network, limit=100),
+        media=latest_per_media(session, account, limit=100),
     )
 
 
 @pages.get("/stats/{media_ref}")
 def media_stats(media_ref: str, request: Request, session: ReadSessionDep):
-    snapshots = media_history(media_ref, session, _network(request), limit=365)
+    snapshots = media_history(media_ref, session, _account_id(request, session), limit=365)
     if not snapshots:
         return render(request, "not_found.html", 404, what="media")
     metrics = sorted({name for s in snapshots for name in s.metrics})
@@ -506,7 +505,7 @@ def media_stats(media_ref: str, request: Request, session: ReadSessionDep):
 
 @pages.get("/rules")
 def rules(request: Request, session: ReadSessionDep):
-    network = _network(request)
+    account = _account_id(request, session)
 
     def out(found) -> list[RuleOut]:
         return [RuleOut.model_validate(rule, from_attributes=True) for rule in found]
@@ -514,21 +513,21 @@ def rules(request: Request, session: ReadSessionDep):
     return render(
         request,
         "rules.html",
-        rules=out(list_rules(session, network, limit=1000)),
-        archived=out(list_rules(session, network, archived=True, limit=1000)),
+        rules=out(list_rules(session, account, limit=1000)),
+        archived=out(list_rules(session, account, archived=True, limit=1000)),
     )
 
 
 @pages.get("/events")
 def events(request: Request, session: ReadSessionDep):
-    network = _network(request)
-    names = {rule.id: rule.name for rule in list_rules(session, network, limit=1000)}
-    names |= {r.id: r.name for r in list_rules(session, network, archived=True, limit=1000)}
+    account = _account_id(request, session)
+    names = {rule.id: rule.name for rule in list_rules(session, account, limit=1000)}
+    names |= {r.id: r.name for r in list_rules(session, account, archived=True, limit=1000)}
     return render(
         request,
         "events.html",
-        events=list_events(session, network, limit=100),
-        deliveries=list_deliveries(session, network, limit=100),
+        events=list_events(session, account, limit=100),
+        deliveries=list_deliveries(session, account, limit=100),
         rule_names=names,
     )
 
