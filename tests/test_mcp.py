@@ -677,7 +677,23 @@ async def test_set_appearance_cannot_write_css(app, transport):
     description = " ".join(tools["set_appearance"].description.split())
     assert "only editable by the operator in Settings" in description
     assert "only editable by the operator in Settings" in guide
+    assert "belongs to the installation" in description
     assert refused[0] == "error"
     assert refused[1]["code"] == "invalid_appearance"
     assert "ask them to paste it" in refused[1]["message"]
     assert (after[1]["css"], after[1]["name"]) == ("kept {}", "Social")
+
+
+async def test_the_guide_says_what_belongs_to_the_installation(app, transport):
+    """Several own accounts, one token each; the appearance and the catalog are not an account's."""
+    async with Client(server_for(app, transport, **ALL_WRITE)) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        guide = client.instructions
+
+    def description(name):
+        return " ".join(tools[name].description.split())
+
+    assert "The installation may serve several of the operator's own accounts" in guide
+    assert "The appearance is the installation's" in guide
+    assert "belongs to the installation" in description("get_appearance")
+    assert "belongs to the installation" in description("get_catalog")

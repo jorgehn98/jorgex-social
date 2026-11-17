@@ -151,7 +151,7 @@ def consent_page(request: Request, signed_in: RecentSignIn, req: str = ""):
         if opened is not None:
             pending, client, nonce = opened
             client_name, redirect_uri = client.name, pending.params["redirect_uri"]
-            accounts = scope.connected_accounts(session)
+            accounts = scope.accounts_of(session, state.network, connected_only=True)
     if opened is None:
         return render(request, "consent.html", 400, error=GONE)
     if not accounts:
@@ -207,6 +207,7 @@ async def consent_answer(request: Request, signed_in: RecentSignIn):
                 permissions,
                 # Never trusted for itself: the store checks it against the connected accounts.
                 form.get("account_id", ""),
+                state.network,
                 state.clock.now(),
             )
 

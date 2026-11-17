@@ -176,7 +176,10 @@ class Provider:
     ) -> OAuthToken:
         try:
             issued = await self._write(
-                store.exchange_code, authorization_code.code, client.client_id
+                store.exchange_code,
+                authorization_code.code,
+                client.client_id,
+                self._state.network,
             )
         except store.Replayed:
             await self._write(store.code_replayed, authorization_code.code)

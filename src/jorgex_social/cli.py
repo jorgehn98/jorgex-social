@@ -20,7 +20,7 @@ from jorgex_social.access import operator
 from jorgex_social.access.models import ApiToken
 from jorgex_social.access.tokens import Group, Level, TokenError, create_token, revoke_token
 from jorgex_social.account import appearance, scope
-from jorgex_social.account.connection import ConnectError, ConnectionTask, connect
+from jorgex_social.account.connection import ConnectionTask, connect
 from jorgex_social.account.credential import NotConnected
 from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
 from jorgex_social.account.models import Connection
@@ -67,11 +67,11 @@ def parse_grants(values: list[str]) -> dict[str, str]:
     return grants
 
 
-def token_account(session, value: str) -> Connection:
-    """The connected account `value` names: its username, or its `account_id` as list-tokens shows
-    it. A token works on one account and cannot be moved, so an install connects the account
-    first."""
-    accounts = scope.connected_accounts(session)
+def token_account(session, value: str, network: str) -> Connection:
+    """The connected account of `network` that `value` names: its username, or its `account_id` as
+    list-tokens shows it. A token works on one account and cannot be moved, so an install connects
+    the account first."""
+    accounts = scope.accounts_of(session, network, connected_only=True)
     if not accounts:
         raise TokenError(
             "no account is connected: connect one first with `jorgex-social connect-instagram`"
@@ -88,7 +88,7 @@ def token_account(session, value: str) -> Connection:
 def cmd_create_token(args: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
-        account = token_account(session, args.account)
+        account = token_account(session, args.account, network_for(settings))
         token, secret = create_token(session, args.name, parse_grants(args.grant), account.id)
         result = {
             "name": token.name,
@@ -214,25 +214,25 @@ def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
     clock = SystemClock()
     # "me" until the account is known: connecting only reads /me and renews the token.
     instagram = FakeInstagram(clock) if settings.simulation else InstagramClient(token, "me")
-    connection = connect(
+    result = connect(
         make_sessionmaker(make_engine(settings)),
         instagram,
         token,
         key,
         clock.now(),
-        replace=args.replace,
     )
-    print(
-        json.dumps(
-            {
-                "network": connection.network,
-                "username": connection.username,
-                "account_type": connection.account_type,
-                "credential_expires_at": connection.credential_expires_at.isoformat(),
-            },
-            indent=2,
-        )
-    )
+    connection = result.connection
+    shown = {
+        "result": "added" if result.added else "refreshed",
+        "network": connection.network,
+        "username": connection.username,
+        "account_type": connection.account_type,
+        "credential_expires_at": connection.credential_expires_at.isoformat(),
+    }
+    if result.carried is not None:
+        # What the pre-existing row already owned: connecting the wrong account would keep it.
+        shown["carried"] = result.carried
+    print(json.dumps(shown, indent=2))
 
 
 def cmd_serve(args: argparse.Namespace, settings: Settings) -> None:
@@ -352,6 +352,18 @@ def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
     loop.join()
 
 
+class RemovedOption(argparse.Action):
+    """A flag that existed and does not any more: the operator gets the reason, not argparse's
+    "unrecognized arguments"."""
+
+    def __init__(self, option_strings, dest, reason, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+        self.reason = reason
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(f"{option_string} was removed: {self.reason}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jorgex-social")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -398,12 +410,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect_ig = sub.add_parser(
         "connect-instagram",
-        help="store an Instagram access token, read from standard input, encrypted",
+        help=(
+            "add one of your own Instagram accounts, or refresh its credential, with a token read "
+            "from standard input"
+        ),
     )
     connect_ig.add_argument(
         "--replace",
-        action="store_true",
-        help="switch this installation to a different account than the one connected",
+        action=RemovedOption,
+        reason=(
+            "connecting a different Instagram account now adds it as another account of the "
+            "installation; no account, post or token is replaced"
+        ),
+        help=argparse.SUPPRESS,
     )
 
     sub.add_parser(
@@ -467,7 +486,6 @@ def main(argv: list[str] | None = None) -> None:
         operator.OperatorError,
         SecretKeyError,
         NotConnected,
-        ConnectError,
         InstagramError,
     ) as exc:
         raise SystemExit(f"error: {exc}") from None

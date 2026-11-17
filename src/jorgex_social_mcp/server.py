@@ -80,8 +80,9 @@ one call to its REST API, which checks this token's permissions and enforces eve
 
 This token works on one account, the one `get_token` reports, and that is the account every tool \
 acts on: posts, media, rules, events, statistics, incidents, the audit log and the kill switch are \
-that account's. There is no account parameter, and nothing of another account is ever returned: an \
-id of another account answers not_found or unknown_media, exactly as a made-up one does. For \
+that account's. The installation may serve several of the operator's own accounts; this token \
+still sees one. There is no account parameter, and nothing of another account is ever returned: \
+an id of another account answers not_found or unknown_media, exactly as a made-up one does. For \
 another account, the operator gives you another token with its own permissions.
 
 Start with `get_token`, to see what this token may do and which account it works on, and \
@@ -187,8 +188,10 @@ nothing: a human must check Account Status in the Instagram app.
 Appearance: `get_appearance` shows the web interface's product name and the part of it in the \
 accent colour, its CSS, its icon, the CSS variables that can be overridden and warnings about \
 likely typos in the CSS. `set_appearance` changes the name, its highlight and the icon; nothing \
-reaches Instagram. CSS is only editable by the operator in Settings: to change it, ask them to \
-paste it there, and do not try to work around this.
+reaches Instagram. The appearance is the installation's, not this account's: `set_appearance` with \
+this token's `account:write` changes it for every account and for the sign-in page. CSS is only \
+editable by the operator in Settings: to change it, ask them to paste it there, and do not try to \
+work around this.
 
 Lists are newest first unless said otherwise. Pass limit explicitly and page with offset until \
 a page comes back shorter than limit; tools without offset say how to page in their \
@@ -276,7 +279,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         """The account this token works on and what it may do. `account.id` is the account's id on
         the network (the same one `get_account` reports, null until it is connected),
         `account.connection_id` the id this installation gives it, with its username and network.
-        No other account is reachable with it. `permissions` gives the level of each group (posts,
+        The installation may serve several of the operator's own accounts; no other one is
+        reachable with it. `permissions` gives the level of each group (posts,
         scheduling, stats, account, rules, events): deny, read or write. Call it first; a tool
         whose group is not granted at its level fails with forbidden, and a token of the other
         mode (simulation against a real service, or the other way round) fails with
@@ -287,7 +291,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
 
     def get_catalog() -> str:
         """Limits per post type (items, media types, caption) and accepted uploads, as the server
-        enforces them. Read before preparing a post."""
+        enforces them. Read before preparing a post. The catalog belongs to the installation: every
+        account accepts the same types and limits."""
         return call("GET", "/v1/catalog")
 
     def list_posts(
@@ -570,7 +575,8 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
         """The web interface's product name, the part of it in the accent colour and its CSS; its
         icon's type and size in bytes (icon null: the default icon); the CSS variables that can be
         overridden, with their defaults; and warnings: custom properties in the CSS the interface
-        does not read, likely typos."""
+        does not read, likely typos. The appearance belongs to the installation, not to this
+        account, so every account sees the same one."""
         return call("GET", "/v1/appearance")
 
     def set_appearance(
@@ -598,9 +604,11 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
             ),
         ] = False,
     ) -> str:
-        """Change the name and icon of the web interface, including its public sign-in page. Only
-        what you pass changes, and invalid_appearance means nothing did. CSS is only editable by the
-        operator in Settings: ask them to paste it there, and do not try to work around this."""
+        """Change the installation's web interface name and icon, including its public sign-in page.
+        It belongs to the installation, not to this account: with this token's `account:write` it
+        changes for every account. Only what you pass changes, and invalid_appearance means nothing
+        did. CSS is only editable by the operator in Settings: ask them to paste it there, and do
+        not try to work around this."""
         return call(
             "PUT",
             "/v1/appearance",

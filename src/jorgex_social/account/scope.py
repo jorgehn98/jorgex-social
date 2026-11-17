@@ -23,12 +23,6 @@ def account_of(session: Session, network: str) -> Connection | None:
     ).first()
 
 
-def account_id_of(session: Session, network: str) -> str | None:
-    """The id the queries filter by. None matches no row: nothing exists before the first write."""
-    account = account_of(session, network)
-    return account and account.id
-
-
 def connected(account: Connection | None) -> bool:
     """Whether the account has been connected. A row without an external account id only owns
     what was written before the first connection (a draft post, the kill switch); the API still
@@ -48,14 +42,15 @@ def current_account(session: Session, network: str) -> Connection:
     return account
 
 
-def connected_accounts(session: Session) -> list[Connection]:
-    """The accounts a credential can be bound to: the ones that have been connected, oldest
-    first. A row created by a first write is not one of them yet."""
-    return list(
-        session.scalars(
-            select(Connection).where(Connection.external_account_id != "").order_by(Connection.id)
-        )
-    )
+def draft_account(session: Session, network: str) -> Connection | None:
+    """The row a first write created before anything was connected, if it is still there:
+    connecting an account fills that row instead of adding a second one."""
+    return session.scalars(
+        select(Connection)
+        .where(Connection.network == network, Connection.external_account_id == "")
+        .order_by(Connection.id)
+        .limit(1)
+    ).first()
 
 
 def accounts_of(

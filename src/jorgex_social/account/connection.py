@@ -1,11 +1,13 @@
 """Connecting the account, renewing its credential and checking the connection's health."""
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
+from jorgex_social.access.models import ApiToken
 from jorgex_social.account import audit, crypto, incidents, scope
 from jorgex_social.account.credential import seal, unseal
 from jorgex_social.account.models import (
@@ -24,6 +26,7 @@ from jorgex_social.instagram.errors import (
 )
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import Account, Instagram, PublishingLimit
+from jorgex_social.oauth.models import OAuthGrant
 from jorgex_social.publishing.models import AttemptResult, Post, PostStatus, PublishAttempt
 
 log = logging.getLogger(__name__)
@@ -39,10 +42,6 @@ PERSISTENT_ERRORS = 3
 UNRESOLVED_AFTER = timedelta(hours=1)
 # Expiry assumed for a token Meta would not renew at connect time (younger than 24 hours).
 ESTIMATED_LIFETIME = timedelta(days=59)
-
-
-class ConnectError(Exception):
-    pass
 
 
 def status_at(connection: Connection, now: datetime) -> ConnectionStatus:
@@ -74,29 +73,31 @@ def _limits(limit: PublishingLimit) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class ConnectResult:
+    """What `connect` did: the account's row, whether it was added (a new row, or the draft row
+    filled) rather than refreshed in place, and what the draft row already owned, when it was that
+    row that got the account. The counts are of rows, not their contents."""
+
+    connection: Connection
+    added: bool
+    carried: dict[str, int] | None = None
+
+
 def connect(
     sessions: sessionmaker,
     instagram: Instagram,
     token: str,
     key: bytes,
     now: datetime,
-    *,
-    replace: bool = False,
-) -> Connection:
+) -> ConnectResult:
     """Stores the credential `instagram` was built with (`token`), after checking which account
-    it opens and renewing it once: the renewal is how its expiry becomes known. `replace` lets
-    the installation switch to a different account; without it, that is refused."""
+    it opens and renewing it once: the renewal is how its expiry becomes known. The account is
+    the one Instagram answers for that token: a row already bound to it is refreshed in place, the
+    row a first write created is filled, or a new row is added. Another account's row, posts and
+    tokens are never touched, and no row is deleted."""
     network = instagram.network
     account = instagram.account()
-    with sessions() as session:
-        current = scope.account_of(session, network)
-    switching = scope.connected(current) and current.external_account_id != account.id
-    if switching and not replace:
-        raise ConnectError(
-            f"this installation is already connected to another {network} account, and adding a "
-            "second one is not available yet; --replace switches to a different account, "
-            "replacing the one connected"
-        )
     try:
         renewal = instagram.refresh_token()
         stored, expires_at, estimated = renewal.access_token, now + renewal.expires_in, False
@@ -112,31 +113,69 @@ def connect(
             extra={"error": str(exc), "expires_at": expires_at},
         )
     with sessions() as session, session.begin():
-        connection = scope.current_account(session, network)
+        connection = scope.connection_by_external_id(session, network, account.id)
+        added = connection is None
+        filled = False
+        if connection is None:
+            connection = scope.draft_account(session, network)
+            filled = connection is not None
+        if connection is None:
+            connection = Connection(
+                network=network, external_account_id=account.id, username=account.username
+            )
+            session.add(connection)
         connection.external_account_id = account.id
         connection.username = account.username
         connection.account_type = account.account_type
         connection.credential_expires_at = expires_at
         connection.credential_refreshed_at = now
         connection.status = ConnectionStatus.OK
-        connection.limits = None if switching else connection.limits
         connection.checked_at = now
+        # The id a new row needs before anything else records or queries it.
         session.flush()
+        # A working credential cures what a broken one caused; the operator's account_restricted
+        # is not one of these: it closes only when the operator turns the kill switch off.
+        for type_ in (
+            IncidentType.CREDENTIAL_EXPIRED,
+            IncidentType.CREDENTIAL_UNREADABLE,
+            IncidentType.PERMISSION_REVOKED,
+        ):
+            incidents.sync(session, connection.id, type_, False, now)
+        carried = _carried(session, connection.id) if filled else None
         # Sealed for its row: the context needs the id the flush just gave it.
         connection.credential_encrypted = seal(key, connection.id, stored)
         connection.credential_legacy = False
+        detail = {"expiry_estimated": True} if estimated else {}
+        if carried is not None:
+            detail["carried"] = carried
         audit.record(
             session,
             now,
-            "connection.replaced" if switching else "connection.connected",
+            "connection.added" if added else "connection.refreshed",
             account_id=connection.id,
             actor_type=ActorType.OPERATOR,
             object_type="connection",
             object_id=connection.id,
-            detail={"expiry_estimated": True} if estimated else None,
+            detail=detail or None,
         )
     log.info("connected", extra={"network": network, "username": account.username})
-    return connection
+    return ConnectResult(connection, added, carried)
+
+
+def _carried(session, account_id: str) -> dict[str, int]:
+    """How much a row that predates the account already owns: the data on a draft row is the
+    operator's, and connecting a different account to it would keep it on the wrong one."""
+    return {
+        "posts": session.scalar(
+            select(func.count()).select_from(Post).where(Post.account_id == account_id)
+        ),
+        "api_tokens": session.scalar(
+            select(func.count()).select_from(ApiToken).where(ApiToken.account_id == account_id)
+        ),
+        "oauth_grants": session.scalar(
+            select(func.count()).select_from(OAuthGrant).where(OAuthGrant.account_id == account_id)
+        ),
+    }
 
 
 def mark_unreadable(sessions: sessionmaker, account_id: str, now: datetime) -> None:

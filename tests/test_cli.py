@@ -2,17 +2,23 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import func, inspect, select
 
-from jorgex_social.account import scope
-from jorgex_social.account.credential import seal
+from jorgex_social.access.models import ApiToken
+from jorgex_social.access.tokens import create_token
+from jorgex_social.account import crypto, scope
+from jorgex_social.account.credential import credential_context, seal
 from jorgex_social.account.crypto import load_key
-from jorgex_social.account.models import Connection
+from jorgex_social.account.models import AuditEntry, Connection
 from jorgex_social.cli import main, worker_tasks
 from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
 from jorgex_social.instagram import network_for
+from jorgex_social.instagram.fake import FakeInstagram
+from jorgex_social.instagram.types import Renewal
+from jorgex_social.oauth.models import OAuthClient, OAuthGrant
+from jorgex_social.publishing.models import Post
 from jorgex_social.replies.task import ReplyTask
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
@@ -25,6 +31,32 @@ def connect_account(settings, monkeypatch) -> None:
     monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(settings.secret_key_file))
     monkeypatch.setattr("sys.stdin", io.StringIO("pasted-token-not-real\n"))
     main(["connect-instagram"])
+
+
+def connect_accounts(settings, monkeypatch, *attempts) -> None:
+    """Runs `connect-instagram` once per (account id, pasted token): each command gets a fake
+    Instagram that answers for that account, as its token would."""
+    import io
+
+    answers = iter(attempts)
+
+    class AccountedFake(FakeInstagram):
+        def __init__(self, clock):
+            account_id, self._pasted = next(answers)
+            super().__init__(clock, account_id=account_id)
+
+        def _refresh(self):
+            # Meta renews to a new token; here the renewed one is the pasted one, so a test can
+            # tell which token the row ended up with.
+            self.credential_issued_at = self.clock.now()
+            return Renewal(self._pasted, self.credential_lifetime)
+
+    monkeypatch.setattr("jorgex_social.cli.FakeInstagram", AccountedFake)
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+    monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(settings.secret_key_file))
+    for _, token in attempts:
+        monkeypatch.setattr("sys.stdin", io.StringIO(f"{token}\n"))
+        main(["connect-instagram"])
 
 
 def test_create_token_prints_secret_once(settings, monkeypatch, capsys):
@@ -79,6 +111,24 @@ def test_create_token_accepts_the_account_id(settings, monkeypatch, capsys):
     tokens = {token["name"]: token for token in json.loads(capsys.readouterr().out)}
     assert tokens["reader"]["account"] == "simulated_account"
     assert tokens["reader"]["account_id"] == account_id
+
+
+def test_create_token_refuses_an_account_of_the_other_mode(settings, monkeypatch):
+    """A token works in its account's mode: binding one to the other mode's row would only be
+    refused later by the API."""
+    env_for(monkeypatch, settings)
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        other = Connection(
+            network="instagram", external_account_id="1784real", username="real_account"
+        )
+        session.add(other)
+        session.flush()
+        other_id = other.id
+
+    for value in ("real_account", other_id):
+        with pytest.raises(SystemExit, match="no account is connected"):
+            main(["create-token", "--name", "agent", "--account", value])
 
 
 def test_migrate_creates_schema_from_scratch(tmp_path, monkeypatch):
@@ -177,6 +227,7 @@ def test_connect_instagram_reads_the_token_from_stdin(settings, monkeypatch, cap
     out = capsys.readouterr()
     shown = json.loads(out.out)
     assert (shown["network"], shown["username"]) == ("simulation", "simulated_account")
+    assert shown["result"] == "added"
     assert shown["credential_expires_at"]
     assert "pasted-token-not-real" not in out.out + out.err
     with make_sessionmaker(make_engine(settings))() as session:
@@ -194,15 +245,132 @@ def test_connect_instagram_needs_the_key(settings, monkeypatch):
         main(["connect-instagram"])
 
 
-def test_connect_instagram_accepts_replace(settings, monkeypatch, capsys):
-    import io
-
+def test_connect_instagram_refreshes_the_same_account(settings, monkeypatch, capsys):
+    """Connecting the same account again renews its credential in place: no second row, and the
+    posts and tokens it already owns stay where they are."""
     env_for(monkeypatch, settings)
-    monkeypatch.setattr("sys.stdin", io.StringIO("pasted-token-not-real\n"))
+    connect_accounts(settings, monkeypatch, ("1784", "first-token"))
+    capsys.readouterr()
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        first = session.scalar(select(Connection))
+        session.add(Post(account_id=first.id, type="image", content_hash="h"))
+        create_token(session, "agent", {"posts": "read"}, first.id)
+        first_id, first_credential = first.id, first.credential_encrypted
 
-    main(["connect-instagram", "--replace"])
+    connect_accounts(settings, monkeypatch, ("1784", "second-token"))
 
-    assert json.loads(capsys.readouterr().out)["username"] == "simulated_account"
+    refreshed = json.loads(capsys.readouterr().out)
+    assert refreshed["result"] == "refreshed"
+    assert refreshed["credential_expires_at"]
+    with sessions() as session:
+        rows = session.scalars(select(Connection)).all()
+        assert [row.id for row in rows] == [first_id]
+        assert rows[0].credential_encrypted != first_credential  # renewed and re-sealed
+        key = load_key(settings.secret_key_file)
+        assert (
+            crypto.decrypt(key, rows[0].credential_encrypted, credential_context(first_id))
+            == "second-token"
+        )
+        assert session.scalar(select(func.count()).select_from(Post)) == 1
+        assert session.scalar(select(func.count()).select_from(ApiToken)) == 1
+        actions = session.scalars(select(AuditEntry.action).order_by(AuditEntry.occurred_at)).all()
+    assert actions == ["connection.added", "connection.refreshed"]
+
+
+def test_connect_instagram_adds_a_second_account_and_keeps_the_first(settings, monkeypatch, capsys):
+    """The second own account is a second row with its own credential. The first account's row,
+    credential, posts and tokens are untouched."""
+    env_for(monkeypatch, settings)
+    connect_accounts(settings, monkeypatch, ("1784", "first-token"))
+    capsys.readouterr()
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        first = session.scalar(select(Connection))
+        session.add(Post(account_id=first.id, type="image", content_hash="h"))
+        create_token(session, "agent", {"posts": "read"}, first.id)
+        first_id, first_credential = first.id, first.credential_encrypted
+
+    connect_accounts(settings, monkeypatch, ("2048", "second-token"))
+
+    added = json.loads(capsys.readouterr().out)
+    assert added["result"] == "added"
+    assert added["credential_expires_at"]
+    with sessions() as session:
+        rows = session.scalars(select(Connection).order_by(Connection.id)).all()
+        assert [row.external_account_id for row in rows] == ["1784", "2048"]
+        untouched = session.get_one(Connection, first_id)
+        assert (untouched.external_account_id, untouched.username) == (
+            "1784",
+            "simulated_account",
+        )
+        assert untouched.credential_encrypted == first_credential
+        assert (
+            session.scalar(
+                select(func.count()).select_from(Post).where(Post.account_id == first_id)
+            )
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count()).select_from(ApiToken).where(ApiToken.account_id == first_id)
+            )
+            == 1
+        )
+        actions = session.scalars(select(AuditEntry.action).order_by(AuditEntry.occurred_at)).all()
+    assert actions == ["connection.added", "connection.added"]
+
+
+def test_connect_instagram_fills_the_draft_row(settings, monkeypatch, capsys):
+    """A write before connecting already owns the mode's first row: connecting names it instead
+    of adding another one, and says how much that row already carried."""
+    env_for(monkeypatch, settings)
+    sessions = make_sessionmaker(make_engine(settings))
+    with sessions() as session, session.begin():
+        draft_id = scope.current_account(session, network_for(Settings.from_env())).id
+        session.add(Post(account_id=draft_id, type="image", content_hash="h"))
+        create_token(session, "agent", {"posts": "read"}, draft_id)
+        session.add(OAuthClient(id="client", name="agent", info={}, created_at=datetime.now(UTC)))
+        session.flush()
+        session.add(
+            OAuthGrant(
+                id="grant",
+                client_id="client",
+                account_id=draft_id,
+                permissions={"posts": "read"},
+                resource="http://localhost/mcp",
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    connect_accounts(settings, monkeypatch, ("1784", "first-token"))
+
+    filled = json.loads(capsys.readouterr().out)
+    assert filled["result"] == "added"
+    assert filled["credential_expires_at"]
+    assert filled["carried"] == {"posts": 1, "api_tokens": 1, "oauth_grants": 1}
+    with sessions() as session:
+        rows = session.scalars(select(Connection)).all()
+        assert [row.id for row in rows] == [draft_id]
+        assert rows[0].external_account_id == "1784"
+        details = session.scalars(
+            select(AuditEntry.detail).where(AuditEntry.action == "connection.added")
+        ).all()
+    assert details == [{"carried": {"posts": 1, "api_tokens": 1, "oauth_grants": 1}}]
+
+
+def test_connect_instagram_refuses_the_removed_replace_flag(settings, monkeypatch, capsys):
+    env_for(monkeypatch, settings)
+
+    with pytest.raises(SystemExit) as exit:
+        main(["connect-instagram", "--replace"])
+
+    assert exit.value.code == 2
+    message = capsys.readouterr().err
+    assert "--replace was removed" in message
+    assert "adds it as another account" in message
+    with make_sessionmaker(make_engine(settings))() as session:
+        assert session.scalar(select(func.count()).select_from(Connection)) == 0
 
 
 def test_worker_in_real_mode_refuses_to_start_without_the_key(settings, monkeypatch):

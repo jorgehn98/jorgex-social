@@ -262,8 +262,13 @@ class InstagramClient:
             {"fields": "user_id,username,account_type,followers_count,media_count"},
             credentials,
         )
+        user_id = data.get("user_id")
+        if not user_id:
+            # Never the credential's own id: in the connect command that is the literal "me",
+            # and two different tokens would then look like the same account.
+            raise Unavailable("Instagram API did not return the account's user id")
         return Account(
-            id=str(data.get("user_id") or credentials[1]),
+            id=str(user_id),
             username=data.get("username", ""),
             account_type=data.get("account_type"),
             followers_count=data.get("followers_count"),
