@@ -459,7 +459,8 @@ accounts, and this one serves only yours. If a new app behaves differently, plea
 
    `list-tokens` shows which account each token works on.
 
-In real mode the worker refuses to start without a connected account, so connect before switching.
+In real mode the worker starts even before an account is connected: it has nothing to publish until
+there is one, picks it up on its next pass and does not need a restart when you connect.
 
 ## Webhook
 

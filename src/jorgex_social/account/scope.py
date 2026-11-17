@@ -1,9 +1,10 @@
-"""Which account a piece of work is about.
+"""Which accounts the service's own work is about.
 
 Every row of the domain carries `account_id`, never the network: with two accounts of one network
 the network identifies nothing (decision 10). This module is the one place the *service's own* code
-asks which account that is: the worker, the webhook and the operator's web interface, which still
-work on the one account of each mode until the interface carries the account in its URL.
+asks which account that is: the worker, which goes account by account; the webhook, which finds the
+account Meta names in each notification; and the operator's web interface, which still works on the
+one account of each mode until the interface carries the account in its URL (T04).
 
 An API call never comes here: its account is the caller's, resolved from the token or the OAuth
 grant in `access/deps.py` (T02).
@@ -53,5 +54,29 @@ def connected_accounts(session: Session) -> list[Connection]:
     return list(
         session.scalars(
             select(Connection).where(Connection.external_account_id != "").order_by(Connection.id)
+        )
+    )
+
+
+def accounts_of(
+    session: Session, network: str, *, connected_only: bool = False
+) -> list[Connection]:
+    """The connections of `network`, oldest first. `connected_only` leaves out the row a first
+    write created before `connect-instagram` named its account: in simulation, where nothing has
+    to be connected, the worker works on every row; in real mode only on the connected ones."""
+    query = select(Connection).where(Connection.network == network).order_by(Connection.id)
+    if connected_only:
+        query = query.where(Connection.external_account_id != "")
+    return list(session.scalars(query))
+
+
+def connection_by_external_id(
+    session: Session, network: str, external_id: str
+) -> Connection | None:
+    """The connection of `network` that the network itself calls `external_id`: the account a
+    webhook notification says it is about (`entry[].id`)."""
+    return session.scalar(
+        select(Connection).where(
+            Connection.network == network, Connection.external_account_id == external_id
         )
     )

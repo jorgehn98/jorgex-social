@@ -1,9 +1,12 @@
 """Meta's webhook: `GET /webhook` answers the subscription check, `POST /webhook` receives
 notifications of new comments and direct messages.
 
-A notification only feeds the intake that polling uses (replies/intake.py): the same filters,
-deduplication and rules, and the worker sends the replies. Polling stays on as the reconciler,
-since Meta may retry, reorder or drop notifications.
+One installation has one Meta app, so one signature covers the whole request; the notification
+itself says which account each entry is about (`entry[].id`), and each group feeds the intake of
+that connection only (replies/intake.py): the same filters, deduplication and rules as polling,
+and the worker sends the replies. An entry of an account this installation does not have is
+discarded with its id in the log and nothing else. Polling stays on as the reconciler, since Meta
+may retry, reorder or drop notifications.
 
 The body carries third-party text and usernames. It is never logged or stored, whatever the
 signature: what is logged is counts and outcomes only.
@@ -68,9 +71,7 @@ class Notification:
     comments: list[tuple[str, Comment]] = field(default_factory=list)  # (media id, comment)
     messages: list[Message] = field(default_factory=list)
     echoes: list[Echo] = field(default_factory=list)
-    ignored: int = 0  # entries or changes not used: other fields, other accounts, odd shapes
-    matched: int = 0  # entries for our account, useful or not
-    other_accounts: set[str] = field(default_factory=set)  # entry ids that are not ours
+    ignored: int = 0  # changes not used: other fields, odd shapes
 
 
 def _str_id(value: Any) -> str | None:
@@ -144,44 +145,48 @@ def _messaging(item: Any, notification: Notification) -> None:
         )
 
 
-def parse(payload: Any, own: str, now: datetime) -> Notification:
-    """What a notification says about the account `own`. Never raises on an unexpected shape."""
-    notification = Notification()
-    entries = payload.get("entry") if isinstance(payload, dict) else None
-    if not isinstance(payload, dict) or payload.get("object") != "instagram":
-        notification.ignored += 1
-        return notification
-    for entry in entries if isinstance(entries, list) else []:
-        # entry.id is "the Instagram professional account ID of your app user": the `user_id`
-        # the connection stores. One installation serves one account; anything else is dropped.
-        entry_id = _str_id(entry.get("id")) if isinstance(entry, dict) else None
-        if entry_id != own:
+def _entry(entry: Any, notification: Notification, now: datetime) -> None:
+    """One `entry` of the notification, already attributed to an account."""
+    sent_at = min(_time(entry.get("time")) or now, now)
+    # Meta's Instagram Login example puts `field` and `value` on the entry itself; its Unified
+    # Login examples, and the generic Graph format, wrap them in `changes`. Both read.
+    changes = entry.get("changes")
+    changes = changes if isinstance(changes, list) else []
+    if "field" in entry:
+        changes = [*changes, {"field": entry.get("field"), "value": entry.get("value")}]
+    for change in changes:
+        found = (
+            _comment(change.get("value"), sent_at)
+            if isinstance(change, dict) and change.get("field") == "comments"
+            else None
+        )
+        if found is None:
             notification.ignored += 1
-            if entry_id is not None:
-                notification.other_accounts.add(entry_id)
+        else:
+            notification.comments.append(found)
+    messaging = entry.get("messaging")
+    for item in messaging if isinstance(messaging, list) else []:
+        _messaging(item, notification)
+
+
+def parse(payload: Any, now: datetime) -> dict[str, Notification]:
+    """What a notification says, grouped by the account Meta attributes each entry to
+    (`entry[].id`, "the Instagram professional account ID of your app user"). Never raises on an
+    unexpected shape.
+
+    An entry without a usable id belongs to no account and is dropped here: its content cannot be
+    stored anywhere without guessing whose it is."""
+    found: dict[str, Notification] = {}
+    if not isinstance(payload, dict) or payload.get("object") != "instagram":
+        return found
+    entries = payload.get("entry")
+    for entry in entries if isinstance(entries, list) else []:
+        # entry.id is the id the connection stores as its external account id.
+        entry_id = _str_id(entry.get("id")) if isinstance(entry, dict) else None
+        if entry_id is None:
             continue
-        notification.matched += 1
-        sent_at = min(_time(entry.get("time")) or now, now)
-        # Meta's Instagram Login example puts `field` and `value` on the entry itself; its
-        # Unified Login examples, and the generic Graph format, wrap them in `changes`. Both read.
-        changes = entry.get("changes")
-        changes = changes if isinstance(changes, list) else []
-        if "field" in entry:
-            changes = [*changes, {"field": entry.get("field"), "value": entry.get("value")}]
-        for change in changes:
-            found = (
-                _comment(change.get("value"), sent_at)
-                if isinstance(change, dict) and change.get("field") == "comments"
-                else None
-            )
-            if found is None:
-                notification.ignored += 1
-            else:
-                notification.comments.append(found)
-        messaging = entry.get("messaging")
-        for item in messaging if isinstance(messaging, list) else []:
-            _messaging(item, notification)
-    return notification
+        _entry(entry, found.setdefault(entry_id, Notification()), now)
+    return found
 
 
 def signature_valid(secret: str, body: bytes, header: str | None) -> bool:
@@ -278,35 +283,33 @@ def _pause_for_echoes(
     return paused
 
 
-def _process(request: Request, payload: Any) -> None:
+def _account(request: Request, external_id: str, notification: Notification, now: datetime) -> bool:
+    """Handles one account's part of a notification in its own transaction: its intake, its
+    pauses, its webhook health. False when no connection answers to `external_id`."""
     state = request.app.state
-    now = state.clock.now()
+    settings = state.settings
     with state.sessionmaker() as session, session.begin():
-        connection = scope.account_of(session, state.network)
-        if not scope.connected(connection):
-            log.warning("webhook notification before any account is connected; ignored")
-            return
-        own = connection.external_account_id
-        notification = parse(payload, own, now)
-        if notification.other_accounts:
-            # Ids only: an account id, never anything from the body.
-            log.warning(
-                "webhook notification for another account; ignored",
-                extra={"account_ids": sorted(notification.other_accounts), "expected": own},
-            )
-        # Only a notification about our account shows that the webhook works for it.
-        if notification.matched:
-            connection.webhook_notified_at = now
-            incidents.sync(session, connection.id, IncidentType.WEBHOOK_SILENT, False, now)
-        intake: Intake = state.intake
-        intake.comments(session, own, notification.comments, now, Source.WEBHOOK)
-        intake.messages(session, own, notification.messages, now, Source.WEBHOOK)
+        connection = scope.connection_by_external_id(session, state.network, external_id)
+        if connection is None:
+            return False
+        # A notification about this account is what shows the webhook works for it.
+        connection.webhook_notified_at = now
+        incidents.sync(session, connection.id, IncidentType.WEBHOOK_SILENT, False, now)
+        # Stateless and cheap: the settings of the installation and the account they act on.
+        intake = Intake(
+            connection.id,
+            retention=timedelta(days=settings.retention_days),
+            opt_out_words=settings.opt_out_words,
+        )
+        intake.comments(session, external_id, notification.comments, now, Source.WEBHOOK)
+        intake.messages(session, external_id, notification.messages, now, Source.WEBHOOK)
         paused = _pause_for_echoes(
             session, connection.id, notification.echoes, now, state.human_pause
         )
     log.info(
         "webhook notification",
         extra={
+            "account_id": connection.id,
             "comments": len(notification.comments),
             "messages": len(notification.messages),
             "echoes": len(notification.echoes),
@@ -314,6 +317,39 @@ def _process(request: Request, payload: Any) -> None:
             "ignored": notification.ignored,
         },
     )
+    return True
+
+
+def _process(request: Request, payload: Any) -> None:
+    """Each account Meta names in the notification is handled on its own, in its own transaction:
+    nothing else of another account is written, and one failing does not lose the others.
+
+    A failure is raised after every account was tried, so the endpoint answers 500 and Meta retries
+    the whole body; the events' unique key absorbs what was already stored."""
+    state = request.app.state
+    now = state.clock.now()
+    groups = parse(payload, now)
+    if not groups:
+        log.info("webhook notification with nothing to attribute to an account")
+        return
+    unknown: list[str] = []
+    failures: list[Exception] = []
+    for external_id, notification in groups.items():
+        try:
+            known = _account(request, external_id, notification, now)
+        except Exception as exc:
+            failures.append(exc)
+            continue
+        if not known:
+            unknown.append(external_id)
+    if unknown:
+        # Ids only: an account id, never anything from the body.
+        log.warning(
+            "webhook notification for an unknown account; ignored",
+            extra={"account_ids": sorted(unknown), "network": state.network},
+        )
+    if failures:
+        raise failures[0]
 
 
 def _settings_or_404(request: Request):

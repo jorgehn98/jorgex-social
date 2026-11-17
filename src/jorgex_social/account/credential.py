@@ -3,7 +3,7 @@ import logging
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
-from jorgex_social.account import crypto, scope
+from jorgex_social.account import crypto
 from jorgex_social.account.models import Connection
 from jorgex_social.instagram.errors import CredentialUnavailable
 
@@ -48,19 +48,21 @@ class NotConnected(CredentialUnavailable):
 
 
 class StoredCredential:
-    """The access token and account id of the connected account, read together from one row and
-    decrypted on every call: a renewal by the worker or a reconnection (even to another account)
-    from the command line is used at once, and the plaintext never lives longer than one request.
-    Any failure to read it is a CredentialUnavailable, raised before anything is sent.
+    """The access token and account id of one connection, read together from its row and decrypted
+    on every call: a renewal by the worker or a reconnection from the command line is used at once,
+    and the plaintext never lives longer than one request. Any failure to read it is a
+    CredentialUnavailable, raised before anything is sent.
 
-    A credential sealed under its network's context is re-sealed under its connection's the first
-    time it is read. The migration cannot do it: it does not have the master key."""
+    It reads the connection by id, not "the one of the network": with two accounts of one network
+    the network identifies neither (decision 10). A credential sealed under its network's context
+    is re-sealed under its connection's the first time it is read. The migration cannot do it: it
+    does not have the master key."""
 
     def __init__(
         self,
         sessions: sessionmaker,
         key: bytes,
-        network: str,
+        connection_id: str,
         writes: sessionmaker | None = None,
     ) -> None:
         self._sessions = sessions
@@ -68,17 +70,17 @@ class StoredCredential:
         # Where to store a credential re-sealed on read. Without it the read still works, and the
         # row keeps the old context until the credential is renewed or the account reconnected.
         self._writes = writes
-        self.network = network
+        self.connection_id = connection_id
 
     def __repr__(self) -> str:
-        return f"StoredCredential(network={self.network!r})"
+        return f"StoredCredential(connection_id={self.connection_id!r})"
 
     def _connection(self) -> Connection:
         with self._sessions() as session:
-            connection = scope.account_of(session, self.network)
+            connection = session.get(Connection, self.connection_id)
         if connection is None or connection.credential_encrypted is None:
             raise NotConnected(
-                f"no {self.network} connection; run `jorgex-social connect-instagram` first"
+                "no stored credential for this account; run `jorgex-social connect-instagram` first"
             )
         return connection
 

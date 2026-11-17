@@ -56,11 +56,11 @@ def test_closed_days_end_at_least_48_hours_ago():
     assert all(end - start == timedelta(days=1) for start, end in days)
 
 
-def test_first_sweep_backfills_account_and_snapshots_every_media(sessions, ig, clock):
+def test_first_sweep_backfills_account_and_snapshots_every_media(sessions, ig, clock, account_id):
     image = publish(ig, clock, IMAGE)
     reel = publish(ig, clock, REEL)
 
-    SnapshotTask(ig, clock)(sessions)
+    SnapshotTask(ig, clock, account_id=account_id)(sessions)
 
     assert count(sessions, AccountSnapshot) == BACKFILL_DAYS
     with sessions() as session:
@@ -70,9 +70,9 @@ def test_first_sweep_backfills_account_and_snapshots_every_media(sessions, ig, c
     assert "ig_reels_avg_watch_time" in rows[reel].metrics
 
 
-def test_sweeps_at_most_hourly_and_only_what_is_due(sessions, ig, clock):
+def test_sweeps_at_most_hourly_and_only_what_is_due(sessions, ig, clock, account_id):
     publish(ig, clock, IMAGE)
-    task = SnapshotTask(ig, clock)
+    task = SnapshotTask(ig, clock, account_id=account_id)
     task(sessions)
 
     clock.advance(minutes=30)
@@ -89,10 +89,10 @@ def test_sweeps_at_most_hourly_and_only_what_is_due(sessions, ig, clock):
     assert count(sessions, AccountSnapshot) == BACKFILL_DAYS + 1  # one more closed day
 
 
-def test_old_media_are_sampled_weekly(sessions, ig, clock):
+def test_old_media_are_sampled_weekly(sessions, ig, clock, account_id):
     publish(ig, clock, IMAGE)
     clock.advance(days=40)
-    task = SnapshotTask(ig, clock)
+    task = SnapshotTask(ig, clock, account_id=account_id)
     task(sessions)
 
     clock.advance(days=2)
@@ -104,22 +104,22 @@ def test_old_media_are_sampled_weekly(sessions, ig, clock):
     assert count(sessions, PostSnapshot) == 2
 
 
-def test_one_failing_media_does_not_stop_the_others(sessions, ig, clock):
+def test_one_failing_media_does_not_stop_the_others(sessions, ig, clock, account_id):
     publish(ig, clock, IMAGE)
     publish(ig, clock, IMAGE)
     ig.fail_next("media_insights", Refused("deleted", code=100))
 
-    SnapshotTask(ig, clock)(sessions)
+    SnapshotTask(ig, clock, account_id=account_id)(sessions)
 
     assert count(sessions, PostSnapshot) == 1
 
 
-def test_invalid_credential_stops_the_sweep(sessions, ig, clock):
+def test_invalid_credential_stops_the_sweep(sessions, ig, clock, account_id):
     publish(ig, clock, IMAGE)
     ig.fail_next("account", AuthError("expired", code=190))
 
     with pytest.raises(AuthError):
-        SnapshotTask(ig, clock)(sessions)
+        SnapshotTask(ig, clock, account_id=account_id)(sessions)
 
     assert count(sessions, PostSnapshot) == 0
 
@@ -137,9 +137,9 @@ def test_api_requires_stats_read(app, client):
     assert client.get("/v1/instagram-media", headers=headers).status_code == 403
 
 
-def test_api_returns_history(app, client, sessions, ig, clock):
+def test_api_returns_history(app, client, sessions, ig, clock, account_id):
     media_id = publish(ig, clock, IMAGE)
-    task = SnapshotTask(ig, clock)
+    task = SnapshotTask(ig, clock, account_id=account_id)
     task(sessions)
     clock.advance(days=1, hours=1)
     task(sessions)
@@ -165,9 +165,9 @@ def test_recent_media_is_empty_until_the_worker_lists_it(app, client):
     assert response.json() == {"fetched_at": None, "items": []}
 
 
-def test_each_sweep_replaces_the_recent_media(app, client, sessions, ig, clock):
+def test_each_sweep_replaces_the_recent_media(app, client, sessions, ig, clock, account_id):
     oldest = publish(ig, clock, IMAGE)
-    task = SnapshotTask(ig, clock)
+    task = SnapshotTask(ig, clock, account_id=account_id)
     task(sessions)
     headers = auth(app, stats="read")
     first = client.get("/v1/instagram-media", headers=headers).json()
@@ -186,12 +186,14 @@ def test_each_sweep_replaces_the_recent_media(app, client, sessions, ig, clock):
     assert second["fetched_at"] > first["fetched_at"]
 
 
-def test_a_failing_store_of_recent_media_does_not_stop_the_sweep(sessions, ig, clock, caplog):
+def test_a_failing_store_of_recent_media_does_not_stop_the_sweep(
+    sessions, ig, clock, caplog, account_id
+):
     publish(ig, clock, IMAGE)
     with sessions() as session, session.begin():
         session.execute(text("DROP TABLE recent_media"))
 
-    SnapshotTask(ig, clock)(sessions)
+    SnapshotTask(ig, clock, account_id=account_id)(sessions)
 
     assert count(sessions, PostSnapshot) == 1
     assert "could not store the recent media" in caplog.text
@@ -211,7 +213,7 @@ def test_api_rejects_dates_without_timezone(app, client):
     "stop", [RateLimited("slow down", code=4), AccountRestricted("no", code=4, subcode=2207051)]
 )
 def test_rate_limit_or_restriction_stops_the_sweep_and_keeps_what_was_saved(
-    sessions, ig, clock, stop
+    sessions, ig, clock, stop, account_id
 ):
     for _ in range(3):
         publish(ig, clock, IMAGE)
@@ -219,14 +221,14 @@ def test_rate_limit_or_restriction_stops_the_sweep_and_keeps_what_was_saved(
     ig.fail_next("media_insights", stop)
 
     with pytest.raises(type(stop)):
-        SnapshotTask(ig, clock)(sessions)
+        SnapshotTask(ig, clock, account_id=account_id)(sessions)
 
     assert count(sessions, AccountSnapshot) == BACKFILL_DAYS
     assert count(sessions, PostSnapshot) == 0
 
 
-def test_a_gap_is_filled_without_duplicates(sessions, ig, clock):
-    task = SnapshotTask(ig, clock)
+def test_a_gap_is_filled_without_duplicates(sessions, ig, clock, account_id):
+    task = SnapshotTask(ig, clock, account_id=account_id)
     task(sessions)
 
     clock.advance(days=10)
@@ -237,18 +239,18 @@ def test_a_gap_is_filled_without_duplicates(sessions, ig, clock):
     assert len(starts) == len(set(starts)) == BACKFILL_DAYS + 10
 
 
-def test_media_older_than_two_years_are_skipped(sessions, ig, clock):
+def test_media_older_than_two_years_are_skipped(sessions, ig, clock, account_id):
     publish(ig, clock, IMAGE)
     clock.advance(days=731)
 
-    SnapshotTask(ig, clock)(sessions)
+    SnapshotTask(ig, clock, account_id=account_id)(sessions)
 
     assert count(sessions, PostSnapshot) == 0
 
 
-def test_a_failing_media_waits_a_day_before_retrying(sessions, ig, clock):
+def test_a_failing_media_waits_a_day_before_retrying(sessions, ig, clock, account_id):
     publish(ig, clock, IMAGE)
-    task = SnapshotTask(ig, clock)
+    task = SnapshotTask(ig, clock, account_id=account_id)
     ig.fail_next("media_insights", Refused("temporary", code=100))
     task(sessions)
 
@@ -264,14 +266,14 @@ def test_a_failing_media_waits_a_day_before_retrying(sessions, ig, clock):
     assert count(sessions, PostSnapshot) == 1
 
 
-def test_simulated_rows_never_show_as_real(settings, sessions, ig, clock):
+def test_simulated_rows_never_show_as_real(settings, sessions, ig, clock, account_id):
     from fastapi.testclient import TestClient
 
     from jorgex_social.api import create_app
     from jorgex_social.config import Settings
 
     publish(ig, clock, IMAGE)
-    SnapshotTask(ig, clock)(sessions)
+    SnapshotTask(ig, clock, account_id=account_id)(sessions)
     real = create_app(Settings(database_path=settings.database_path, simulation=False))
 
     response = TestClient(real).get("/v1/stats/media", headers=auth(real, stats="read"))
@@ -279,9 +281,9 @@ def test_simulated_rows_never_show_as_real(settings, sessions, ig, clock):
     assert response.json() == []
 
 
-def test_media_list_pages_with_offset(app, client, sessions, ig, clock):
+def test_media_list_pages_with_offset(app, client, sessions, ig, clock, account_id):
     ids = [publish(ig, clock, IMAGE) for _ in range(3)]
-    SnapshotTask(ig, clock)(sessions)
+    SnapshotTask(ig, clock, account_id=account_id)(sessions)
     headers = auth(app, stats="read")
 
     page = client.get("/v1/stats/media", params={"limit": 2, "offset": 2}, headers=headers)

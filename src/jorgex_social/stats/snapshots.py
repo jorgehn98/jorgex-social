@@ -5,7 +5,6 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
-from jorgex_social.account import scope
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.errors import (
     AccountRestricted,
@@ -84,15 +83,9 @@ def store_recent_media(
         )
 
 
-def _account_id(sessions: sessionmaker, instagram: Instagram) -> str:
-    """The account the sweep is for. The sweep is a write, so it creates the row of the mode when
-    nothing has been connected yet, as the first listing of a simulation does today."""
-    with sessions() as session, session.begin():
-        return scope.current_account(session, instagram.network).id
-
-
-def snapshot_account(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
-    account_id = _account_id(sessions, instagram)
+def snapshot_account(
+    sessions: sessionmaker, instagram: Instagram, account_id: str, now: datetime
+) -> int:
     with sessions() as session:
         recorded = set(
             session.scalars(
@@ -139,11 +132,11 @@ def _due(media: Media, last: datetime | None, now: datetime) -> bool:
 def snapshot_media(
     sessions: sessionmaker,
     instagram: Instagram,
+    account_id: str,
     now: datetime,
     failed_at: dict[str, datetime] | None = None,
 ) -> int:
-    """Feed posts and reels, including the ones published by hand."""
-    account_id = _account_id(sessions, instagram)
+    """Feed posts and reels of the account, including the ones published by hand."""
     items = instagram.list_media()
     store_recent_media(sessions, account_id, items, now)
     with sessions() as session:
@@ -189,10 +182,11 @@ def snapshot_media(
     return taken
 
 
-def snapshot_stories(sessions: sessionmaker, instagram: Instagram, now: datetime) -> int:
-    """Stories published by this service, every 6 hours during their first 24. A failed one is
-    retried on the next hourly sweep: a day of backoff would outlive the story."""
-    account_id = _account_id(sessions, instagram)
+def snapshot_stories(
+    sessions: sessionmaker, instagram: Instagram, account_id: str, now: datetime
+) -> int:
+    """Stories this service published to the account, every 6 hours during their first 24. A
+    failed one is retried on the next hourly sweep: a day of backoff would outlive the story."""
     with sessions() as session:
         stories = session.execute(
             select(Post.external_ref, Post.published_at, Post.permalink).where(
@@ -242,13 +236,15 @@ def snapshot_stories(sessions: sessionmaker, instagram: Instagram, now: datetime
 
 
 class SnapshotTask:
-    """Worker task: at most one sweep per hour; each sweep only fetches what is due."""
+    """Worker task: at most one sweep per hour for one account; each sweep only fetches what is
+    due. One task per account: the snapshots it stores are that account's."""
 
     __name__ = "snapshots"
 
-    def __init__(self, instagram: Instagram, clock: Clock) -> None:
+    def __init__(self, instagram: Instagram, clock: Clock, *, account_id: str) -> None:
         self.instagram = instagram
         self.clock = clock
+        self.account_id = account_id
         self._last_sweep: datetime | None = None
         self._failed_at: dict[str, datetime] = {}
 
@@ -258,9 +254,14 @@ class SnapshotTask:
             return
         self._last_sweep = now
         steps = (
-            ("account", lambda: snapshot_account(sessions, self.instagram, now)),
-            ("media", lambda: snapshot_media(sessions, self.instagram, now, self._failed_at)),
-            ("stories", lambda: snapshot_stories(sessions, self.instagram, now)),
+            ("account", lambda: snapshot_account(sessions, self.instagram, self.account_id, now)),
+            (
+                "media",
+                lambda: snapshot_media(
+                    sessions, self.instagram, self.account_id, now, self._failed_at
+                ),
+            ),
+            ("stories", lambda: snapshot_stories(sessions, self.instagram, self.account_id, now)),
         )
         for name, step in steps:
             try:

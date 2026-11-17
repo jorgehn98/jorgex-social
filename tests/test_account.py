@@ -61,9 +61,17 @@ def key(settings):
     return crypto.load_key(settings.secret_key_file)
 
 
+def connection_task(sessions, instagram, clock, key):
+    """A connection check bound to the row `connect` fills (or the draft's, before it). The row is
+    created here if nothing has written for it yet, as the first write does."""
+    with sessions() as session, session.begin():
+        account_id = scope.current_account(session, instagram.network).id
+    return ConnectionTask(instagram, clock, key, account_id=account_id)
+
+
 @pytest.fixture
-def task(ig, clock, key):
-    return ConnectionTask(ig, clock, key)
+def task(sessions, ig, clock, key):
+    return connection_task(sessions, ig, clock, key)
 
 
 def headers_for(app, **grants):
@@ -119,6 +127,18 @@ def count_calls(ig, operation):
 def connection(sessions, network="simulation"):
     with sessions() as session:
         return session.scalar(select(Connection).where(Connection.network == network))
+
+
+def current_connection_id(sessions, network="instagram") -> str:
+    with sessions() as session:
+        return session.scalar(select(Connection.id).where(Connection.network == network))
+
+
+def a_connection() -> Connection:
+    """A connection as `make_instagram` reads it: it only needs the row, not the database."""
+    return Connection(
+        id="0ef0f3a2-connection", network="instagram", external_account_id="1784", username="a"
+    )
 
 
 def open_incidents(sessions):
@@ -206,7 +226,9 @@ def test_a_credential_sealed_with_its_network_is_resealed_with_its_row(sessions,
         account.credential_legacy = True
         account_id = account.id
 
-    token, external_id = StoredCredential(sessions, key, "instagram", writes=sessions)()
+    token, external_id = StoredCredential(
+        sessions, key, current_connection_id(sessions), writes=sessions
+    )()
 
     assert (token, external_id) == (PASTED, "1784")
     with sessions() as session:
@@ -270,7 +292,7 @@ def test_a_failed_reseal_leaves_the_token_usable(sessions, key, caplog):
     def locked():
         raise OperationalError("SELECT 1", {}, Exception("database is locked"))
 
-    token, _ = StoredCredential(sessions, key, "instagram", writes=locked)()
+    token, _ = StoredCredential(sessions, key, current_connection_id(sessions), writes=locked)()
 
     assert token == PASTED
     assert "could not re-seal" in caplog.text
@@ -303,9 +325,9 @@ def test_worker_client_uses_the_renewed_token_at_once(real, key, clock, settings
     )
     transport = StubTransport(renewed="second-renewal-not-real")
     worker_client = InstagramClient.from_source(
-        StoredCredential(sessions, key, "instagram"), transport=transport
+        StoredCredential(sessions, key, current_connection_id(sessions)), transport=transport
     )
-    task = ConnectionTask(worker_client, clock, key)
+    task = connection_task(sessions, worker_client, clock, key)
 
     clock.advance(days=11)
     task(sessions)
@@ -323,10 +345,13 @@ def test_real_mode_refuses_to_start_without_the_key(settings, tmp_path, clock):
     )
 
     with pytest.raises(crypto.SecretKeyError, match="secret key file .* is missing"):
-        make_instagram(no_key, clock)
+        make_instagram(no_key, clock, None, a_connection())
 
 
-def test_real_mode_refuses_to_start_without_a_connection(settings, clock):
+def test_a_connection_without_a_credential_raises_not_connected(settings, clock):
+    """A row a draft created before `connect-instagram`: its client refuses before sending."""
+    unreadable = a_connection()
+
     with pytest.raises(NotConnected, match="connect-instagram"):
         make_instagram(
             Settings(
@@ -335,6 +360,8 @@ def test_real_mode_refuses_to_start_without_a_connection(settings, clock):
                 simulation=False,
             ),
             clock,
+            None,
+            unreadable,
         )
 
 
@@ -355,7 +382,7 @@ def test_a_token_too_young_to_renew_is_stored_with_an_estimated_expiry(
     assert PASTED not in caplog.text
 
     # The worker renews it once Meta accepts, well before the estimate runs out.
-    task = ConnectionTask(young, clock, key)
+    task = connection_task(sessions, young, clock, key)
     clock.advance(days=10)
     task(sessions)
     assert len(refreshes) == 2  # the refused one at connect time, then the real renewal
@@ -425,7 +452,7 @@ def test_never_renews_a_credential_younger_than_24_hours(sessions, clock, key, s
     short = FakeInstagram(clock, credential_lifetime=timedelta(days=40))
     connect(sessions, short, PASTED, key, clock.now())
     refreshes = count_calls(short, "refresh_token")
-    task = ConnectionTask(short, clock, key)
+    task = connection_task(sessions, short, clock, key)
 
     for _ in range(23):
         clock.advance(hours=1)
@@ -453,7 +480,7 @@ def test_never_renews_an_expired_credential(sessions, ig, key, clock, task, clie
 def test_never_renews_with_a_key_that_cannot_read_the_credential(sessions, ig, key, clock):
     connect(sessions, ig, PASTED, key, clock.now())
     refreshes = count_calls(ig, "refresh_token")
-    task = ConnectionTask(ig, clock, crypto.secrets.token_bytes(32))
+    task = connection_task(sessions, ig, clock, crypto.secrets.token_bytes(32))
 
     clock.advance(days=11)
     task(sessions)
@@ -479,7 +506,9 @@ def test_real_mode_refuses_to_start_with_a_key_that_does_not_decrypt(real, setti
     other_key_file(settings)  # restored the wrong key, or migrate ran from another directory
 
     with pytest.raises(CredentialUnavailable, match="does not decrypt"):
-        make_instagram(real.state.settings, clock)
+        make_instagram(
+            real.state.settings, clock, None, connection(real.state.sessionmaker, "instagram")
+        )
 
 
 def test_unreadable_credential_is_reported_and_nothing_is_sent(real, key, clock):
@@ -493,20 +522,21 @@ def test_unreadable_credential_is_reported_and_nothing_is_sent(real, key, clock)
 
     def client_with(worker_key):
         return InstagramClient.from_source(
-            StoredCredential(sessions, worker_key, "instagram"), transport=transport
+            StoredCredential(sessions, worker_key, current_connection_id(sessions)),
+            transport=transport,
         )
 
     wrong = crypto.secrets.token_bytes(32)
     with pytest.raises(CredentialUnavailable):
         client_with(wrong).create_container(ContainerRequest(ContainerKind.IMAGE, url="u"))
-    ConnectionTask(client_with(wrong), clock, wrong)(sessions)
+    connection_task(sessions, client_with(wrong), clock, wrong)(sessions)
 
     assert transport.calls == []
     assert open_incidents(sessions) == ["credential_unreadable"]
     account = TestClient(real).get("/v1/account", headers=headers_for(real, account="read"))
     assert account.json()["status"] == "unreadable"
 
-    ConnectionTask(client_with(key), clock, key)(sessions)  # the right key is back
+    connection_task(sessions, client_with(key), clock, key)(sessions)  # the right key is back
     assert connection(sessions, "instagram").status == "ok"
     assert open_incidents(sessions) == []
 
@@ -518,7 +548,7 @@ def test_replacing_the_account_applies_at_once_to_token_and_id(real, key, clock)
     )
     transport = StubTransport()
     worker_client = InstagramClient.from_source(
-        StoredCredential(sessions, key, "instagram"), transport=transport
+        StoredCredential(sessions, key, current_connection_id(sessions)), transport=transport
     )
     worker_client.publish("1")
     connect(

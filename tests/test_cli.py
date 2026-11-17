@@ -1,10 +1,18 @@
 import json
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import inspect
 
-from jorgex_social.cli import main
-from jorgex_social.db import make_engine
+from jorgex_social.account import scope
+from jorgex_social.cli import main, worker_tasks
+from jorgex_social.clock import ManualClock
+from jorgex_social.config import Settings
+from jorgex_social.db import make_engine, make_sessionmaker
+from jorgex_social.instagram import network_for
+from jorgex_social.replies.task import ReplyTask
+
+START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 
 
 def connect_account(settings, monkeypatch) -> None:
@@ -203,22 +211,22 @@ def test_worker_in_real_mode_refuses_to_start_without_the_key(settings, monkeypa
 
 
 def test_the_worker_hands_the_opt_out_words_to_the_reply_task(settings, monkeypatch):
-    class Built(Exception):
-        pass
-
+    """One set of tasks per account, built with the installation's settings."""
     seen = {}
 
-    def reply_task(*args, **kwargs):
-        seen.update(kwargs)
-        raise Built
+    class Recording(ReplyTask):
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+            super().__init__(*args, **kwargs)
 
-    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
-    monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(settings.secret_key_file))
-    monkeypatch.setenv("JORGEX_SOCIAL_OPT_OUT_WORDS", "halt,enough")
-    monkeypatch.setattr("jorgex_social.cli.ReplyTask", reply_task)
-    monkeypatch.setattr("jorgex_social.cli.logs.configure", lambda: None)
+    env_for(monkeypatch, settings, OPT_OUT_WORDS="halt,enough")
+    monkeypatch.setattr("jorgex_social.cli.ReplyTask", Recording)
+    loaded = Settings.from_env()
+    sessions = make_sessionmaker(make_engine(loaded))
+    with sessions() as session, session.begin():
+        scope.current_account(session, network_for(loaded))
 
-    with pytest.raises(Built):
-        main(["worker"])
+    _, accounts = worker_tasks(loaded, ManualClock(START), sessions, None)
+    accounts(sessions)
 
     assert seen["opt_out_words"] == ("halt", "enough")

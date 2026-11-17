@@ -1,6 +1,8 @@
-"""Worker task for automatic replies: polls comments and direct messages and hands them to the
-intake (replies/intake.py, shared with the webhook), sends the replies and purges what is past
-retention.
+"""Worker task for automatic replies: polls one account's comments and direct messages and hands
+them to its intake (replies/intake.py, shared with the webhook), sends its replies and purges what
+is past retention.
+
+One task per account: its client, its intake, its conversations and its caps (decision 10).
 
 Polling runs every `poll_every`; sending runs on every worker pass, so a reply to something the
 webhook recorded goes out within one pass instead of waiting for the next poll.
@@ -20,7 +22,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from jorgex_social.account import incidents, kill_switch, scope
-from jorgex_social.account.models import IncidentType
+from jorgex_social.account.models import Connection, IncidentType
 from jorgex_social.clock import Clock
 from jorgex_social.config import Settings
 from jorgex_social.instagram.errors import (
@@ -94,6 +96,10 @@ class _Send:
 
 
 class ReplyTask:
+    """One account's replies: it polls that account's comments and messages, sends its deliveries
+    and counts its caps. The hourly caps are per account (decision 10), so one account at its cap
+    never holds another's replies back."""
+
     __name__ = "replies"
 
     def __init__(
@@ -101,6 +107,7 @@ class ReplyTask:
         instagram: Instagram,
         clock: Clock,
         *,
+        account_id: str,
         poll_every: timedelta = timedelta(seconds=120),
         hourly_private_cap: int = 500,
         hourly_public_cap: int = 300,
@@ -113,6 +120,7 @@ class ReplyTask:
     ) -> None:
         self.instagram = instagram
         self.clock = clock
+        self.account_id = account_id
         self.poll_every = poll_every
         # Messages have none: Meta allows 100 a second, and the pace limit already holds them.
         self._hourly_caps = {
@@ -124,7 +132,7 @@ class ReplyTask:
         self.cooldown = cooldown
         self.webhook = webhook
         self.intake = Intake(
-            instagram.network, retention=retention, choose=choose, opt_out_words=opt_out_words
+            account_id, retention=retention, choose=choose, opt_out_words=opt_out_words
         )
         self._started = clock.now()
         self._last_poll: datetime | None = None
@@ -158,7 +166,7 @@ class ReplyTask:
 
     def _own_account(self, sessions: sessionmaker) -> str | None:
         with sessions() as session:
-            account = scope.account_of(session, self.instagram.network)
+            account = session.get(Connection, self.account_id)
         return account.external_account_id if scope.connected(account) else None
 
     # Polling
@@ -174,9 +182,7 @@ class ReplyTask:
             step(sessions, own, now)
         except AccountRestricted as exc:
             with sessions() as session, session.begin():
-                account_id = scope.account_id_of(session, self.instagram.network)
-                if account_id is not None:
-                    kill_switch.trip(session, account_id, exc, self.clock.now())
+                kill_switch.trip(session, self.account_id, exc, self.clock.now())
             raise
 
     def poll_comments(self, sessions: sessionmaker, own: str, now: datetime) -> None:
@@ -186,8 +192,7 @@ class ReplyTask:
             if now - m.timestamp < RECENT_MEDIA
         ]
         with sessions() as session:
-            account_id = scope.account_id_of(session, self.instagram.network)
-            named = {r.media_ref for r in active_rules(session, account_id, Channel.COMMENT)}
+            named = {r.media_ref for r in active_rules(session, self.account_id, Channel.COMMENT)}
         # One odd media never stops the others; a failure that affects every call stops the poll.
         for media_ref in recent + sorted(named - {None} - set(recent)):
             try:
@@ -229,7 +234,7 @@ class ReplyTask:
             pending = session.execute(
                 select(Delivery.id, Delivery.action)
                 .where(
-                    Delivery.account_id == scope.account_id_of(session, self.instagram.network),
+                    Delivery.account_id == self.account_id,
                     Delivery.status == DeliveryStatus.PENDING,
                 )
                 .order_by(Delivery.created_at, Delivery.id)
@@ -268,7 +273,7 @@ class ReplyTask:
             select(func.count())
             .select_from(Delivery)
             .where(
-                Delivery.account_id == scope.account_id_of(session, self.instagram.network),
+                Delivery.account_id == self.account_id,
                 Delivery.attempted_at > since,
             )
         )
@@ -441,24 +446,37 @@ class ReplyTask:
     # Retention
 
     def purge(self, sessions: sessionmaker, now: datetime) -> None:
-        """Events and deliveries older than the retention period, and conversations past their
-        `purge_at` that nothing refers to any more. A paused conversation is kept while paused:
-        dropping it would quietly lift the pause."""
+        """Events and deliveries of this account older than the retention period, and its
+        conversations past their `purge_at` that nothing refers to any more. A paused conversation
+        is kept while paused: dropping it would quietly lift the pause. Each account purges its
+        own rows, so a failure here never reaches another account's retention."""
         cutoff = now - self.retention
         with sessions() as session, session.begin():
-            session.execute(delete(Delivery).where(Delivery.created_at < cutoff))
+            session.execute(
+                delete(Delivery).where(
+                    Delivery.account_id == self.account_id, Delivery.created_at < cutoff
+                )
+            )
             session.execute(
                 delete(Event).where(
-                    Event.received_at < cutoff, Event.id.not_in(select(Delivery.event_id))
+                    Event.account_id == self.account_id,
+                    Event.received_at < cutoff,
+                    Event.id.not_in(
+                        select(Delivery.event_id).where(Delivery.account_id == self.account_id)
+                    ),
                 )
             )
             session.execute(
                 delete(Conversation).where(
+                    Conversation.account_id == self.account_id,
                     Conversation.purge_at <= now,
                     Conversation.paused_forever.is_(False),
                     or_(Conversation.paused_until.is_(None), Conversation.paused_until <= now),
                     Conversation.id.not_in(
-                        select(Event.conversation_id).where(Event.conversation_id.is_not(None))
+                        select(Event.conversation_id).where(
+                            Event.account_id == self.account_id,
+                            Event.conversation_id.is_not(None),
+                        )
                     ),
                 )
             )
@@ -471,14 +489,14 @@ class ReplyTask:
         message from that day first. A valid notification closes it (replies/webhook.py); so does
         turning the webhook off."""
         with sessions() as session, session.begin():
-            account = scope.account_of(session, self.instagram.network)
-            account_id = account and account.id
-            if account_id is None:
-                return  # nothing written for this mode yet: no account's incident to open
+            account = session.get(Connection, self.account_id)
+            if account is None:
+                return  # the account is gone: there is no account's incident to open
+            account_id = account.id
             if not self.webhook:
                 incidents.sync(session, account_id, IncidentType.WEBHOOK_SILENT, False, now)
                 return
-            silent_since = (account and account.webhook_notified_at) or self._started
+            silent_since = account.webhook_notified_at or self._started
             if now - silent_since < WEBHOOK_SILENCE:
                 return
             missed = session.scalar(
