@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from fastapi.responses import FileResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy import delete, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from jorgex_social.access.deps import (
@@ -189,7 +189,8 @@ class PostIn(BaseModel):
     # Reels only: shown to non-followers first (see TrialMode).
     trial: TrialMode | None = None
     source_ref: str | None = Field(None, max_length=500)
-    # Sending the same key again returns the post created the first time.
+    # Sending the same key again returns the post created the first time. Unique per account: the
+    # same key in another account is another post.
     idempotency_key: str | None = Field(None, min_length=1, max_length=200)
 
 
@@ -384,11 +385,18 @@ def list_posts(
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
     """Posts, newest first."""
-    query = select(Post).where(Post.account_id == account)
+    # The account, for the network the response names: one query for the page, not one per post.
+    query = (
+        select(Post)
+        .where(Post.account_id == account)
+        .options(joinedload(Post.account))
+        .order_by(Post.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
     if status:
         query = query.where(Post.status == status)
-    posts = session.scalars(query.order_by(Post.created_at.desc()).limit(limit).offset(offset))
-    return [_out(session, post) for post in posts]
+    return [_out(session, post) for post in session.scalars(query)]
 
 
 def next_scheduled(session: Session, account_id: str | None, limit: int) -> list[dict]:
@@ -396,6 +404,7 @@ def next_scheduled(session: Session, account_id: str | None, limit: int) -> list
     query = (
         select(Post)
         .where(Post.account_id == account_id, Post.status == PostStatus.SCHEDULED)
+        .options(joinedload(Post.account))
         .order_by(Post.scheduled_for, Post.id)
         .limit(limit)
     )

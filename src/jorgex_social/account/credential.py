@@ -1,8 +1,13 @@
+import logging
+
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from jorgex_social.account import crypto, scope
 from jorgex_social.account.models import Connection
 from jorgex_social.instagram.errors import CredentialUnavailable
+
+log = logging.getLogger(__name__)
 
 
 def credential_context(connection_id: str) -> str:
@@ -24,11 +29,17 @@ def seal(key: bytes, connection_id: str, token: str) -> bytes:
 def unseal(key: bytes, connection: Connection) -> tuple[str, bool]:
     """The token of `connection` and whether it was sealed with the connection's own context,
     which it is not when it predates the schema being indexed by account. Raises
-    crypto.SecretKeyError if neither context opens it."""
+    crypto.SecretKeyError if neither context opens it.
+
+    The network's context is only tried for a row that says its ciphertext is still sealed with it
+    (`credential_legacy`): otherwise a ciphertext copied to another account of the same network
+    would decrypt there."""
     blob = connection.credential_encrypted
     try:
         return crypto.decrypt(key, blob, credential_context(connection.id)), True
     except crypto.SecretKeyError:
+        if not connection.credential_legacy:
+            raise
         return crypto.decrypt(key, blob, network_context(connection.network)), False
 
 
@@ -82,13 +93,24 @@ class StoredCredential:
         return token, connection.external_account_id
 
     def _reseal(self, connection: Connection, token: str) -> None:
+        """Seals what was read with the connection's own context, best effort: the token is already
+        usable, and a failure here is retried on the next read, which the flag in the row keeps
+        asking for."""
         if self._writes is None:
             return
-        with self._writes() as session, session.begin():
-            stored: Connection | None = session.get(Connection, connection.id)
-            # Only what was read: a credential renewed meanwhile is newer than this plaintext.
-            if (
-                stored is not None
-                and stored.credential_encrypted == connection.credential_encrypted
-            ):
-                stored.credential_encrypted = seal(self._key, stored.id, token)
+        try:
+            with self._writes() as session, session.begin():
+                stored: Connection | None = session.get(Connection, connection.id)
+                # Only what was read: a credential renewed meanwhile is newer than this plaintext,
+                # and it cleared the flag already.
+                if (
+                    stored is not None
+                    and stored.credential_encrypted == connection.credential_encrypted
+                ):
+                    stored.credential_encrypted = seal(self._key, stored.id, token)
+                    stored.credential_legacy = False
+        except SQLAlchemyError as exc:
+            log.warning(
+                "could not re-seal the stored credential; read once more",
+                extra={"error_type": type(exc).__name__},
+            )

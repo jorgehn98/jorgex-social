@@ -14,10 +14,14 @@ one is created for them: that is the simulation, whose rows must never mix with 
 database that prepared posts before connecting anything.
 
 `audit_log` is append-only, so its rows keep `account_id` null: nothing in them says which account
-they were about, and the operator's sign-ins are no account's at all.
+they were about, and the operator's sign-ins are no account's at all. The incident a sign-in opens
+stays without an account too, since only `set-password` or `enroll-totp` close it.
 
-Downgrading is lossless while the installation still has one account per network, which is the case
-until accounts can be connected from the command line (later tasks).
+Downgrading is meant to undo a fresh upgrade, not to run an installation on the old schema again. It
+fails if two accounts (or two modes) share an `idempotency_key`, if two accounts share a network, or
+if both have a post with the same media ref, because the old unique keys were global and per
+network. It cannot re-seal a credential either: one re-sealed with its connection's context after
+the upgrade only opens with `connect-instagram` again, since this schema has no master key.
 """
 
 import json
@@ -104,11 +108,16 @@ def _connection_of(bind, network: str) -> str:
     return connection_id
 
 
-def _fill_from_network(table: str) -> None:
-    op.execute(
+def _fill_from_network(table: str, keep_without_account: str | None = None) -> None:
+    """Gives each row the connection of the network it names. The rows of `keep_without_account`
+    belong to the operator, one for the whole installation, so they stay without an account."""
+    query = (
         f"UPDATE {table} SET account_id = (SELECT id FROM connections c"
         f" WHERE c.network = {table}.network)"
     )
+    if keep_without_account is not None:
+        query += f" WHERE {table}.type <> '{keep_without_account}'"
+    op.execute(query)
 
 
 def _drop_foreign_key(batch_op, table: str) -> None:
@@ -126,13 +135,30 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column("kill_switch_updated_at", jorgex_social.db.UTCDateTime(length=32))
         )
+        batch_op.add_column(
+            sa.Column("credential_legacy", sa.Boolean(), nullable=False, server_default=sa.false())
+        )
         batch_op.drop_constraint("uq_connections_network", type_="unique")
         batch_op.create_unique_constraint(
             "uq_connections_network_external_account_id", ["network", "external_account_id"]
         )
+    # The rows whose ciphertext is still sealed with the network's context: the only ones allowed to
+    # open it, and only until they are sealed again (account/credential.py).
+    op.execute(
+        "UPDATE connections SET credential_legacy = 1 WHERE credential_encrypted IS NOT NULL"
+    )
+
+    # One connection per network with rows, before any row needs its id and before the
+    # installation's switch goes to them.
+    for table in BY_NETWORK:
+        for network in bind.execute(sa.text(f"SELECT DISTINCT network FROM {table}")).scalars():
+            if network is not None:
+                _connection_of(bind, network)
+
     stored = _row(bind, "SELECT value, updated_at FROM settings WHERE key = 'kill_switch'")
     if stored is not None:
-        # It was the installation's switch, so every account that exists had it on or off.
+        # It was the installation's switch, so every account there is, the ones just created too,
+        # had it on or off.
         enabled = json.loads(stored.value) if isinstance(stored.value, str) else bool(stored.value)
         op.execute(
             sa.text(
@@ -140,12 +166,6 @@ def upgrade() -> None:
             ).bindparams(on=enabled, at=stored.updated_at)
         )
     op.execute("DELETE FROM settings WHERE key = 'kill_switch'")
-
-    # One connection per network with rows, before any row needs its id.
-    for table in BY_NETWORK:
-        for network in bind.execute(sa.text(f"SELECT DISTINCT network FROM {table}")).scalars():
-            if network is not None:
-                _connection_of(bind, network)
 
     # Posts: the account indexes them, and the idempotency key is the caller's, not the world's.
     _add_account("posts")
@@ -230,8 +250,22 @@ def upgrade() -> None:
         )
 
     # Incidents: per account, except the operator's own, which is no account's.
+    # Incidents: per account, except the operator's own, which has none. Assigning one to the
+    # connection would leave a sign-in warning that only the credential commands close, and they
+    # close the ones without an account.
     _add_account("channel_incidents")
-    _fill_from_network("channel_incidents")
+    _fill_from_network("channel_incidents", keep_without_account="sign_in_password_accepted")
+    # The old index was per network, so two modes could each hold an open one; this one is per type.
+    # The newest stays open, and the others close when it opened.
+    op.execute(
+        "UPDATE channel_incidents SET closed_at = ("
+        " SELECT max(c.opened_at) FROM channel_incidents c"
+        " WHERE c.type = channel_incidents.type AND c.account_id IS NULL AND c.closed_at IS NULL)"
+        " WHERE account_id IS NULL AND closed_at IS NULL AND id NOT IN ("
+        " SELECT c.id FROM channel_incidents c"
+        " WHERE c.type = channel_incidents.type AND c.account_id IS NULL AND c.closed_at IS NULL"
+        " ORDER BY c.opened_at DESC, c.id DESC LIMIT 1)"
+    )
     with op.batch_alter_table("channel_incidents", schema=None) as batch_op:
         batch_op.drop_index("uq_channel_incidents_open", sqlite_where=sa.text("closed_at IS NULL"))
         batch_op.drop_column("network")
@@ -240,6 +274,13 @@ def upgrade() -> None:
             ["account_id", "type"],
             unique=True,
             sqlite_where=sa.text("closed_at IS NULL"),
+        )
+        # SQLite takes one NULL as different from another, so the operator's need their own.
+        batch_op.create_index(
+            "uq_channel_incidents_operator",
+            ["type"],
+            unique=True,
+            sqlite_where=sa.text("account_id IS NULL AND closed_at IS NULL"),
         )
         batch_op.create_foreign_key(
             "fk_channel_incidents_account_id_connections", "connections", ["account_id"], ["id"]
@@ -316,6 +357,10 @@ def downgrade() -> None:
 
     with op.batch_alter_table("channel_incidents", schema=None) as batch_op:
         batch_op.drop_index("uq_channel_incidents_open", sqlite_where=sa.text("closed_at IS NULL"))
+        batch_op.drop_index(
+            "uq_channel_incidents_operator",
+            sqlite_where=sa.text("account_id IS NULL AND closed_at IS NULL"),
+        )
     # The operator's incidents have no account. The installation's network names them; with no
     # connection at all there is no network to name, and the old schema cannot hold them.
     op.execute(
@@ -398,5 +443,6 @@ def downgrade() -> None:
     with op.batch_alter_table("connections", schema=None, naming_convention=NAMING) as batch_op:
         batch_op.drop_constraint("uq_connections_network_external_account_id", type_="unique")
         batch_op.create_unique_constraint("uq_connections_network", ["network"])
+        batch_op.drop_column("credential_legacy")
         batch_op.drop_column("kill_switch_updated_at")
         batch_op.drop_column("kill_switch")

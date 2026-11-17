@@ -4,7 +4,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from jorgex_social.access.deps import SessionDep, require
 from jorgex_social.access.tokens import Group, Level
@@ -210,7 +210,7 @@ def list_rules(
 ):
     """Rules in the order they are tried: lower priority first, then the oldest. Archived ones
     only with `archived=true`, and then only those."""
-    query = select(Rule).where(Rule.account_id == account)
+    query = select(Rule).where(Rule.account_id == account).options(joinedload(Rule.account))
     query = query.where(Rule.archived_at.is_not(None) if archived else Rule.archived_at.is_(None))
     if channel is not None:
         query = query.where(Rule.channel == channel)
@@ -405,7 +405,7 @@ def list_events(
 ):
     """Comments and messages seen, newest first: identifiers and the rule they fired. Their text
     and usernames are never stored; a comment's author id is kept, but not returned here."""
-    query = select(Event).where(Event.account_id == account)
+    query = select(Event).where(Event.account_id == account).options(joinedload(Event.account))
     if type is not None:
         query = query.where(Event.type == type)
     if rule_id is not None:
@@ -461,7 +461,11 @@ def list_conversations(
     """People who wrote by direct message, most recent first, with their window and pause. A
     person who sent an opt-out word shows as `paused_forever`; the audit log has
     `conversation.opted_out` for them."""
-    query = select(Conversation).where(Conversation.account_id == account)
+    query = (
+        select(Conversation)
+        .where(Conversation.account_id == account)
+        .options(joinedload(Conversation.account))
+    )
     if paused is not None:
         now = request.app.state.clock.now()
         is_paused = Conversation.paused_forever.is_(True) | (Conversation.paused_until > now)

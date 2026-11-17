@@ -80,6 +80,10 @@ class Connection(Base):
     # AES-GCM nonce + ciphertext (account/crypto.py). Never decrypted outside the worker and the
     # connect command. Null in simulation, whose fake needs no credential.
     credential_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    # True while the ciphertext is still sealed with the context of the single-account schema, which
+    # named the network: it is the only row that can open it, and any seal with the row's own
+    # context clears it (account/credential.py). Never set for a row written after 0016.
+    credential_legacy: Mapped[bool] = mapped_column(Boolean, default=False)
     credential_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     # Meta only renews a credential older than 24 hours.
     credential_refreshed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
@@ -113,6 +117,14 @@ class ChannelIncident(Base):
             "type",
             unique=True,
             sqlite_where=text("closed_at IS NULL"),
+        ),
+        # The operator's incidents have no account, and SQLite takes one NULL as different from
+        # another, so they need an index of their own to open only once.
+        Index(
+            "uq_channel_incidents_operator",
+            "type",
+            unique=True,
+            sqlite_where=text("account_id IS NULL AND closed_at IS NULL"),
         ),
     )
 

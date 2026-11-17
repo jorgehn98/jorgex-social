@@ -5,8 +5,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account import appearance, crypto, scope
@@ -28,6 +28,7 @@ from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import AuthError, CredentialUnavailable, Unavailable
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
+from jorgex_social.publishing.models import Post
 
 START = datetime(2026, 10, 29, 12, tzinfo=UTC)
 PASTED = "pasted-token-not-real"
@@ -199,16 +200,42 @@ def test_a_credential_sealed_with_its_network_is_resealed_with_its_row(sessions,
         account = scope.current_account(session, "instagram")
         account.external_account_id = "1784"
         account.credential_encrypted = crypto.encrypt(key, PASTED, network_context("instagram"))
+        account.credential_legacy = True
         account_id = account.id
 
     token, external_id = StoredCredential(sessions, key, "instagram", writes=sessions)()
 
     assert (token, external_id) == (PASTED, "1784")
     with sessions() as session:
-        stored = session.get(Connection, account_id).credential_encrypted
-    assert crypto.decrypt(key, stored, credential_context(account_id)) == PASTED
+        stored = session.get(Connection, account_id)
+    assert crypto.decrypt(key, stored.credential_encrypted, credential_context(account_id)) == (
+        PASTED
+    )
+    assert stored.credential_legacy is False  # the row no longer opens the old context
     with pytest.raises(crypto.SecretKeyError):
-        crypto.decrypt(key, stored, network_context("instagram"))
+        crypto.decrypt(key, stored.credential_encrypted, network_context("instagram"))
+
+
+def test_a_legacy_ciphertext_copied_to_another_account_does_not_decrypt(sessions, key):
+    """Two accounts of one network shared the context before, so a copy would open there: only the
+    row that says it is still sealed with it may try."""
+    with sessions() as session, session.begin():
+        first = scope.current_account(session, "instagram")
+        first.external_account_id = "1784"
+        first.credential_encrypted = crypto.encrypt(key, PASTED, network_context("instagram"))
+        first.credential_legacy = True
+        second = Connection(network="instagram", external_account_id="2048", username="other")
+        session.add(second)
+        session.flush()
+        second.credential_encrypted = first.credential_encrypted
+        second_id = second.id
+
+    with sessions() as session:
+        copied = session.get(Connection, second_id)
+        original = session.get(Connection, first.id)
+    with pytest.raises(crypto.SecretKeyError):
+        unseal(key, copied)  # its own context does not open it, and it is not flagged
+    assert unseal(key, original)[0] == PASTED
 
 
 def test_a_credential_copied_to_another_account_does_not_decrypt(sessions, key):
@@ -226,6 +253,44 @@ def test_a_credential_copied_to_another_account_does_not_decrypt(sessions, key):
         copied = session.get(Connection, second_id)
     with pytest.raises(crypto.SecretKeyError):
         unseal(key, copied)
+
+
+def test_a_failed_reseal_leaves_the_token_usable(sessions, key, caplog):
+    """The read already has the token: losing it because the new context could not be written would
+    stop publishing for a write that is retried on the next read."""
+    with sessions() as session, session.begin():
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.credential_encrypted = crypto.encrypt(key, PASTED, network_context("instagram"))
+        account.credential_legacy = True
+
+    def locked():
+        raise OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+    token, _ = StoredCredential(sessions, key, "instagram", writes=locked)()
+
+    assert token == PASTED
+    assert "could not re-seal" in caplog.text
+    assert PASTED not in caplog.text
+
+
+def test_connecting_fills_the_row_a_draft_created(real, key, clock):
+    """A write before connecting already owns the account of the mode: connecting names that same
+    row, without a second one and without --replace."""
+    sessions = real.state.sessionmaker
+    with sessions() as session, session.begin():
+        account = scope.current_account(session, "instagram")
+        session.add(Post(account_id=account.id, type="image", content_hash="h"))
+        created = account.id
+
+    stored = connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
+    )
+
+    assert stored.id == created
+    assert (stored.external_account_id, stored.username) == ("1784", "account_1784")
+    with sessions() as session:
+        assert session.scalar(select(func.count()).select_from(Connection)) == 1
 
 
 def test_worker_client_uses_the_renewed_token_at_once(real, key, clock, settings):
@@ -566,6 +631,21 @@ def test_checks_at_most_once_an_hour(sessions, ig, clock, task):
     task(sessions)
 
     assert len(checks) == 2
+
+
+def test_one_open_operator_incident_per_cause_is_enforced_by_the_database(sessions, clock):
+    """SQLite takes one NULL as different from another, so the incidents without an account need an
+    index of their own to open only once."""
+
+    def add():
+        with sessions() as session, session.begin():
+            session.add(
+                ChannelIncident(account_id=None, type="sign_in_password_accepted", opened_at=START)
+            )
+
+    add()
+    with pytest.raises(IntegrityError):
+        add()
 
 
 def test_one_open_incident_per_cause_is_enforced_by_the_database(sessions, clock):

@@ -123,6 +123,7 @@ def connect(
         session.flush()
         # Sealed for its row: the context needs the id the flush just gave it.
         connection.credential_encrypted = seal(key, connection.id, stored)
+        connection.credential_legacy = False
         audit.record(
             session,
             now,
@@ -270,6 +271,7 @@ class ConnectionTask:
                 )
                 return True
             connection.credential_encrypted = seal(self.key, connection.id, renewal.access_token)
+            connection.credential_legacy = False
             connection.credential_expires_at = now + renewal.expires_in
             connection.credential_refreshed_at = now
             audit.record(
