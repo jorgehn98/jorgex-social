@@ -551,6 +551,8 @@ def test_a_fresh_install_gains_no_connection(settings):
 
 
 def test_it_stops_when_two_accounts_could_own_the_credentials(settings):
+    """Ambiguity stops the migration before it touches the schema, so it can run again once the
+    operator has chosen: here, by removing one of the two connections."""
     config = _downgrade_to_before_the_credentials_have_one(settings)
     with sqlite3.connect(settings.database_path) as db:
         for account in ("one", "two"):
@@ -563,6 +565,78 @@ def test_it_stops_when_two_accounts_could_own_the_credentials(settings):
 
     with pytest.raises(RuntimeError, match="cannot tell which account"):
         command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert db.execute("SELECT count(*) FROM connections").fetchone() == (2,)
+        for table in ("api_tokens", "oauth_grants"):
+            assert "account_id" not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        db.execute("DELETE FROM connections WHERE id = 'two'")
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert _account_of_each_credential(db) == {"token": "one", "grant": "one"}
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_the_audit_log_keeps_the_accounts_past(settings):
+    """Historical entries that are an account's get it, so a token reads what happened before the
+    upgrade; the operator's own stay without one. The log is still append-only."""
+    config = _downgrade_to_before_the_credentials_have_one(settings)
+    with sqlite3.connect(settings.database_path) as db:
+        db.execute(
+            "INSERT INTO connections (id, network, external_account_id, username, status)"
+            " VALUES ('only', 'instagram', '1784', 'account', 'ok')"
+        )
+        _credential_rows(db)
+        for entry_id, actor, action in (
+            ("published", "system", "post.published"),
+            ("archived", "token", "rule.archived"),
+            ("sign-in", "operator", "operator.login"),
+            ("settings", "operator", "appearance.updated"),
+        ):
+            db.execute(
+                "INSERT INTO audit_log (id, occurred_at, actor_type, action, outcome)"
+                " VALUES (?, '2026-11-01T00:00:00.000000+00:00', ?, ?, 'ok')",
+                (entry_id, actor, action),
+            )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        named = dict(db.execute("SELECT id, account_id FROM audit_log").fetchall())
+        assert named == {
+            "published": "only",
+            "archived": "only",
+            "sign-in": None,
+            "settings": None,
+        }
+        # Still append-only, with the trigger back exactly as 0016 left it.
+        for statement in ("UPDATE audit_log SET outcome = 'ok'", "DELETE FROM audit_log"):
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                db.execute(statement)
+
+    # And the past reaches the token of that account through the API.
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from jorgex_social.access.tokens import create_token
+    from jorgex_social.api import create_app
+    from jorgex_social.db import make_engine, make_sessionmaker
+
+    # The account is a real one, so the service runs in real mode: a token of the other mode is
+    # refused (access/deps.py).
+    app = create_app(replace(settings, simulation=False))
+    with make_sessionmaker(make_engine(settings))() as session, session.begin():
+        _, secret = create_token(session, "history-reader", {"account": "read"}, "only")
+    entries = (
+        TestClient(app)
+        .get("/v1/account/audit", headers={"Authorization": f"Bearer {secret}"})
+        .json()
+    )
+
+    assert {entry["action"] for entry in entries} == {"post.published", "rule.archived"}
 
 
 def test_downgrading_gives_the_account_column_back(settings):

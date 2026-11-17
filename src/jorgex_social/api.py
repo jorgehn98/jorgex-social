@@ -73,16 +73,19 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     @app.get("/v1/token", tags=["access"])
     def whoami(token: TokenDep, session: ReadSessionDep) -> dict:
         """What the calling token is allowed to do and which account it works on, so an agent can
-        check before acting. It can reach that account and no other."""
+        check before acting. It can reach that account and no other. `account.id` is the account's
+        id on the network, as `GET /v1/account` reports it (null before connecting);
+        `account.connection_id` is the id this installation gives it."""
         account = session.get_one(Connection, token.account_id)
         return {
             "name": token.name,
             "prefix": token.prefix,
             "permissions": token.permissions,
             "account": {
-                "id": account.id,
+                "id": account.external_account_id or None,
                 "network": account.network,
                 "username": account.username,
+                "connection_id": account.id,
             },
         }
 

@@ -273,10 +273,14 @@ def tool_definitions(api: Api) -> list[tuple[str, str, Callable[..., str], ToolA
     # access
 
     def get_token() -> str:
-        """The account this token works on (its id in this service, its network and the account's
-        username) and what it may do: its permissions per group (posts, scheduling, stats,
-        account, rules, events), each deny, read or write. No other account is reachable with it.
-        Call it first; a tool whose group is not granted at its level fails with forbidden."""
+        """The account this token works on and what it may do. `account.id` is the account's id on
+        the network (the same one `get_account` reports, null until it is connected),
+        `account.connection_id` the id this installation gives it, with its username and network.
+        No other account is reachable with it. `permissions` gives the level of each group (posts,
+        scheduling, stats, account, rules, events): deny, read or write. Call it first; a tool
+        whose group is not granted at its level fails with forbidden, and a token of the other
+        mode (simulation against a real service, or the other way round) fails with
+        account_in_other_mode."""
         return call("GET", "/v1/token")
 
     # posts

@@ -30,6 +30,7 @@ from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
 from jorgex_social.oauth import store
 from jorgex_social.oauth.models import OAuthGrant, OAuthToken
+from jorgex_social.publishing.models import Media
 from jorgex_social.ui.routes import COOKIE
 
 PUBLIC = "http://localhost"
@@ -42,6 +43,7 @@ ALL_DENIED = {g: "deny" for g in ("posts", "scheduling", "rules", "events", "sta
 # The account a client is allowed over: the simulated one, with the id the fake reports.
 ACCOUNT = "simulated_account"
 ACCOUNT_ID = "17841400000000000"
+JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
 
 
 @pytest.fixture
@@ -656,10 +658,13 @@ def test_the_answer_names_the_account_the_grant_works_on(app, agent, browser):
 
     with app.state.read_sessionmaker() as session:
         assert session.scalar(select(OAuthGrant.account_id)) == second
-    assert api(agent, tokens["access_token"]).json()["account"]["id"] == second
+    shown_account = api(agent, tokens["access_token"]).json()["account"]
+    assert shown_account["connection_id"] == second
     # A second consent of the same client, on the other account, is another grant.
     _, second_client = connect(agent, browser, stats="read")
-    assert api(agent, second_client["access_token"]).json()["account"]["id"] == account_id(app)
+    assert api(agent, second_client["access_token"]).json()["account"]["connection_id"] == (
+        account_id(app)
+    )
 
 
 def test_a_grant_of_one_account_sees_nothing_of_the_other(app, agent, browser):
@@ -673,6 +678,94 @@ def test_a_grant_of_one_account_sees_nothing_of_the_other(app, agent, browser):
 
     assert mine == []
     assert api(agent, tokens["access_token"], f"/v1/posts/{theirs['id']}").status_code == 404
+
+
+def test_a_grant_of_the_other_mode_is_refused(app, agent, browser):
+    """A grant on the account of the other mode cannot write what the worker never sweeps: the
+    API refuses it with account_in_other_mode, as it does for an API token."""
+    with app.state.sessionmaker() as session, session.begin():
+        other_mode = Connection(
+            id="other-mode",
+            network="instagram",  # the service runs in simulation
+            external_account_id="1784real",
+            username="real_account",
+            account_type="BUSINESS",
+        )
+        session.add(other_mode)
+        _, secret = create_token(session, "real-agent", {"posts": "write"}, other_mode.id)
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+    fields["account_id"] = other_mode.id
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    tokens = exchange(agent, client_id, code, verifier).json()
+
+    # Both credentials say which account they work on, and this one is of the other mode.
+    for response in (api(agent, tokens["access_token"]), api(agent, secret)):
+        assert response.json()["account"]["network"] == "instagram"
+    for response in (
+        api(agent, tokens["access_token"], "/v1/posts"),
+        api(agent, secret, "/v1/posts"),
+    ):
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "account_in_other_mode"
+    # A credential of this mode works, so the refusal is about the mode and not everything.
+    _, mine = connect(agent, browser, posts="read")
+    assert api(agent, mine["access_token"], "/v1/posts").status_code == 200
+
+
+def test_the_code_needs_its_account_still_connected(app, agent, browser):
+    """Between the consent page and the exchange the account may go away: the client gets a new
+    code through consent instead of a grant that cannot be stored."""
+    second = add_account(app, "second_account")
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+    fields["account_id"] = second
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    with app.state.sessionmaker() as session, session.begin():
+        session.get(Connection, second).external_account_id = ""  # disconnected
+
+    response = exchange(agent, client_id, code, verifier)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_grant"
+    assert rows(app, "SELECT count(*) FROM oauth_grants") == [(0,)]
+
+
+def test_a_remote_upload_lands_on_the_account_of_its_grant(app, agent, browser):
+    """A one-use upload URL carries the grant, so the file belongs to that grant's account and no
+    other account can put it in a post."""
+    second = add_account(app, "second_account")
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+    fields["account_id"] = second
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    tokens = exchange(agent, client_id, code, verifier).json()
+    access = tokens["access_token"]
+
+    issued = api(agent, access, "/v1/upload-urls", "POST").json()
+    uploaded = agent.post(urlsplit(issued["url"]).path, content=JPEG)
+    assert uploaded.status_code == 201
+    media = uploaded.json()
+
+    with app.state.read_sessionmaker() as session:
+        assert session.scalar(select(Media.account_id).where(Media.id == media["id"])) == second
+    # The other account's credential cannot use it, in a post or as a cover.
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "first-agent", {"posts": "write"}, account_id(app))
+    others = agent.post(
+        "/v1/posts",
+        json={"type": "image", "items": [media["id"]], "cover_media_id": media["id"]},
+        headers={"authorization": f"Bearer {secret}"},
+    )
+    assert others.status_code == 422
+    assert others.json()["detail"]["code"] == "unknown_media"
+    # Its own account writes the post with it.
+    mine = api(agent, access, "/v1/posts", "POST", json={"type": "image", "items": [media["id"]]})
+    assert mine.status_code == 201
+    assert mine.json()["items"] == [media["id"]]
 
 
 def test_a_forged_account_is_refused_and_grants_nothing(app, agent, browser):

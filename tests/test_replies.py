@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account import kill_switch, scope
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import AuditEntry, ChannelIncident
+from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.client import InstagramClient
@@ -1785,16 +1785,19 @@ def test_a_timed_pause_cannot_lift_an_opt_out(client, headers, ig, sessions, tas
 
 
 def test_each_account_sees_only_its_own_events_deliveries_and_conversations(app, client, headers):
-    """The simulation and the real account have one of each, and neither lists the other's.
-
-    The account decides what a call sees, not the mode of the installation: a token of the
-    simulated account never reaches the real one's rows, and the other way round (SC-06)."""
+    """Two accounts of the installation have one event, a delivery and a conversation each, and no
+    credential lists the other's: the account, not the installation, decides what a call sees."""
     with app.state.sessionmaker() as session, session.begin():
-        for network, person in (("simulation", "person-simulated"), ("instagram", "person-real")):
-            account = scope.current_account(session, network)
+        mine = scope.current_account(session, app.state.network)
+        other = Connection(
+            network=app.state.network, external_account_id="1784other", username="other_account"
+        )
+        session.add(other)
+        session.flush()
+        for account, name in ((mine, "mine"), (other, "other")):
             conversation = Conversation(
                 account_id=account.id,
-                external_id=person,
+                external_id=f"person-{name}",
                 last_user_message_at=START,
                 window_until=START,
                 paused_forever=False,
@@ -1804,7 +1807,7 @@ def test_each_account_sees_only_its_own_events_deliveries_and_conversations(app,
             )
             rule = Rule(
                 account_id=account.id,
-                name=person,
+                name=name,
                 channel="message",
                 priority=1,
                 active=True,
@@ -1817,7 +1820,7 @@ def test_each_account_sees_only_its_own_events_deliveries_and_conversations(app,
             event = Event(
                 account_id=account.id,
                 type="message",
-                external_ref=f"message-{network}",
+                external_ref=f"message-{name}",
                 conversation_id=conversation.id,
                 occurred_at=START,
                 received_at=START,
@@ -1836,26 +1839,23 @@ def test_each_account_sees_only_its_own_events_deliveries_and_conversations(app,
                     created_at=START,
                 )
             )
-
-        # A second token, on the other account: what an installation with both connected has.
-        real_account = scope.current_account(session, "instagram")
-        _, real_secret = create_token(
-            session, "real-agent", {"rules": "read", "events": "read"}, real_account.id
+        _, other_secret = create_token(
+            session, "other-agent", {"rules": "read", "events": "read"}, other.id
         )
-    other = {"Authorization": f"Bearer {real_secret}"}
+    theirs = {"Authorization": f"Bearer {other_secret}"}
 
-    for token in (headers, other):
+    for token in (headers, theirs):
         for resource in ("events", "deliveries", "conversations"):
             assert len(client.get(f"/v1/{resource}", headers=token).json()) == 1, resource
     assert [e["external_ref"] for e in client.get("/v1/events", headers=headers).json()] == [
-        "message-simulation"
+        "message-mine"
     ]
-    assert [e["external_ref"] for e in client.get("/v1/events", headers=other).json()] == [
-        "message-instagram"
+    assert [e["external_ref"] for e in client.get("/v1/events", headers=theirs).json()] == [
+        "message-other"
     ]
     assert [c["external_id"] for c in client.get("/v1/conversations", headers=headers).json()] == [
-        "person-simulated"
+        "person-mine"
     ]
-    assert [c["external_id"] for c in client.get("/v1/conversations", headers=other).json()] == [
-        "person-real"
+    assert [c["external_id"] for c in client.get("/v1/conversations", headers=theirs).json()] == [
+        "person-other"
     ]

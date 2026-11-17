@@ -59,14 +59,15 @@ def test_create_token_accepts_the_account_id(settings, monkeypatch, capsys):
     capsys.readouterr()
 
     main(["create-token", "--name", "agent", "--account", "simulated_account"])
-    account_id = json.loads(capsys.readouterr().out)["account"]["id"]
+    account_id = json.loads(capsys.readouterr().out)["account"]["connection_id"]
     main(["create-token", "--name", "reader", "--account", account_id])
 
     listed = json.loads(capsys.readouterr().out)
-    assert listed["account"]["id"] == account_id
+    assert listed["account"]["connection_id"] == account_id
     main(["list-tokens"])
     tokens = {token["name"]: token for token in json.loads(capsys.readouterr().out)}
     assert tokens["reader"]["account"] == "simulated_account"
+    assert tokens["reader"]["account_id"] == account_id
 
 
 def test_migrate_creates_schema_from_scratch(tmp_path, monkeypatch):

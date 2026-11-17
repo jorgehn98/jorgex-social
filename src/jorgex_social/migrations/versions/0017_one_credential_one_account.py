@@ -7,11 +7,18 @@ Create Date: 2026-11-17 12:00:00.000000
 Every API token and every OAuth grant gains the one account it works on, required: the API takes
 the account of a call from its credential and from nothing else (decision 10). Existing credentials
 get the installation's account: the only connection there is, or the one that is not the
-simulation's. A database with no connection at all gets the one a first write would have created,
-which owns what it writes until `connect-instagram` fills it.
+simulation's. A database with credentials and no connection at all gets the one a first write would
+have created, which owns what it writes until `connect-instagram` fills it: that account has no
+external id, and since it is an `instagram` row, a simulation service refuses its tokens
+(`account_in_other_mode`, access/deps.py) until the account is connected.
+
+The audit log keeps the past readable: the rows that are an account's get it too, so a token of
+that account sees what happened before the upgrade. The operator's own entries (sign-ins, Settings,
+the connection commands) stay without an account, as they are no account's.
 
 When the credentials of one database point at more than one account (several connections, none of
-them the simulation's), there is no right answer and the migration stops instead of guessing.
+them the simulation's), there is no right answer and the migration stops without touching the
+schema, so it can run again once the ambiguity is gone.
 """
 
 import uuid
@@ -33,6 +40,8 @@ REAL_NETWORK = "instagram"
 SIMULATION_NETWORK = "simulation"
 # The tables that gain an account: one credential, one account.
 CREDENTIALS = ("api_tokens", "oauth_grants")
+# actor_type of the entries that are no account's (account/models.py:ActorType).
+OPERATOR_ACTOR = "operator"
 
 
 def _scalar(bind, sql: str, **params):
@@ -53,12 +62,13 @@ def _new_account(bind) -> str:
     return connection_id
 
 
-def _the_account(bind) -> str:
-    """The account every existing credential goes to: the only connection there is, or the one
-    that is not the simulation's, or a new one when there is no connection at all."""
+def _unambiguous_account(bind) -> str | None:
+    """The account a rule can name without guessing: the only connection there is, or the only one
+    that is not the simulation's. None when there is no connection at all; RuntimeError when there
+    are several candidates, before anything is written, so the migration can run again."""
     connections = bind.execute(sa.text("SELECT id, network FROM connections ORDER BY id")).all()
     if not connections:
-        return _new_account(bind)
+        return None
     if len(connections) == 1:
         return connections[0].id
     real = [connection.id for connection in connections if connection.network != SIMULATION_NETWORK]
@@ -69,6 +79,12 @@ def _the_account(bind) -> str:
         f"and {len(real)} of them not the simulation's. Bind them by hand and run this migration "
         "again."
     )
+
+
+def _the_account(bind) -> str:
+    """The account every existing credential goes to, created when the database has none: the
+    account a first write would have made."""
+    return _unambiguous_account(bind) or _new_account(bind)
 
 
 def _add_account(table: str) -> None:
@@ -84,6 +100,26 @@ def _fill(table: str, account_id: str) -> None:
         raise RuntimeError(f"{table} has {leftover} rows without an account")
 
 
+def _fill_audit(account_id: str) -> None:
+    """The historical entries that are an account's get it: otherwise a token would read nothing
+    older than this upgrade. The operator's own stay null (they are no account's), and so do the
+    ones already named.
+
+    The log is append-only through database triggers, so the one that refuses UPDATE is dropped
+    for this statement and recreated exactly as 0016 left it."""
+    op.execute("DROP TRIGGER IF EXISTS audit_log_no_update")
+    op.execute(
+        sa.text(
+            "UPDATE audit_log SET account_id = :account"
+            " WHERE account_id IS NULL AND actor_type != :operator"
+        ).bindparams(account=account_id, operator=OPERATOR_ACTOR)
+    )
+    op.execute(
+        "CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log "
+        "BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END"
+    )
+
+
 def _require(batch_op, table: str) -> None:
     batch_op.alter_column("account_id", existing_type=UUID, nullable=False)
     batch_op.create_foreign_key(
@@ -93,13 +129,20 @@ def _require(batch_op, table: str) -> None:
 
 def upgrade() -> None:
     bind = op.get_bind()
+    # Before any DDL: an ambiguous database stops here, with the schema still at 0016, so the
+    # migration can run again once the operator has chosen.
+    unresolved = _unambiguous_account(bind)
+    credentials = any(_scalar(bind, f"SELECT count(*) FROM {table}") for table in CREDENTIALS)
+    account = _the_account(bind) if credentials else unresolved
     for table in CREDENTIALS:
         _add_account(table)
-    # A fresh install has no credential to bind, and must not gain a connection it never made.
-    if any(_scalar(bind, f"SELECT count(*) FROM {table}") for table in CREDENTIALS):
-        account = _the_account(bind)
+    if credentials:
         for table in CREDENTIALS:
             _fill(table, account)
+    # A fresh install has no credential and no connection: it gains neither, and nothing to name
+    # the audit rows with.
+    if account is not None:
+        _fill_audit(account)
     for table in CREDENTIALS:
         with op.batch_alter_table(table, schema=None) as batch_op:
             _require(batch_op, table)

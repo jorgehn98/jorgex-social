@@ -514,7 +514,7 @@ def test_delete_unknown_or_already_deleted_is_404(client, headers):
     client.delete(f"/v1/posts/{post['id']}", headers=headers)
 
     # A post of another account is the same answer: this file checks the unknown ones, and
-    # tests/test_accounts.py the other account's.
+    # tests/test_isolation.py the other account's.
     for post_id in ("nope", post["id"]):
         response = client.delete(f"/v1/posts/{post_id}", headers=headers)
         assert response.status_code == 404

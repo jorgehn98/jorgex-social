@@ -123,20 +123,49 @@ def require_outside_transaction(group: Group, level: Level) -> Callable[[Princip
     return require(group, level)
 
 
-def current_account_id(token: TokenDep) -> str:
-    """The account the caller works on: the token's, or the one its OAuth grant was given. Every
-    row of the domain belongs to one account, and the account comes from the credential alone:
-    never from the body, the query or a header, so no client can choose or mix up another
-    (decision 10)."""
+def _require_mode(request: Request, network: str) -> None:
+    """An account of the other mode is refused, before anything is read or written with it: in
+    simulation only the fake account exists and in real mode only a real one, so a token of the
+    other mode could schedule what no worker sweeps (T03 makes the worker per connection). Its own
+    network and the service's mode are all the answer says: nothing of another account."""
+    if network != request.app.state.network:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "account_in_other_mode",
+                "message": (
+                    f"This token works on an account of the {network} mode and this service runs "
+                    f"in {request.app.state.network}. Ask the operator for a token of an account "
+                    "of this mode."
+                ),
+            },
+        )
+
+
+def current_account_id(request: Request, token: TokenDep) -> str:
+    """The id of the account the caller works on: the token's, or the one its OAuth grant was
+    given. Every row of the domain belongs to one account, and the account comes from the
+    credential alone: never from the body, the query or a header, so no client can choose or mix
+    up another (decision 10).
+
+    The row is read in a short read transaction of its own, never the request's: an upload must not
+    hold the database write lock while its body streams in."""
+    with request.app.state.read_sessionmaker() as session, session.begin():
+        account = session.get_one(Connection, token.account_id)
+        network = account.network
+    _require_mode(request, network)
     return token.account_id
 
 
 AccountIdDep = Annotated[str, Depends(current_account_id)]
 
 
-def current_account(token: TokenDep, session: SessionDep) -> Connection:
-    """The connection of the account the caller works on. The foreign key guarantees the row."""
-    return session.get_one(Connection, token.account_id)
+def current_account(request: Request, token: TokenDep, session: SessionDep) -> Connection:
+    """The connection of the account the caller works on, in the request's transaction, for what
+    changes it. The foreign key guarantees the row."""
+    account = session.get_one(Connection, token.account_id)
+    _require_mode(request, account.network)
+    return account
 
 
 AccountDep = Annotated[Connection, Depends(current_account)]

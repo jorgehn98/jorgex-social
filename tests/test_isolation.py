@@ -14,7 +14,7 @@ from sqlalchemy import select
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
 from jorgex_social.publishing.models import Media
-from jorgex_social.replies.models import Conversation, Event
+from jorgex_social.replies.models import Conversation, Delivery, Event, Rule
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot, RecentMedia
 
 NOW = datetime(2026, 11, 17, 12, tzinfo=UTC)
@@ -42,9 +42,11 @@ class Accounts:
 
 @pytest.fixture
 def accounts(app) -> Accounts:
+    """Two accounts of the service's own mode: an account of the other one is refused before any
+    data is touched (account_in_other_mode), so isolation is what is left to check here."""
     with app.state.sessionmaker() as session, session.begin():
-        a = Connection(network="instagram", external_account_id="1784a", username="account_a")
-        b = Connection(network="instagram", external_account_id="1784b", username="account_b")
+        a = Connection(network=app.state.network, external_account_id="1784a", username="account_a")
+        b = Connection(network=app.state.network, external_account_id="1784b", username="account_b")
         session.add_all([a, b])
         session.flush()
         _, secret_a = create_token(session, "agent-a", ALL, a.id)
@@ -73,11 +75,13 @@ def test_each_token_reports_and_works_on_its_own_account(client, accounts):
     b = client.get("/v1/token", headers=accounts.b_headers).json()
 
     assert a["account"] == {
-        "id": accounts.a.id,
-        "network": "instagram",
+        "id": "1784a",
+        "network": "simulation",
         "username": "account_a",
+        "connection_id": accounts.a.id,
     }
-    assert b["account"]["id"] == accounts.b.id
+    assert b["account"]["connection_id"] == accounts.b.id
+    assert b["account"]["id"] == "1784b"
     assert client.get("/v1/account", headers=accounts.a_headers).json()["account"]["username"] == (
         "account_a"
     )
@@ -102,7 +106,7 @@ def test_the_account_never_comes_from_the_request(client, accounts):
     asking = {
         "account": accounts.b.id,
         "account_id": accounts.b.id,
-        "network": "instagram",
+        "network": "simulation",
         "username": "account_b",
     }
 
@@ -236,6 +240,16 @@ def test_rules_of_one_account_never_appear_in_the_other(client, accounts):
 def test_events_and_conversations_are_the_accounts_own(app, client, accounts):
     with app.state.sessionmaker() as session, session.begin():
         for account, person in ((accounts.a, "person_a"), (accounts.b, "person_b")):
+            rule = Rule(
+                account_id=account.id,
+                name=person,
+                channel="message",
+                priority=1,
+                active=True,
+                content={"keywords": ["hola"], "private_replies": ["Hi"]},
+                created_at=NOW,
+                updated_at=NOW,
+            )
             conversation = Conversation(
                 account_id=account.id,
                 external_id=person,
@@ -245,16 +259,27 @@ def test_events_and_conversations_are_the_accounts_own(app, client, accounts):
                 updated_at=NOW,
                 purge_at=NOW + timedelta(days=30),
             )
-            session.add(conversation)
+            session.add_all([rule, conversation])
+            session.flush()
+            event = Event(
+                account_id=account.id,
+                type="message",
+                external_ref=f"event_{person}",
+                conversation_id=conversation.id,
+                occurred_at=NOW,
+                received_at=NOW,
+            )
+            session.add(event)
             session.flush()
             session.add(
-                Event(
+                Delivery(
                     account_id=account.id,
-                    type="message",
-                    external_ref=f"event_{person}",
-                    conversation_id=conversation.id,
-                    occurred_at=NOW,
-                    received_at=NOW,
+                    event_id=event.id,
+                    rule_id=rule.id,
+                    action="message",
+                    status="sent",
+                    text="Hola",
+                    created_at=NOW,
                 )
             )
 
@@ -262,7 +287,10 @@ def test_events_and_conversations_are_the_accounts_own(app, client, accounts):
     a_people = client.get("/v1/conversations", headers=accounts.a_headers).json()
     assert [e["external_ref"] for e in a_events] == ["event_person_a"]
     assert [c["external_id"] for c in a_people] == ["person_a"]
-    assert client.get("/v1/deliveries", headers=accounts.a_headers).json() == []
+    a_replies = client.get("/v1/deliveries", headers=accounts.a_headers).json()
+    b_replies = client.get("/v1/deliveries", headers=accounts.b_headers).json()
+    assert [d["event_id"] for d in a_replies] == [a_events[0]["id"]]
+    assert len(b_replies) == 1 and b_replies[0]["id"] != a_replies[0]["id"]
 
     b_people = client.get("/v1/conversations", headers=accounts.b_headers).json()
     response = client.post(
@@ -388,7 +416,7 @@ def test_incidents_are_the_accounts_own(app, client, accounts):
 
     a_incidents = client.get("/v1/account/incidents", headers=accounts.a_headers).json()
     assert [i["type"] for i in a_incidents] == ["publish_unresolved"]
-    assert a_incidents[0]["network"] == "instagram"
+    assert a_incidents[0]["network"] == "simulation"
     # The installation's own incident, which the operator sees in the web interface.
     assert "sign_in_password_accepted" not in str(a_incidents)
     for name in ("theirs", "operator"):

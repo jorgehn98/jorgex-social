@@ -67,8 +67,9 @@ def parse_grants(values: list[str]) -> dict[str, str]:
 
 
 def token_account(session, value: str) -> Connection:
-    """The connected account `value` names: its username, or its id as list-tokens shows it. A
-    token works on one account and cannot be moved, so an install connects the account first."""
+    """The connected account `value` names: its username, or its `account_id` as list-tokens shows
+    it. A token works on one account and cannot be moved, so an install connects the account
+    first."""
     accounts = scope.connected_accounts(session)
     if not accounts:
         raise TokenError(
@@ -91,9 +92,10 @@ def cmd_create_token(args: argparse.Namespace, settings: Settings) -> None:
         result = {
             "name": token.name,
             "account": {
-                "id": account.id,
+                "id": account.external_account_id or None,
                 "network": account.network,
                 "username": account.username,
+                "connection_id": account.id,
             },
             "permissions": token.permissions,
             "token": secret,
@@ -113,11 +115,13 @@ def cmd_list_tokens(_: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
         # The account each token works on: with two accounts, a token's name alone no longer says.
+        # `account_id` is the value `create-token --account` takes; the username is easier to read.
         accounts = {c.id: c for c in session.scalars(select(Connection))}
         tokens = [
             {
                 "name": t.name,
-                "account": accounts[t.account_id].username,
+                "account": accounts[t.account_id].username if t.account_id in accounts else None,
+                "account_id": t.account_id,
                 "prefix": t.prefix,
                 "permissions": t.permissions,
                 "created_at": t.created_at.isoformat(),
@@ -328,10 +332,11 @@ def build_parser() -> argparse.ArgumentParser:
     token.add_argument(
         "--account",
         required=True,
-        metavar="USERNAME|ID",
+        metavar="USERNAME|ACCOUNT_ID",
         help=(
-            "the connected account the token works on, by username or by id (list-tokens shows "
-            "both); a token can reach that account only"
+            "the connected account the token works on: its username, or its account_id (the "
+            "connection's id), exactly as list-tokens shows them; a token can reach that account "
+            "only"
         ),
     )
     token.add_argument(

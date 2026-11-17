@@ -316,9 +316,10 @@ def exchange_code(session: Session, code: str, client_id: str, now: datetime) ->
         raise Invalid
     if found.used_at is not None:
         raise Replayed
-    # A code answered before a credential had an account carries none: it cannot name one, and
-    # the client gets a new code through consent rather than a grant that works on nothing.
-    if found.params.get("account_id") is None:
+    # The account chosen on the consent page must still be a connected one: the operator may have
+    # disconnected it meanwhile, and a grant on a row that is gone would fail on its foreign key.
+    account_id = found.params.get("account_id")
+    if account_id not in {account.id for account in scope.connected_accounts(session)}:
         raise Invalid
     found.used_at = now
     grant = OAuthGrant(
@@ -326,7 +327,7 @@ def exchange_code(session: Session, code: str, client_id: str, now: datetime) ->
         client_id=client_id,
         # Chosen on the consent page and carried by the code: every token of the grant works on
         # that account and no other.
-        account_id=found.params["account_id"],
+        account_id=account_id,
         permissions=found.permissions,
         resource=found.params["resource"],
         created_at=now,
@@ -502,7 +503,8 @@ def list_grants(session: Session) -> list[dict[str, Any]]:
             "id": grant.id,
             "client_id": grant.client_id,
             "client_name": name,
-            "account": {"id": grant.account_id, "username": account},
+            "account": account,
+            "account_id": grant.account_id,
             "permissions": grant.permissions,
             "created_at": grant.created_at.isoformat(),
             "expires_at": grant_end(grant).isoformat(),

@@ -122,7 +122,9 @@ Most agent clients take a JSON entry like this one (the exact file and key depen
 ```
 
 Give the agent its own token with only the groups it needs, for the account it should work on: that
-token reaches that account and no other, and `GET /v1/token` says which one. The URL must use HTTPS
+token reaches that account and no other, and `GET /v1/token` says which one (`account.id` is the
+account's id on the network, `account.connection_id` the one this installation gives it). A token
+of the simulated account is refused by a service in real mode, and the other way round. The URL must use HTTPS
 unless the API is on the same machine (`localhost`, `127.0.0.0/8` or `::1`): the token travels in
 every request. With the recommended proxy the API is not public, so `http://localhost:8000` goes
 through the SSH tunnel described in [INSTALL.md](INSTALL.md#reverse-proxy).

@@ -69,8 +69,11 @@ docker compose exec api jorgex-social create-token --name my-agent --account sim
 curl -H "Authorization: Bearer jxs_your_token_here" http://127.0.0.1:8000/v1/token
 ```
 
-`--account` takes the account's username or its id, as `list-tokens` shows them; with more than one
-account connected, create one token per account. The token is printed once and works on that account
+`--account` takes the account's username or its `account_id` (the connection's id), as
+`list-tokens` shows them; with more than one account connected, create one token per account. A
+token works only in the mode of its account: a service in real mode refuses a token of the
+simulated account with `account_in_other_mode`, and the other way round, because the worker only
+publishes to the accounts of its own mode. Create a token per mode instead of reusing one. The token is printed once and works on that account
 alone. `jorgex-social list-tokens` and `revoke-token --name ...` manage them the same way. The API
 reference is at `/docs` in simulation; in real mode it answers 404 unless
 `JORGEX_SOCIAL_API_DOCS=true`.
@@ -638,6 +641,13 @@ docker compose down && docker compose up -d --build
 
 Then run the real-address check in [Reverse proxy](#reverse-proxy) before relying on the sign-in
 limits.
+
+A token that existed before the version that bound each one to an account is bound to the
+installation's account by that upgrade. If the database had no connection at all (a simulation
+install that created a token before connecting anything), that account was never connected: it
+still belongs to the `instagram` mode, so a service in simulation refuses its tokens with
+`account_in_other_mode`. Run `connect-instagram` in simulation (any placeholder token is accepted)
+and create a new token for the account `list-tokens` then shows.
 
 Compose stops the old worker before it replaces `api`, so the new version migrates with no worker
 running, and starts the new worker once `api` is healthy again. On stop, the worker finishes the
