@@ -491,7 +491,8 @@ def test_consent_with_an_old_sign_in_asks_for_credentials_and_then_finishes(agen
     assert response.headers["location"] == "/ui/login?" + urlencode({"next": location})
     assert "set-cookie" not in response.headers
     assert browser.cookies[COOKIE] == old_cookie
-    assert browser.get("/ui/", follow_redirects=False).status_code == 200
+    # The session still serves the interface: `/ui/` opens the account it works on.
+    assert browser.get("/ui/").status_code == 200
 
     # The sign-in form opens with the old session still valid, and carries the page to return to.
     form = browser.get(response.headers["location"], follow_redirects=False)
@@ -528,7 +529,8 @@ def test_an_old_sign_in_decides_nothing(app, agent, browser, clock, decision):
     assert response.status_code == 303
     assert response.headers["location"] == "/ui/login"
     assert "set-cookie" not in response.headers
-    assert browser.get("/ui/", follow_redirects=False).status_code == 200
+    # The session still serves the interface: `/ui/` opens the account it works on.
+    assert browser.get("/ui/").status_code == 200
     assert audit_actions(app) == []
     assert rows(app, "SELECT count(*) FROM oauth_codes") == [(0,)]
     assert rows(app, "SELECT count(*) FROM oauth_grants") == [(0,)]
