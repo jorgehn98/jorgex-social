@@ -58,7 +58,6 @@ def app(settings, clock):
         operator.create_operator(session, PASSWORD, earlier)
         operator.enroll_totp(
             session,
-            app.state.network,
             key,
             TOTP_SECRET,
             pyotp.TOTP(TOTP_SECRET).at(earlier),
@@ -917,13 +916,12 @@ def test_changing_the_credentials_ends_every_grant(app, settings, agent, browser
     _, tokens = connect(agent, browser, posts="read")
     with app.state.sessionmaker() as session, session.begin():
         if change == "password":
-            operator.set_password(session, app.state.network, "another long password", clock.now())
+            operator.set_password(session, "another long password", clock.now())
         else:
             key = crypto.load_key(settings.secret_key_file)
             code = pyotp.TOTP(TOTP_SECRET).at(clock.now() + timedelta(minutes=5))
             operator.enroll_totp(
                 session,
-                app.state.network,
                 key,
                 TOTP_SECRET,
                 code,

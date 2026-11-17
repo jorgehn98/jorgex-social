@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from jorgex_social.account import audit, crypto, incidents
-from jorgex_social.account.credential import connection_of, credential_context, seal
+from jorgex_social.account import audit, crypto, incidents, scope
+from jorgex_social.account.credential import seal, unseal
 from jorgex_social.account.models import (
     ActorType,
     Connection,
@@ -89,8 +89,8 @@ def connect(
     network = instagram.network
     account = instagram.account()
     with sessions() as session:
-        current = connection_of(session, network)
-    switching = current is not None and current.external_account_id != account.id
+        current = scope.account_of(session, network)
+    switching = scope.connected(current) and current.external_account_id != account.id
     if switching and not replace:
         raise ConnectError(
             f"this installation is connected to another {network} account; one installation "
@@ -111,20 +111,18 @@ def connect(
             extra={"error": str(exc), "expires_at": expires_at},
         )
     with sessions() as session, session.begin():
-        connection = connection_of(session, network)
-        if connection is None:
-            connection = Connection(network=network)
-            session.add(connection)
+        connection = scope.current_account(session, network)
         connection.external_account_id = account.id
         connection.username = account.username
         connection.account_type = account.account_type
-        connection.credential_encrypted = seal(key, network, stored)
         connection.credential_expires_at = expires_at
         connection.credential_refreshed_at = now
         connection.status = ConnectionStatus.OK
         connection.limits = None if switching else connection.limits
         connection.checked_at = now
         session.flush()
+        # Sealed for its row: the context needs the id the flush just gave it.
+        connection.credential_encrypted = seal(key, connection.id, stored)
         audit.record(
             session,
             now,
@@ -165,8 +163,8 @@ class ConnectionTask:
     def check(self, sessions: sessionmaker, now: datetime) -> None:
         network = self.instagram.network
         with sessions() as session:
-            connection = connection_of(session, network)
-        if connection is None and network != FakeInstagram.network:
+            connection = scope.account_of(session, network)
+        if not scope.connected(connection) and network != FakeInstagram.network:
             return  # nothing connected; the API reports it as missing
         unreadable = False
         if connection is not None and should_renew(connection, now):
@@ -192,36 +190,31 @@ class ConnectionTask:
         elif not (auth_failed or unreadable):
             self._consecutive_errors += 1
         with sessions() as session, session.begin():
-            connection = connection_of(session, network)
-            if connection is None and account is not None:
-                # Simulation: the fake needs no credential, so its connection appears on its own.
-                connection = Connection(network=network, external_account_id=account.id)
-                session.add(connection)
-            if connection is not None:
-                if unreadable:
-                    connection.status = ConnectionStatus.UNREADABLE
-                elif account is not None:
-                    connection.username = account.username
-                    connection.account_type = account.account_type
-                    connection.limits = limits
-                    connection.status = ConnectionStatus.OK  # a revoked credential works again
-                elif auth_failed:
-                    connection.status = ConnectionStatus.REVOKED  # EXPIRED below if expired
-                connection.status = status_at(connection, now)
-                connection.checked_at = now
-                status = connection.status
-            else:
-                status = ConnectionStatus.REVOKED if auth_failed else None
+            connection = scope.current_account(session, network)
+            if unreadable:
+                connection.status = ConnectionStatus.UNREADABLE
+            elif account is not None:
+                # Simulation: the fake needs no credential, so its account appears on its own.
+                connection.external_account_id = connection.external_account_id or account.id
+                connection.username = account.username
+                connection.account_type = account.account_type
+                connection.limits = limits
+                connection.status = ConnectionStatus.OK  # a revoked credential works again
+            elif auth_failed:
+                connection.status = ConnectionStatus.REVOKED  # EXPIRED below if expired
+            connection.status = status_at(connection, now)
+            connection.checked_at = now
+            status = connection.status
             for type_, active in (
                 (IncidentType.CREDENTIAL_EXPIRING, status == ConnectionStatus.EXPIRING),
                 (IncidentType.CREDENTIAL_EXPIRED, status == ConnectionStatus.EXPIRED),
                 (IncidentType.PERMISSION_REVOKED, status == ConnectionStatus.REVOKED),
                 (IncidentType.CREDENTIAL_UNREADABLE, status == ConnectionStatus.UNREADABLE),
             ):
-                incidents.sync(session, network, type_, active, now)
+                incidents.sync(session, connection.id, type_, active, now)
             incidents.sync(
                 session,
-                network,
+                connection.id,
                 IncidentType.PERSISTENT_API_ERROR,
                 self._consecutive_errors >= PERSISTENT_ERRORS,
                 now,
@@ -232,12 +225,11 @@ class ConnectionTask:
         """Returns False when the stored credential does not decrypt with the worker's key; then
         Meta is not asked, since a renewed token could not be stored readably."""
         network = self.instagram.network
-        context = credential_context(network)
         if self.key is None:
             log.error("no secret key: the credential cannot be renewed")
             return False
         try:
-            crypto.decrypt(self.key, before.credential_encrypted, context)
+            unseal(self.key, before)
         except crypto.SecretKeyError:
             return False
         try:
@@ -258,8 +250,12 @@ class ConnectionTask:
                 )
             return True
         with sessions() as session, session.begin():
-            connection = connection_of(session, network)
-            if connection is None or connection.credential_encrypted != before.credential_encrypted:
+            connection = scope.account_of(session, network)
+            if (
+                connection is None
+                or connection.id != before.id
+                or connection.credential_encrypted != before.credential_encrypted
+            ):
                 # Reconnected (maybe to another account) while Meta answered: the stored
                 # credential is newer than the one renewed, so the renewal is dropped.
                 log.warning("connection changed during renewal; renewal discarded")
@@ -273,7 +269,7 @@ class ConnectionTask:
                     detail={"discarded": "connection_changed"},
                 )
                 return True
-            connection.credential_encrypted = seal(self.key, network, renewal.access_token)
+            connection.credential_encrypted = seal(self.key, connection.id, renewal.access_token)
             connection.credential_expires_at = now + renewal.expires_in
             connection.credential_refreshed_at = now
             audit.record(
@@ -288,13 +284,13 @@ class ConnectionTask:
 
     def watch_unresolved(self, sessions: sessionmaker, now: datetime) -> None:
         """Posts whose outcome the resolver has not settled for over an hour need a human."""
-        network = self.instagram.network
         with sessions() as session, session.begin():
+            account_id = scope.account_id_of(session, self.instagram.network)
             post_ids = session.scalars(
                 select(Post.id)
                 .join(PublishAttempt)
                 .where(
-                    Post.network == network,
+                    Post.account_id == account_id,
                     Post.status == PostStatus.OUTCOME_UNKNOWN,
                     PublishAttempt.result == AttemptResult.UNKNOWN,
                     PublishAttempt.resolved_at.is_(None),
@@ -305,7 +301,7 @@ class ConnectionTask:
             ).all()
             incidents.sync(
                 session,
-                network,
+                account_id,
                 IncidentType.PUBLISH_UNRESOLVED,
                 bool(post_ids),
                 now,

@@ -10,9 +10,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import kill_switch
+from jorgex_social.account import kill_switch, scope
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
+from jorgex_social.account.models import AuditEntry, ChannelIncident
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.client import InstagramClient
@@ -279,7 +279,7 @@ def test_a_rule_stored_with_two_public_variants_answers_but_is_refused_when_edit
         now = clock.now()
         with sessions() as session, session.begin():
             rule = Rule(
-                network=app.state.network,
+                account_id=scope.current_account(session, app.state.network).id,
                 name="old",
                 channel="comment",
                 priority=1,
@@ -525,7 +525,9 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
     meta = FakeMeta(now)
     ig = InstagramClient("token-not-real", "1784", transport=meta)
     with sessions() as session, session.begin():
-        session.add(Connection(network="instagram", external_account_id="1784", username="own"))
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.username = "own"
         for channel, content in (
             ("comment", PRICE_RULE),
             (
@@ -538,7 +540,7 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
         ):
             session.add(
                 Rule(
-                    network="instagram",
+                    account_id=account.id,
                     name=channel,
                     channel=channel,
                     priority=1,
@@ -650,6 +652,7 @@ def test_one_private_reply_per_comment_even_across_restarts(
     with pytest.raises(IntegrityError), sessions() as session, session.begin():
         session.add(
             Delivery(
+                account_id=private.account_id,
                 event_id=private.event_id,
                 rule_id=other["id"],
                 action="private_reply",
@@ -731,7 +734,9 @@ def test_kill_switch_skips_with_its_reason(client, headers, ig, sessions, task, 
     make_rule(client, headers)
     ig.add_comment(publish(ig), "precio")
     with sessions() as session, session.begin():
-        kill_switch.set_state(session, True, clock.now())
+        kill_switch.set_state(
+            session, scope.current_account(session, "simulation"), True, clock.now()
+        )
 
     task(sessions)
 
@@ -1153,10 +1158,12 @@ def test_malformed_and_repeated_comments_from_meta_are_handled(sessions, clock):
 
     ig = InstagramClient("token-not-real", "1784", transport=transport)
     with sessions() as session, session.begin():
-        session.add(Connection(network="instagram", external_account_id="1784", username="own"))
+        account = scope.current_account(session, "instagram")
+        account.external_account_id = "1784"
+        account.username = "own"
         session.add(
             Rule(
-                network="instagram",
+                account_id=account.id,
                 name="price",
                 channel="comment",
                 priority=1,
@@ -1233,7 +1240,8 @@ def restriction_incidents(sessions):
 
 def kill_switch_is_on(sessions):
     with sessions() as session:
-        return kill_switch.is_on(session)
+        account = scope.current_account(session, "simulation")
+        return kill_switch.is_on(session, account.id)
 
 
 @pytest.fixture

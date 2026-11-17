@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from jorgex_social.access.deps import SessionDep, require
 from jorgex_social.access.tokens import Group, Level
+from jorgex_social.account import scope
 from jorgex_social.publishing.models import Post, PostStatus, PostType
 from jorgex_social.replies import rules
 from jorgex_social.replies.models import (
@@ -38,12 +39,13 @@ def _error(status_code: int, code: str, message: str, **extra) -> HTTPException:
     return HTTPException(status_code, detail={"code": code, "message": message, **extra})
 
 
-def _network(request: Request) -> str:
-    # Simulated rules and events never show in real mode, and the other way round.
-    return request.app.state.network
+def _account(request: Request, session: SessionDep) -> str | None:
+    # The account of the mode: simulated rules and events never show in real mode, and the other
+    # way round. None before anything exists for the mode, which matches no row.
+    return scope.account_id_of(session, request.app.state.network)
 
 
-Network = Annotated[str, Depends(_network)]
+Account = Annotated[str | None, Depends(_account)]
 
 # A post in one of these goes nowhere on its own. `failed` can still be scheduled again.
 NOT_GOING_OUT = {PostStatus.FAILED, PostStatus.CANCELLED}
@@ -135,11 +137,11 @@ def _check(
         raise _error(422, "invalid_rule", str(exc)) from None
 
 
-def _media_of_post(session: Session, network: str, post_id: str) -> str | None:
+def _media_of_post(session: Session, account_id: str | None, post_id: str) -> str | None:
     """The media id a rule for this post starts with: none until the post has one, and the rule
     waits. Refuses a post that can never give it comments to answer."""
     post = session.get(Post, post_id)
-    if post is None or post.network != network:
+    if post is None or post.account_id != account_id:
         raise _error(404, "not_found", "No such post.")
     if post.type == PostType.STORY:
         raise _error(
@@ -150,9 +152,9 @@ def _media_of_post(session: Session, network: str, post_id: str) -> str | None:
     return post.external_ref
 
 
-def _rule(session: Session, network: str, rule_id: str) -> Rule:
+def _rule(session: Session, account_id: str | None, rule_id: str) -> Rule:
     rule = session.get(Rule, rule_id)
-    if rule is None or rule.network != network:
+    if rule is None or rule.account_id != account_id:
         raise _error(404, "not_found", "No such rule.")
     return rule
 
@@ -165,7 +167,7 @@ def _not_archived(rule: Rule) -> None:
 @router.post(
     "/rules", status_code=status.HTTP_201_CREATED, response_model=RuleOut, dependencies=RulesWrite
 )
-def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Network):
+def create_rule(body: RuleIn, request: Request, session: SessionDep, account: Account):
     """Create a rule, inactive. Activate it to make it answer; only what arrives after that
     is answered. `public_replies` needs at least 5 variants, and `private_replies` at least 3, that
     differ in more than case, accents or spacing, or none at all: this service's own floor, not a
@@ -174,12 +176,13 @@ def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Ne
     service instead of a `media_ref`: with `post_id` it waits, answering nothing, until the post
     is published, and then answers on it alone."""
     _check(body.channel, body.media_ref, body.content, body.post_id)
+    account_id = account or scope.current_account(session, request.app.state.network).id
     media_ref = body.media_ref
     if body.post_id is not None:
-        media_ref = _media_of_post(session, network, body.post_id)
+        media_ref = _media_of_post(session, account_id, body.post_id)
     now = request.app.state.clock.now()
     rule = Rule(
-        network=network,
+        account_id=account_id,
         name=body.name,
         channel=body.channel,
         media_ref=media_ref,
@@ -198,7 +201,7 @@ def create_rule(body: RuleIn, request: Request, session: SessionDep, network: Ne
 @router.get("/rules", response_model=list[RuleOut], dependencies=RulesRead)
 def list_rules(
     session: SessionDep,
-    network: Network,
+    account: Account,
     channel: Channel | None = None,
     active: bool | None = None,
     archived: bool = False,
@@ -207,7 +210,7 @@ def list_rules(
 ):
     """Rules in the order they are tried: lower priority first, then the oldest. Archived ones
     only with `archived=true`, and then only those."""
-    query = select(Rule).where(Rule.network == network)
+    query = select(Rule).where(Rule.account_id == account)
     query = query.where(Rule.archived_at.is_not(None) if archived else Rule.archived_at.is_(None))
     if channel is not None:
         query = query.where(Rule.channel == channel)
@@ -220,13 +223,13 @@ def list_rules(
 
 
 @router.get("/rules/{rule_id}", response_model=RuleOut, dependencies=RulesRead)
-def get_rule(rule_id: str, session: SessionDep, network: Network):
-    return _rule(session, network, rule_id)
+def get_rule(rule_id: str, session: SessionDep, account: Account):
+    return _rule(session, account, rule_id)
 
 
 @router.patch("/rules/{rule_id}", response_model=RuleOut, dependencies=RulesWrite)
 def update_rule(
-    rule_id: str, body: RulePatch, request: Request, session: SessionDep, network: Network
+    rule_id: str, body: RulePatch, request: Request, session: SessionDep, account: Account
 ):
     """Edit a rule; only the fields given change, and `media_ref: null` makes it apply to every
     post, ending any link to a post as well. `post_id` ties it to a post, replacing any
@@ -237,7 +240,7 @@ def update_rule(
     A rule stored with fewer keeps answering, but any edit, even of its name alone, gets that same
     refusal until `content` fixes it. `warnings` lists what automation users report as risky; it
     blocks nothing."""
-    rule = _rule(session, network, rule_id)
+    rule = _rule(session, account, rule_id)
     _not_archived(rule)
     fields = body.model_fields_set
     for required in ("name", "priority", "content", "post_id"):
@@ -249,7 +252,7 @@ def update_rule(
     content = body.content if "content" in fields else RuleContent.model_validate(rule.content)
     _check(Channel(rule.channel), media_ref, content, body.post_id)
     if body.post_id is not None:
-        media_ref = _media_of_post(session, network, body.post_id)
+        media_ref = _media_of_post(session, account, body.post_id)
     if "name" in fields:
         rule.name = body.name
     if "priority" in fields:
@@ -262,11 +265,11 @@ def update_rule(
 
 
 @router.post("/rules/{rule_id}/activate", response_model=RuleOut, dependencies=RulesWrite)
-def activate_rule(rule_id: str, request: Request, session: SessionDep, network: Network):
+def activate_rule(rule_id: str, request: Request, session: SessionDep, account: Account):
     """Start answering. Only comments and messages written from now on fire the rule. A rule
     with `warnings` activates all the same, and so does one waiting for its post, which starts
     answering once the post is published."""
-    rule = _rule(session, network, rule_id)
+    rule = _rule(session, account, rule_id)
     _not_archived(rule)
     if not rule.active:
         now = request.app.state.clock.now()
@@ -275,18 +278,18 @@ def activate_rule(rule_id: str, request: Request, session: SessionDep, network: 
 
 
 @router.post("/rules/{rule_id}/deactivate", response_model=RuleOut, dependencies=RulesWrite)
-def deactivate_rule(rule_id: str, request: Request, session: SessionDep, network: Network):
+def deactivate_rule(rule_id: str, request: Request, session: SessionDep, account: Account):
     """Stop answering. Replies already queued are still sent."""
-    rule = _rule(session, network, rule_id)
+    rule = _rule(session, account, rule_id)
     if rule.active:
         rule.active, rule.updated_at = False, request.app.state.clock.now()
     return rule
 
 
 @router.post("/rules/{rule_id}/archive", response_model=RuleOut, dependencies=RulesWrite)
-def archive_rule(rule_id: str, request: Request, session: SessionDep, network: Network):
+def archive_rule(rule_id: str, request: Request, session: SessionDep, account: Account):
     """Deactivate and archive: the rule can no longer be edited or activated."""
-    rule = _rule(session, network, rule_id)
+    rule = _rule(session, account, rule_id)
     if rule.archived_at is None:
         now = request.app.state.clock.now()
         rule.active, rule.archived_at, rule.updated_at = False, now, now
@@ -312,18 +315,18 @@ class RuleTestOut(BaseModel):
 
 
 @router.post("/rules/test", response_model=RuleTestOut, dependencies=RulesRead)
-def test_rules(body: RuleTestIn, session: SessionDep, network: Network):
+def test_rules(body: RuleTestIn, session: SessionDep, account: Account):
     """Which rule a sample text would fire and what it could answer. Stores nothing and calls
     nothing on Instagram. Opt-out words are not applied: a direct message that is exactly one of
     them fires no rule, whatever this says. A rule named by `rule_id` that is waiting for its post
     shows what it would match once bound, with a `note` saying it is waiting; without `rule_id`,
     waiting rules fire nothing, as in the worker."""
     if body.rule_id is not None:
-        candidates = [_rule(session, network, body.rule_id)]
+        candidates = [_rule(session, account, body.rule_id)]
         if candidates[0].channel != body.channel:
             raise _error(422, "invalid_value", "The rule is for another channel.")
     else:
-        candidates = rules.active_rules(session, network, body.channel)
+        candidates = rules.active_rules(session, account, body.channel)
     note = None
     if body.rule_id is not None and candidates[0].waiting_for_post:
         waiting = candidates[0]
@@ -393,7 +396,7 @@ class ConversationOut(BaseModel):
 @router.get("/events", response_model=list[EventOut], dependencies=EventsRead)
 def list_events(
     session: SessionDep,
-    network: Network,
+    account: Account,
     type: Channel | None = None,
     rule_id: str | None = None,
     matched: bool | None = None,
@@ -402,7 +405,7 @@ def list_events(
 ):
     """Comments and messages seen, newest first: identifiers and the rule they fired. Their text
     and usernames are never stored; a comment's author id is kept, but not returned here."""
-    query = select(Event).where(Event.network == network)
+    query = select(Event).where(Event.account_id == account)
     if type is not None:
         query = query.where(Event.type == type)
     if rule_id is not None:
@@ -416,7 +419,7 @@ def list_events(
 @router.get("/deliveries", response_model=list[DeliveryOut], dependencies=EventsRead)
 def list_deliveries(
     session: SessionDep,
-    network: Network,
+    account: Account,
     status: DeliveryStatus | None = None,
     rule_id: str | None = None,
     reason: Reason | None = None,
@@ -432,7 +435,7 @@ def list_deliveries(
     `cooldown`, `already_answered` (this rule already answered this person on this post),
     `hourly_cap` (only on older replies: a reply over a cap now waits as `pending`), `refused` or
     `unknown`."""
-    query = select(Delivery).join(Event).where(Event.network == network)
+    query = select(Delivery).where(Delivery.account_id == account)
     for column, value in (
         (Delivery.status, status),
         (Delivery.rule_id, rule_id),
@@ -450,7 +453,7 @@ def list_deliveries(
 def list_conversations(
     request: Request,
     session: SessionDep,
-    network: Network,
+    account: Account,
     paused: bool | None = None,
     limit: Limit = 100,
     offset: Offset = 0,
@@ -458,7 +461,7 @@ def list_conversations(
     """People who wrote by direct message, most recent first, with their window and pause. A
     person who sent an opt-out word shows as `paused_forever`; the audit log has
     `conversation.opted_out` for them."""
-    query = select(Conversation).where(Conversation.network == network)
+    query = select(Conversation).where(Conversation.account_id == account)
     if paused is not None:
         now = request.app.state.clock.now()
         is_paused = Conversation.paused_forever.is_(True) | (Conversation.paused_until > now)
@@ -474,9 +477,9 @@ class PauseIn(BaseModel):
     forever: bool = False
 
 
-def _conversation(session: Session, network: str, conversation_id: str) -> Conversation:
+def _conversation(session: Session, account_id: str | None, conversation_id: str) -> Conversation:
     conversation = session.get(Conversation, conversation_id)
-    if conversation is None or conversation.network != network:
+    if conversation is None or conversation.account_id != account_id:
         raise _error(404, "not_found", "No such conversation.")
     return conversation
 
@@ -487,7 +490,7 @@ def _conversation(session: Session, network: str, conversation_id: str) -> Conve
     dependencies=RulesWrite,
 )
 def pause_conversation(
-    conversation_id: str, body: PauseIn, request: Request, session: SessionDep, network: Network
+    conversation_id: str, body: PauseIn, request: Request, session: SessionDep, account: Account
 ):
     """Stop automatic messages to this person, until a time or for good, for example while a
     human answers. Messages already queued are skipped as `paused`. Replies to this person's
@@ -500,7 +503,7 @@ def pause_conversation(
     now = request.app.state.clock.now()
     if body.until is not None and body.until <= now:
         raise _error(422, "in_the_past", "until is in the past.")
-    conversation = _conversation(session, network, conversation_id)
+    conversation = _conversation(session, account, conversation_id)
     if conversation.paused_forever and body.until is not None:
         raise _error(409, "invalid_state", "Paused for good; resume it first.")
     conversation.paused_forever = body.forever
@@ -515,11 +518,11 @@ def pause_conversation(
     dependencies=RulesWrite,
 )
 def resume_conversation(
-    conversation_id: str, request: Request, session: SessionDep, network: Network
+    conversation_id: str, request: Request, session: SessionDep, account: Account
 ):
     """Lift a pause, or an opt-out, which is a pause for good. Messages skipped while paused are
     not sent afterwards."""
-    conversation = _conversation(session, network, conversation_id)
+    conversation = _conversation(session, account, conversation_id)
     conversation.paused_forever = False
     conversation.paused_until = None
     conversation.updated_at = request.app.state.clock.now()

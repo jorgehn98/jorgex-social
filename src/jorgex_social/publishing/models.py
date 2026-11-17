@@ -5,6 +5,7 @@ from enum import StrEnum
 from sqlalchemy import ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from jorgex_social.account.models import Connection
 from jorgex_social.db import Base, UTCDateTime, utcnow
 
 
@@ -63,11 +64,13 @@ class Resolution(StrEnum):
 
 
 class Media(Base):
-    """An uploaded file. Immutable once stored: its sha256 is part of every post hash."""
+    """An uploaded file of one account. Immutable once stored: its sha256 is part of every post
+    hash."""
 
     __tablename__ = "media"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     relative_path: Mapped[str] = mapped_column(String(200))  # inside the media directory
     sha256: Mapped[str] = mapped_column(String(64))
     type: Mapped[str] = mapped_column(String(8))
@@ -83,12 +86,18 @@ class Media(Base):
 class Post(Base):
     __tablename__ = "posts"
     __table_args__ = (
-        UniqueConstraint("network", "external_ref"),
+        # One row per published media of an account; the idempotency key is the caller's, and
+        # two accounts may use the same one.
+        UniqueConstraint("account_id", "external_ref", name="uq_posts_account_id_external_ref"),
+        UniqueConstraint(
+            "account_id", "idempotency_key", name="uq_posts_account_id_idempotency_key"
+        ),
         Index("ix_posts_status_scheduled_for", "status", "scheduled_for"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    network: Mapped[str] = mapped_column(String(32))
+    # The account the post belongs to. It never changes: a post does not move between accounts.
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     type: Mapped[str] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(16), default=PostStatus.DRAFT)
     caption: Mapped[str] = mapped_column(Text, default="")
@@ -101,7 +110,7 @@ class Post(Base):
     permalink: Mapped[str | None] = mapped_column(String(500))
     # Why the post is `failed`: missed_schedule, daily_limit, refused, container_error, ...
     failure: Mapped[str | None] = mapped_column(String(32))
-    idempotency_key: Mapped[str | None] = mapped_column(String(200), unique=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
     content_hash: Mapped[str] = mapped_column(String(64))
     source_ref: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
@@ -111,6 +120,13 @@ class Post(Base):
         order_by="PostItem.position", cascade="all, delete-orphan"
     )
     attempts: Mapped[list[PublishAttempt]] = relationship(order_by="PublishAttempt.number")
+    account: Mapped[Connection] = relationship(viewonly=True)
+
+    @property
+    def network(self) -> str:
+        """The network of the account: the post belongs to an account, and the account says which
+        network it is on (decision 10)."""
+        return self.account.network
 
     @property
     def media_ids(self) -> list[str]:

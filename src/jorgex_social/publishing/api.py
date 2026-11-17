@@ -17,7 +17,7 @@ from jorgex_social.access.deps import (
     require_outside_transaction,
 )
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import audit
+from jorgex_social.account import audit, scope
 from jorgex_social.account.audit import set_detail
 from jorgex_social.publishing import catalog
 from jorgex_social.publishing import media as storage
@@ -72,8 +72,9 @@ def _write_chunk(fh: BinaryIO, digest, chunk: bytes) -> None:
     fh.write(chunk)
 
 
-def _save_media(sessions: sessionmaker, media: Media) -> None:
+def _save_media(sessions: sessionmaker, network: str, media: Media) -> None:
     with sessions() as session, session.begin():
+        media.account_id = scope.current_account(session, network).id
         session.add(media)
 
 
@@ -139,7 +140,9 @@ async def save_upload(request: Request) -> Media:
         created_at=request.app.state.clock.now(),  # unused media are purged by age
     )
     try:
-        await run_in_threadpool(_save_media, request.app.state.sessionmaker, media)
+        await run_in_threadpool(
+            _save_media, request.app.state.sessionmaker, request.app.state.network, media
+        )
     except BaseException:
         final.unlink(missing_ok=True)
         raise
@@ -307,17 +310,18 @@ def _set_content(
     post.items = [PostItem(position=i, media_id=media_id) for i, media_id in enumerate(item_ids)]
 
 
-def _network(request: Request) -> str:
-    # Simulated posts never show in real mode, and the other way round.
-    return request.app.state.network
+def _account(request: Request, session: SessionDep) -> str | None:
+    # The account of the mode: simulated posts never show in real mode, and the other way round.
+    # None before anything exists for the mode, which matches no row.
+    return scope.account_id_of(session, request.app.state.network)
 
 
-Network = Annotated[str, Depends(_network)]
+Account = Annotated[str | None, Depends(_account)]
 
 
-def _post(session: Session, network: str, post_id: str) -> Post:
+def _post(session: Session, account_id: str | None, post_id: str) -> Post:
     post = session.get(Post, post_id)
-    if post is None or post.network != network:
+    if post is None or post.account_id != account_id:
         raise _error(404, "not_found", "No such post.")
     return post
 
@@ -339,18 +343,21 @@ def _require_status(post: Post, allowed: set[PostStatus], action: str) -> None:
     response_model=PostOut,
     dependencies=PostsWrite,
 )
-def create_post(body: PostIn, session: SessionDep, network: Network, response: Response):
+def create_post(body: PostIn, request: Request, session: SessionDep, response: Response):
     """Create a draft. The response carries its content_hash and the catalog errors and
     warnings; a draft with errors is kept but cannot be scheduled."""
+    account_id = scope.current_account(session, request.app.state.network).id
     if body.idempotency_key:
-        existing = session.scalar(select(Post).where(Post.idempotency_key == body.idempotency_key))
+        existing = session.scalar(
+            select(Post).where(
+                Post.account_id == account_id, Post.idempotency_key == body.idempotency_key
+            )
+        )
         if existing is not None:
-            if existing.network != network:
-                raise _error(409, "idempotency_key_taken", "The key was used in another mode.")
             response.status_code = status.HTTP_200_OK
             return _out(session, existing)
     post = Post(
-        network=network,
+        account_id=account_id,
         source_ref=body.source_ref,
         idempotency_key=body.idempotency_key,
         status=PostStatus.DRAFT,
@@ -371,24 +378,24 @@ def create_post(body: PostIn, session: SessionDep, network: Network, response: R
 @router.get("/posts", response_model=list[PostOut], dependencies=PostsRead)
 def list_posts(
     session: SessionDep,
-    network: Network,
+    account: Account,
     status: PostStatus | None = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
     """Posts, newest first."""
-    query = select(Post).where(Post.network == network)
+    query = select(Post).where(Post.account_id == account)
     if status:
         query = query.where(Post.status == status)
     posts = session.scalars(query.order_by(Post.created_at.desc()).limit(limit).offset(offset))
     return [_out(session, post) for post in posts]
 
 
-def next_scheduled(session: Session, network: str, limit: int) -> list[dict]:
+def next_scheduled(session: Session, account_id: str | None, limit: int) -> list[dict]:
     """Scheduled posts, soonest first: the order the worker publishes them in."""
     query = (
         select(Post)
-        .where(Post.network == network, Post.status == PostStatus.SCHEDULED)
+        .where(Post.account_id == account_id, Post.status == PostStatus.SCHEDULED)
         .order_by(Post.scheduled_for, Post.id)
         .limit(limit)
     )
@@ -396,16 +403,16 @@ def next_scheduled(session: Session, network: str, limit: int) -> list[dict]:
 
 
 @router.get("/posts/{post_id}", response_model=PostDetail, dependencies=PostsRead)
-def get_post(post_id: str, session: SessionDep, network: Network):
+def get_post(post_id: str, session: SessionDep, account: Account):
     """One post with its publish attempts."""
-    return _out(session, _post(session, network, post_id), detail=True)
+    return _out(session, _post(session, account, post_id), detail=True)
 
 
 @router.patch("/posts/{post_id}", response_model=PostOut, dependencies=PostsWrite)
-def update_post(post_id: str, body: PostPatch, session: SessionDep, network: Network):
+def update_post(post_id: str, body: PostPatch, session: SessionDep, account: Account):
     """Edit a draft or a scheduled post. A scheduled post goes back to draft: what changed has
     not been checked by whoever scheduled it."""
-    post = _post(session, network, post_id)
+    post = _post(session, account, post_id)
     _require_status(post, EDITABLE, "edit")
     fields = body.model_fields_set
     for required in ("type", "caption", "items"):
@@ -476,28 +483,28 @@ def _schedule(
 
 @router.post("/posts/{post_id}/schedule", response_model=PostOut, dependencies=SchedulingWrite)
 def schedule_post(
-    post_id: str, body: ScheduleIn, request: Request, session: SessionDep, network: Network
+    post_id: str, body: ScheduleIn, request: Request, session: SessionDep, account: Account
 ):
     """Publish at `scheduled_for` (ISO 8601 with offset). Rescheduling a scheduled or failed post
     is allowed."""
     if body.scheduled_for < request.app.state.clock.now():
         raise _error(422, "in_the_past", "scheduled_for is in the past; use publish-now.")
-    post = _post(session, network, post_id)
+    post = _post(session, account, post_id)
     return _schedule(request, session, post, body.scheduled_for, body.expected_hash)
 
 
 @router.post("/posts/{post_id}/publish-now", response_model=PostOut, dependencies=SchedulingWrite)
 def publish_now(
-    post_id: str, body: PublishNowIn, request: Request, session: SessionDep, network: Network
+    post_id: str, body: PublishNowIn, request: Request, session: SessionDep, account: Account
 ):
     """Schedule for now; the worker picks it up on its next pass."""
-    post = _post(session, network, post_id)
+    post = _post(session, account, post_id)
     return _schedule(request, session, post, request.app.state.clock.now(), body.expected_hash)
 
 
 @router.post("/posts/{post_id}/cancel", response_model=PostOut, dependencies=SchedulingWrite)
-def cancel_post(post_id: str, session: SessionDep, network: Network):
-    post = _post(session, network, post_id)
+def cancel_post(post_id: str, session: SessionDep, account: Account):
+    post = _post(session, account, post_id)
     _require_status(post, EDITABLE, "cancel")
     post.status = PostStatus.CANCELLED
     post.scheduled_for = None
@@ -514,11 +521,11 @@ class DeletedOut(BaseModel):
 
 
 @router.delete("/posts/{post_id}", response_model=DeletedOut, dependencies=PostsWrite)
-def delete_post(post_id: str, request: Request, session: SessionDep, network: Network):
+def delete_post(post_id: str, request: Request, session: SessionDep, account: Account):
     """Delete a draft, cancelled or failed post with its publish attempts. Rules made for it are
     archived, since they could never fire. Deletes nothing on Instagram; its media files are
     purged later, once no other post uses them."""
-    post = _post(session, network, post_id)
+    post = _post(session, account, post_id)
     _require_status(post, DELETABLE, "delete")
     now = request.app.state.clock.now()
     # Archived as well as unbound: a rule with neither post_id nor media_ref answers on every
@@ -575,11 +582,11 @@ class ResolveIn(BaseModel):
 
 @router.post("/posts/{post_id}/resolve", response_model=PostDetail, dependencies=SchedulingWrite)
 def resolve_post(
-    post_id: str, body: ResolveIn, request: Request, session: SessionDep, network: Network
+    post_id: str, body: ResolveIn, request: Request, session: SessionDep, account: Account
 ):
     """Settle a post whose outcome the service could not determine, after checking the account.
     `not_published` returns it to draft, to be scheduled again on purpose."""
-    post = _post(session, network, post_id)
+    post = _post(session, account, post_id)
     _require_status(post, {PostStatus.OUTCOME_UNKNOWN}, "resolve")
     now = request.app.state.clock.now()
     if body.outcome == "not_published":
@@ -591,7 +598,9 @@ def resolve_post(
         if body.media_ref:
             taken = session.scalar(
                 select(Post.id).where(
-                    Post.network == network, Post.external_ref == body.media_ref, Post.id != post.id
+                    Post.account_id == account,
+                    Post.external_ref == body.media_ref,
+                    Post.id != post.id,
                 )
             )
             if taken:

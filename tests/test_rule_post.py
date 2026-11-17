@@ -8,7 +8,7 @@ from sqlalchemy import event, select
 
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import AuditEntry
+from jorgex_social.account.models import AuditEntry, Connection
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.errors import Unavailable
@@ -239,9 +239,12 @@ def test_refused_links(client, headers, sessions):
     story = make_post(client, headers, "story")
     cancelled = make_post(client, headers)
     client.post(f"/v1/posts/{cancelled}/cancel", headers=headers)
-    other_network = make_post(client, headers)
+    elsewhere = make_post(client, headers)
     with sessions() as session, session.begin():
-        session.get_one(Post, other_network).network = "another"
+        other = Connection(network="another", external_account_id="other", username="other")
+        session.add(other)
+        session.flush()
+        session.get_one(Post, elsewhere).account_id = other.id
     rule = make_rule(client, headers, activate=False)
 
     def create(**fields):
@@ -257,7 +260,7 @@ def test_refused_links(client, headers, sessions):
     for send in (create, patch):
         assert seen(send(post_id=post_id, media_ref="m1")) == (422, "invalid_rule")
         assert seen(send(post_id="nope")) == (404, "not_found")
-        assert seen(send(post_id=other_network)) == (404, "not_found")
+        assert seen(send(post_id=elsewhere)) == (404, "not_found")
         assert seen(send(post_id=story)) == (422, "invalid_rule")
         assert "stories" in send(post_id=story).json()["detail"]["message"]
         assert seen(send(post_id=cancelled)) == (409, "invalid_state")

@@ -18,9 +18,9 @@ from starlette.requests import Request
 from jorgex_social.access import operator
 from jorgex_social.access.models import Operator, OperatorSession
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import appearance, crypto
+from jorgex_social.account import appearance, crypto, scope
 from jorgex_social.account.credential import seal
-from jorgex_social.account.models import ChannelIncident, Connection
+from jorgex_social.account.models import ChannelIncident
 from jorgex_social.api import create_app
 from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
@@ -72,7 +72,6 @@ def enrolled(app, settings, clock):
         operator.create_operator(session, PASSWORD, earlier)
         operator.enroll_totp(
             session,
-            app.state.network,
             key,
             TOTP_SECRET,
             pyotp.TOTP(TOTP_SECRET).at(earlier),
@@ -366,7 +365,7 @@ def test_changing_the_password_signs_every_browser_out(app, client, clock):
     log_in(client, clock)
 
     with app.state.sessionmaker() as session, session.begin():
-        operator.set_password(session, app.state.network, "another long password", clock.now())
+        operator.set_password(session, "another long password", clock.now())
 
     assert client.get("/ui/", follow_redirects=False).status_code == 303
 
@@ -415,23 +414,30 @@ def sample(app, settings, clock, enrolled):
     (settings.media_dir / "photo.jpeg").write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 64)
     with app.state.sessionmaker() as session, session.begin():
         _, api_secret = create_token(session, API_TOKEN_NAME, {"posts": "read"})
-        session.add(
-            Connection(
-                network=network,
-                external_account_id="17840000000000001",
-                username="sample_account",
-                account_type="BUSINESS",
-                credential_encrypted=seal(key, network, CREDENTIAL),
-                credential_expires_at=now + timedelta(days=40),
-                limits={"quota_usage": 3, "quota_total": 100, "quota_duration_seconds": 86400},
-                checked_at=now,
-            )
+        connection = scope.current_account(session, network)
+        connection.external_account_id = "17840000000000001"
+        connection.username = "sample_account"
+        connection.account_type = "BUSINESS"
+        connection.credential_encrypted = seal(key, connection.id, CREDENTIAL)
+        connection.credential_expires_at = now + timedelta(days=40)
+        connection.limits = {
+            "quota_usage": 3,
+            "quota_total": 100,
+            "quota_duration_seconds": 86400,
+        }
+        connection.checked_at = now
+        account_id = connection.id
+        photo = Media(
+            account_id=account_id,
+            relative_path="photo.jpeg",
+            sha256="a" * 64,
+            type="jpeg",
+            bytes=68,
         )
-        photo = Media(relative_path="photo.jpeg", sha256="a" * 64, type="jpeg", bytes=68)
         session.add(photo)
         session.flush()
         published = Post(
-            network=network,
+            account_id=account_id,
             type="image",
             status="published",
             caption="A caption written by the operator",
@@ -442,7 +448,7 @@ def sample(app, settings, clock, enrolled):
             items=[PostItem(position=0, media_id=photo.id)],
         )
         scheduled = Post(
-            network=network,
+            account_id=account_id,
             type="image",
             status="scheduled",
             caption="Next one",
@@ -466,7 +472,7 @@ def sample(app, settings, clock, enrolled):
             start = datetime(2026, 10, 26 + day, tzinfo=UTC)
             session.add(
                 AccountSnapshot(
-                    network=network,
+                    account_id=account_id,
                     period_start=start,
                     period_end=start + timedelta(days=1),
                     taken_at=now,
@@ -477,7 +483,7 @@ def sample(app, settings, clock, enrolled):
         for hours in (1, 25):
             session.add(
                 PostSnapshot(
-                    network=network,
+                    account_id=account_id,
                     media_ref="18000000000000001",
                     taken_at=now - timedelta(hours=hours),
                     product_type="FEED",
@@ -487,7 +493,7 @@ def sample(app, settings, clock, enrolled):
                 )
             )
         rule = Rule(
-            network=network,
+            account_id=account_id,
             name="Price question",
             channel="comment",
             priority=10,
@@ -506,7 +512,7 @@ def sample(app, settings, clock, enrolled):
         session.add(rule)
         session.flush()
         event = Event(
-            network=network,
+            account_id=account_id,
             type="comment",
             external_ref="17850000000000001",
             media_ref="18000000000000001",
@@ -518,6 +524,7 @@ def sample(app, settings, clock, enrolled):
         session.flush()
         session.add(
             Delivery(
+                account_id=account_id,
                 event_id=event.id,
                 rule_id=rule.id,
                 action="private_reply",
@@ -528,7 +535,7 @@ def sample(app, settings, clock, enrolled):
         )
         session.add(
             ChannelIncident(
-                network=network,
+                account_id=account_id,
                 type="credential_expiring",
                 opened_at=now - timedelta(hours=3),
                 detail={"days_left": 9},
@@ -594,13 +601,14 @@ def test_pages_render_sample_data_without_writing_or_showing_secrets(app, client
 
 def test_the_rules_page_shows_a_rule_waiting_for_its_post(app, client, clock, enrolled):
     with app.state.sessionmaker() as session, session.begin():
-        post = Post(network=app.state.network, type="image", content_hash="hash")
+        account = scope.current_account(session, app.state.network)
+        post = Post(account_id=account.id, type="image", content_hash="hash")
         session.add(post)
         session.flush()
         post_id = post.id
         session.add(
             Rule(
-                network=app.state.network,
+                account_id=account.id,
                 name="Waiting",
                 channel="comment",
                 post_id=post_id,
@@ -635,10 +643,11 @@ def test_pages_only_write_the_session_activity(app, client, clock, sample):
 @pytest.mark.usefixtures("enrolled")
 def test_drafts_and_cancelled_posts_are_listed_last_and_folded(app, client, clock, sample):
     with app.state.sessionmaker() as session, session.begin():
+        account = scope.current_account(session, app.state.network)
         for status, caption in (("draft", "A draft in progress"), ("cancelled", "Called off")):
             session.add(
                 Post(
-                    network=app.state.network,
+                    account_id=account.id,
                     type="image",
                     status=status,
                     caption=caption,
@@ -771,9 +780,7 @@ def test_enrolment_refuses_a_non_ascii_code(app, settings, clock):
         app.state.sessionmaker() as session,
         session.begin(),
     ):
-        operator.enroll_totp(
-            session, app.state.network, key, TOTP_SECRET, "１２３４５６", clock.now()
-        )
+        operator.enroll_totp(session, key, TOTP_SECRET, "１２３４５６", clock.now())
 
 
 def test_logout_with_an_unknown_cookie_does_not_take_the_write_lock(app, client, monkeypatch):
@@ -826,10 +833,11 @@ def test_next_scheduled_is_ordered_and_limited_by_schedule_in_the_query(app, clo
 
     with app.state.sessionmaker() as session, session.begin():
         # Created after the sample's post (due in a day) yet due sooner, and one due later.
+        account = scope.current_account(session, app.state.network)
         for hours, caption in ((2, "Due soonest"), (48, "Due last")):
             session.add(
                 Post(
-                    network=app.state.network,
+                    account_id=account.id,
                     type="image",
                     status="scheduled",
                     caption=caption,
@@ -840,7 +848,8 @@ def test_next_scheduled_is_ordered_and_limited_by_schedule_in_the_query(app, clo
             )
 
     with app.state.read_sessionmaker() as session:
-        found = next_scheduled(session, app.state.network, limit=2)
+        account_id = scope.account_id_of(session, app.state.network)
+        found = next_scheduled(session, account_id, limit=2)
 
     assert [post["caption"] for post in found] == ["Due soonest", "Next one"]
 
@@ -895,7 +904,7 @@ def test_the_third_wrong_code_opens_the_incident_and_the_answer_never_changes(ap
     [incident] = password_incidents(app)
 
     assert incident.detail == {"wrong_codes": 3}
-    assert incident.network == app.state.network
+    assert incident.account_id is None  # the operator's, not an account's
     assert incident.closed_at is None
     for answer in answers:
         assert answer.status_code == wrong_password.status_code == 401
@@ -957,9 +966,7 @@ def test_enrolling_the_second_factor_again_closes_the_incident(app, settings, cl
     clock.advance(minutes=5)
     key = crypto.load_key(settings.secret_key_file)
     with app.state.sessionmaker() as session, session.begin():
-        operator.enroll_totp(
-            session, app.state.network, key, TOTP_SECRET, code_at(clock.now()), clock.now()
-        )
+        operator.enroll_totp(session, key, TOTP_SECRET, code_at(clock.now()), clock.now())
 
     assert password_incidents(app)[0].closed_at is not None
 
@@ -970,7 +977,7 @@ def test_wrong_codes_from_before_a_password_change_do_not_reopen_the_incident(ap
     clock.advance(minutes=1)
     new_password = "another long password"
     with app.state.sessionmaker() as session, session.begin():
-        operator.set_password(session, app.state.network, new_password, clock.now())
+        operator.set_password(session, new_password, clock.now())
     clock.advance(minutes=1)
 
     assert (
