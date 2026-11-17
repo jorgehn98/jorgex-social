@@ -348,21 +348,17 @@ def test_real_mode_refuses_to_start_without_the_key(settings, tmp_path, clock):
         make_instagram(no_key, clock, None, a_connection())
 
 
-def test_a_connection_without_a_credential_raises_not_connected(settings, clock):
-    """A row a draft created before `connect-instagram`: its client refuses before sending."""
-    unreadable = a_connection()
+def test_a_connection_without_a_credential_raises_not_connected(real, clock):
+    """A stored row a draft created before `connect-instagram`: it has no account and no
+    ciphertext, so its client refuses before sending anything."""
+    with real.state.sessionmaker() as session, session.begin():
+        account_id = scope.current_account(session, "instagram").id
+    with real.state.sessionmaker() as session:
+        stored = session.get_one(Connection, account_id)
+    assert stored.credential_encrypted is None
 
     with pytest.raises(NotConnected, match="connect-instagram"):
-        make_instagram(
-            Settings(
-                database_path=settings.database_path,
-                secret_key_file=settings.secret_key_file,
-                simulation=False,
-            ),
-            clock,
-            None,
-            unreadable,
-        )
+        make_instagram(real.state.settings, clock, None, stored)
 
 
 def test_a_token_too_young_to_renew_is_stored_with_an_estimated_expiry(

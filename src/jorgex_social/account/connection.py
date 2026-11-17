@@ -93,8 +93,9 @@ def connect(
     switching = scope.connected(current) and current.external_account_id != account.id
     if switching and not replace:
         raise ConnectError(
-            f"this installation is connected to another {network} account; one installation "
-            "serves one account (use --replace to switch accounts)"
+            f"this installation is already connected to another {network} account, and adding a "
+            "second one is not available yet; --replace switches to a different account, "
+            "replacing the one connected"
         )
     try:
         renewal = instagram.refresh_token()
@@ -136,6 +137,19 @@ def connect(
         )
     log.info("connected", extra={"network": network, "username": account.username})
     return connection
+
+
+def mark_unreadable(sessions: sessionmaker, account_id: str, now: datetime) -> None:
+    """Records that an account's stored credential cannot be read, as the connection check does
+    when it finds that: the status the API reports and the incident for the operator. Used when
+    the client cannot even be built (a key that does not decrypt, no credential in the row), where
+    no check can run; the next check that can run closes the incident again."""
+    with sessions() as session, session.begin():
+        connection = session.get(Connection, account_id)
+        if connection is None:
+            return
+        connection.status = ConnectionStatus.UNREADABLE
+        incidents.sync(session, account_id, IncidentType.CREDENTIAL_UNREADABLE, True, now)
 
 
 class ConnectionTask:

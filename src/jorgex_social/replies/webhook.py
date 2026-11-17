@@ -73,6 +73,21 @@ class Notification:
     echoes: list[Echo] = field(default_factory=list)
     ignored: int = 0  # changes not used: other fields, odd shapes
 
+    @property
+    def useful(self) -> bool:
+        """Whether it brought anything to record or to act on. A notification that only carries
+        changes this service ignores says nothing about the webhook working for that account."""
+        return bool(self.comments or self.messages or self.echoes)
+
+
+@dataclass
+class Parsed:
+    """One notification: what each account it names brought, and the entries that name no
+    account at all (they cannot be attributed, so nothing is stored for them)."""
+
+    accounts: dict[str, Notification] = field(default_factory=dict)
+    unattributed: int = 0
+
 
 def _str_id(value: Any) -> str | None:
     if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value):
@@ -169,24 +184,25 @@ def _entry(entry: Any, notification: Notification, now: datetime) -> None:
         _messaging(item, notification)
 
 
-def parse(payload: Any, now: datetime) -> dict[str, Notification]:
+def parse(payload: Any, now: datetime) -> Parsed:
     """What a notification says, grouped by the account Meta attributes each entry to
     (`entry[].id`, "the Instagram professional account ID of your app user"). Never raises on an
     unexpected shape.
 
-    An entry without a usable id belongs to no account and is dropped here: its content cannot be
-    stored anywhere without guessing whose it is."""
-    found: dict[str, Notification] = {}
+    An entry without a usable id belongs to no account: it is counted, not guessed, and nothing is
+    stored for it."""
+    parsed = Parsed()
     if not isinstance(payload, dict) or payload.get("object") != "instagram":
-        return found
+        return parsed
     entries = payload.get("entry")
     for entry in entries if isinstance(entries, list) else []:
         # entry.id is the id the connection stores as its external account id.
         entry_id = _str_id(entry.get("id")) if isinstance(entry, dict) else None
         if entry_id is None:
+            parsed.unattributed += 1
             continue
-        _entry(entry, found.setdefault(entry_id, Notification()), now)
-    return found
+        _entry(entry, parsed.accounts.setdefault(entry_id, Notification()), now)
+    return parsed
 
 
 def signature_valid(secret: str, body: bytes, header: str | None) -> bool:
@@ -248,7 +264,13 @@ def _pause_for_echoes(
     if not echoes:
         return 0
     ids = [e.message_id for e in echoes]
-    ours = set(session.scalars(select(Delivery.result_ref).where(Delivery.result_ref.in_(ids))))
+    ours = set(
+        session.scalars(
+            select(Delivery.result_ref).where(
+                Delivery.account_id == account_id, Delivery.result_ref.in_(ids)
+            )
+        )
+    )
     paused = 0
     for echo in echoes:
         if echo.message_id in ours:
@@ -285,31 +307,46 @@ def _pause_for_echoes(
 
 def _account(request: Request, external_id: str, notification: Notification, now: datetime) -> bool:
     """Handles one account's part of a notification in its own transaction: its intake, its
-    pauses, its webhook health. False when no connection answers to `external_id`."""
+    pauses, its webhook health. False when no connection answers to `external_id`.
+
+    A failure is logged here with the account and the exception's type — never its message, which
+    could quote the body — and raised after the transaction is rolled back, for the endpoint to
+    answer 500 so Meta retries."""
     state = request.app.state
     settings = state.settings
-    with state.sessionmaker() as session, session.begin():
-        connection = scope.connection_by_external_id(session, state.network, external_id)
-        if connection is None:
-            return False
-        # A notification about this account is what shows the webhook works for it.
-        connection.webhook_notified_at = now
-        incidents.sync(session, connection.id, IncidentType.WEBHOOK_SILENT, False, now)
-        # Stateless and cheap: the settings of the installation and the account they act on.
-        intake = Intake(
-            connection.id,
-            retention=timedelta(days=settings.retention_days),
-            opt_out_words=settings.opt_out_words,
+    account_id: str | None = None
+    try:
+        with state.sessionmaker() as session, session.begin():
+            connection = scope.connection_by_external_id(session, state.network, external_id)
+            if connection is None:
+                return False
+            account_id = connection.id
+            # What the account's webhook delivered for real: a notification with nothing usable
+            # says nothing about whether the webhook works for it.
+            if notification.useful:
+                connection.webhook_notified_at = now
+                incidents.sync(session, account_id, IncidentType.WEBHOOK_SILENT, False, now)
+            # Stateless and cheap: the settings of the installation and the account they act on.
+            intake = Intake(
+                account_id,
+                retention=timedelta(days=settings.retention_days),
+                opt_out_words=settings.opt_out_words,
+            )
+            intake.comments(session, external_id, notification.comments, now, Source.WEBHOOK)
+            intake.messages(session, external_id, notification.messages, now, Source.WEBHOOK)
+            paused = _pause_for_echoes(
+                session, account_id, notification.echoes, now, state.human_pause
+            )
+    except Exception as exc:
+        log.error(
+            "webhook notification failed for an account",
+            extra={"account_id": account_id, "error_type": type(exc).__name__},
         )
-        intake.comments(session, external_id, notification.comments, now, Source.WEBHOOK)
-        intake.messages(session, external_id, notification.messages, now, Source.WEBHOOK)
-        paused = _pause_for_echoes(
-            session, connection.id, notification.echoes, now, state.human_pause
-        )
+        raise
     log.info(
         "webhook notification",
         extra={
-            "account_id": connection.id,
+            "account_id": account_id,
             "comments": len(notification.comments),
             "messages": len(notification.messages),
             "echoes": len(notification.echoes),
@@ -328,13 +365,18 @@ def _process(request: Request, payload: Any) -> None:
     the whole body; the events' unique key absorbs what was already stored."""
     state = request.app.state
     now = state.clock.now()
-    groups = parse(payload, now)
-    if not groups:
+    parsed = parse(payload, now)
+    if parsed.unattributed:
+        log.warning(
+            "webhook notification with entries that name no account",
+            extra={"entries": parsed.unattributed},
+        )
+    if not parsed.accounts:
         log.info("webhook notification with nothing to attribute to an account")
         return
     unknown: list[str] = []
     failures: list[Exception] = []
-    for external_id, notification in groups.items():
+    for external_id, notification in parsed.accounts.items():
         try:
             known = _account(request, external_id, notification, now)
         except Exception as exc:

@@ -5,6 +5,9 @@ import pytest
 from sqlalchemy import inspect
 
 from jorgex_social.account import scope
+from jorgex_social.account.credential import seal
+from jorgex_social.account.crypto import load_key
+from jorgex_social.account.models import Connection
 from jorgex_social.cli import main, worker_tasks
 from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
@@ -230,3 +233,36 @@ def test_the_worker_hands_the_opt_out_words_to_the_reply_task(settings, monkeypa
     accounts(sessions)
 
     assert seen["opt_out_words"] == ("halt", "enough")
+
+
+def test_the_worker_only_builds_tasks_for_connected_accounts_in_real_mode(settings, monkeypatch):
+    """A row a first write created has no account and no credential: the worker would have nothing
+    to call for it, so it waits until `connect-instagram` names it."""
+    real = Settings(
+        database_path=settings.database_path,
+        media_dir=settings.media_dir,
+        secret_key_file=settings.secret_key_file,
+        simulation=False,
+    )
+    key = load_key(real.secret_key_file)
+    sessions = make_sessionmaker(make_engine(real))
+    with sessions() as session, session.begin():
+        connected = Connection(network="instagram", external_account_id="1784", username="a")
+        session.add(connected)
+        session.flush()
+        connected.credential_encrypted = seal(key, connected.id, "token-not-real")
+        session.add(Connection(network="instagram", external_account_id="", username=""))
+        connected_id = connected.id
+    built = []
+
+    def recording(*args, **kwargs):
+        built.append(kwargs["account_id"])
+        return lambda sessions: None
+
+    for name in ("PublishTask", "SnapshotTask", "ConnectionTask", "ReplyTask"):
+        monkeypatch.setattr(f"jorgex_social.cli.{name}", recording)
+
+    _, accounts = worker_tasks(real, ManualClock(START), sessions, key)
+    accounts(sessions)
+
+    assert set(built) == {connected_id}  # the draft row is not worked on

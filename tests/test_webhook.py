@@ -513,8 +513,8 @@ def test_message_timestamps_in_milliseconds_and_comment_times_in_seconds():
     seconds = comment_payload("c", "media", "hi", at=START)
     later = START + timedelta(hours=1)
 
-    [message] = parse(millis, later)[ACCOUNT_ID].messages
-    [(_, comment)] = parse(seconds, later)[ACCOUNT_ID].comments
+    [message] = parse(millis, later).accounts[ACCOUNT_ID].messages
+    [(_, comment)] = parse(seconds, later).accounts[ACCOUNT_ID].comments
 
     assert message.created_at == START
     assert comment.timestamp == START
@@ -528,7 +528,7 @@ def test_deleted_and_self_test_messages_are_not_activity():
     deleted["entry"][0]["messaging"][0]["message"]["is_deleted"] = True
 
     for case in (payload, deleted):
-        notification = parse(case, START)[ACCOUNT_ID]
+        notification = parse(case, START).accounts[ACCOUNT_ID]
         assert (notification.messages, notification.echoes) == ([], [])
 
 
@@ -905,6 +905,39 @@ def test_notifications_for_another_account_do_not_count_as_the_webhook_working(
     assert MARKERS[0] not in logged(caplog)
 
 
+def test_a_notification_with_nothing_usable_does_not_count_as_the_webhook_working(
+    client, ig, sessions, task, clock
+):
+    """An entry of our account whose field this service ignores proves nothing about delivery: it
+    is not what closes webhook_silent either."""
+    media = publish(ig)
+    ig.add_comment(media, "hola")
+    task(sessions)
+    clock.advance(hours=24, minutes=1)
+    ig.add_comment(media, "otra")
+    task(sessions)
+    assert open_incidents(sessions) == 1
+
+    notify(
+        client,
+        {
+            "object": "instagram",
+            "entry": [
+                {
+                    "id": ACCOUNT_ID,
+                    "time": int(clock.now().timestamp()),
+                    "field": "live_comments",
+                    "value": {"id": "919", "text": "precio"},
+                }
+            ],
+        },
+    )
+
+    assert open_incidents(sessions) == 1
+    with sessions() as session:
+        assert session.scalar(select(Connection.webhook_notified_at)) is None
+
+
 def test_webhook_silent_needs_activity_the_webhook_missed(ig, sessions, task, clock):
     task(sessions)
     clock.advance(hours=25)
@@ -963,6 +996,55 @@ def test_a_failure_while_processing_answers_500_without_quoting_it(
     assert response.status_code == 500  # Meta retries
     assert "RuntimeError" in logged(caplog)
     assert MARKERS[0] not in logged(caplog)
+
+
+def test_each_account_that_fails_in_one_body_is_logged_with_its_type(
+    client, ig, sessions, task, caplog, clock, monkeypatch
+):
+    """With two accounts in the body, one line says which account failed and with what, so the
+    first failure is not the only trace; the message could quote the body, so only its type."""
+    caplog.set_level(logging.DEBUG)
+    second = add_account(sessions)
+    first = account_rows(sessions)[ACCOUNT_ID].id
+    media = publish(ig)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError(f"could not store {MARKERS[0]}")
+
+    monkeypatch.setattr(Intake, "comments", explode)
+    payload = comment_payload("916", media, f"precio {MARKERS[0]}", at=clock.now())
+    payload["entry"].append(
+        comment_payload("917", media, "precio", account=SECOND, at=clock.now())["entry"][0]
+    )
+
+    assert notify(client, payload).status_code == 500
+
+    failures = [
+        r
+        for r in caplog.records
+        if getattr(r, "error_type", None) == "RuntimeError"
+        and getattr(r, "account_id", None) is not None
+    ]
+    assert sorted(r.account_id for r in failures) == sorted([first, second])
+    assert MARKERS[0] not in logged(caplog)
+
+
+def test_entries_that_name_no_account_are_counted_not_stored(
+    client, headers, ig, sessions, task, caplog
+):
+    """An entry with no `id` cannot be attributed: counted in the log, and the entries that do name
+    an account are still processed."""
+    caplog.set_level(logging.DEBUG)
+    make_rule(client, headers)
+    media = publish(ig)
+    payload = comment_payload("918", media, "precio")
+    payload["entry"].insert(0, {"time": int(START.timestamp()), "field": "comments"})
+
+    assert notify(client, payload).status_code == 200
+
+    assert [event.external_ref for event in events(sessions)] == ["918"]
+    counted = [r for r in caplog.records if getattr(r, "entries", None) == 1]
+    assert counted
 
 
 def test_the_access_log_never_shows_query_strings(app, caplog):

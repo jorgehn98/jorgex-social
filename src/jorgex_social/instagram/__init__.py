@@ -55,7 +55,7 @@ class Clients:
     In real mode every client reads its own row on each call, so a renewal or a reconnection
     applies at once without building it again. Building one account's client can fail (a
     credential that does not decrypt, a missing key); the caller logs it and the other accounts go
-    on with theirs."""
+    on with theirs. `forget` drops the one of an account that is gone."""
 
     def __init__(self, settings: Settings, clock: Clock, key: bytes | None = None) -> None:
         self._settings = settings
@@ -69,3 +69,8 @@ class Clients:
             client = make_instagram(self._settings, self._clock, self._key, connection)
             self._built[connection.id] = client
         return client
+
+    def forget(self, account_id: str) -> None:
+        """Drops the client of an account that is gone. A new connection gets a new id, so it never
+        needs the one an earlier account left behind."""
+        self._built.pop(account_id, None)

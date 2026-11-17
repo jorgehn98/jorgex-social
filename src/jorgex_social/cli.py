@@ -312,7 +312,10 @@ def worker_tasks(
             ),
         ]
 
-    return [PurgeTask(settings.media_dir, clock), worker.AccountTasks(accounts, tasks_for)]
+    return [
+        PurgeTask(settings.media_dir, clock),
+        worker.AccountTasks(accounts, tasks_for, clock, forget=clients.forget),
+    ]
 
 
 def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:

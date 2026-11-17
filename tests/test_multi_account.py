@@ -5,6 +5,7 @@ a client per connection (`instagram.Clients`), and checks that nothing of one en
 and that one failing, restricted or capped account leaves the other working.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -80,12 +81,10 @@ def fakes(clock) -> dict[str, FakeInstagram]:
 
 
 def headers_for(sessions, account_id, **grants) -> dict:
+    grants = grants or {"posts": "write", "scheduling": "write", "stats": "read"}
     with sessions() as session, session.begin():
         _, secret = create_token(
-            session,
-            f"agent-{account_id}",
-            grants or {"posts": "write", "scheduling": "write", "stats": "read"},
-            account_id,
+            session, "-".join((account_id, *sorted(grants))), grants, account_id
         )
     return {"Authorization": f"Bearer {secret}"}
 
@@ -120,24 +119,29 @@ def add_rule(sessions, account_id, channel="message", keywords=("precio",)) -> s
         return rule.id
 
 
+def publish_task(clock, settings, fakes, connection) -> PublishTask:
+    return PublishTask(
+        fakes[connection.external_account_id],
+        clock,
+        settings.media_dir,
+        PUBLIC,
+        account_id=connection.id,
+        sleep=lambda seconds: clock.advance(seconds=seconds),
+    )
+
+
+def accounts_of_simulation(sessions):
+    with sessions() as session:
+        return scope.accounts_of(session, "simulation")
+
+
 def account_tasks(clock, settings, fakes, *, reply=None) -> AccountTasks:
     """What the worker builds each pass: the tasks of each account, with its own client."""
-
-    def accounts(sessions):
-        with sessions() as session:
-            return scope.accounts_of(session, "simulation")
 
     def tasks_for(connection):
         instagram = fakes[connection.external_account_id]
         return [
-            PublishTask(
-                instagram,
-                clock,
-                settings.media_dir,
-                PUBLIC,
-                account_id=connection.id,
-                sleep=lambda seconds: clock.advance(seconds=seconds),
-            ),
+            publish_task(clock, settings, fakes, connection),
             ConnectionTask(instagram, clock, None, account_id=connection.id),
             ReplyTask(
                 instagram,
@@ -148,7 +152,7 @@ def account_tasks(clock, settings, fakes, *, reply=None) -> AccountTasks:
             ),
         ]
 
-    return AccountTasks(accounts, tasks_for)
+    return AccountTasks(accounts_of_simulation, tasks_for, clock)
 
 
 def post_status(sessions, post_id) -> str:
@@ -169,10 +173,13 @@ def rows_by_account(sessions) -> dict[str, Connection]:
 
 
 def incidents(sessions) -> list[tuple[str | None, str]]:
+    """The open incidents, as (account id, type)."""
     with sessions() as session:
         return [
             (incident.account_id, incident.type)
-            for incident in session.scalars(select(ChannelIncident))
+            for incident in session.scalars(
+                select(ChannelIncident).where(ChannelIncident.closed_at.is_(None))
+            )
         ]
 
 
@@ -230,34 +237,59 @@ def test_a_credential_error_in_one_account_does_not_stop_the_other(
     assert (failed.status, failed.failure) == ("failed", "credential_unavailable")
 
 
-def test_an_account_whose_client_cannot_be_built_does_not_stop_the_other(
+def test_an_account_whose_client_cannot_be_built_is_reported_as_unreadable(
     client, sessions, settings, clock, accounts, fakes, caplog
 ):
+    """Without a client the account would never get its check, so the worker records it as
+    unreadable with its incident instead of leaving it saying `ok`; the other account keeps
+    publishing, and the pass that can build it again closes the incident."""
+    caplog.set_level(logging.ERROR)
+    first_post = due_post(client, headers_for(sessions, accounts[FIRST]))
     second_post = due_post(client, headers_for(sessions, accounts[SECOND]))
+    first_headers = headers_for(sessions, accounts[FIRST], account="read")
 
-    def accounts_of_simulation(sessions):
-        with sessions() as session:
-            return scope.accounts_of(session, "simulation")
-
-    def tasks_for(connection):
+    def cannot_be_built(connection):
         if connection.external_account_id == FIRST:
             raise CredentialUnavailable("the stored credential does not decrypt")
+        return [publish_task(clock, settings, fakes, connection)]
+
+    runner = AccountTasks(accounts_of_simulation, cannot_be_built, clock)
+    runner(sessions)
+    runner(sessions)  # the build is retried; the traceback is not logged again
+
+    rows = rows_by_account(sessions)
+    assert rows[accounts[FIRST]].status == "unreadable"
+    assert (accounts[FIRST], "credential_unreadable") in incidents(sessions)
+    assert client.get("/v1/account", headers=first_headers).json()["status"] == "unreadable"
+    assert post_status(sessions, first_post) == "scheduled"  # nothing to publish it with
+    assert post_status(sessions, second_post) == "published"
+    tracebacks = [
+        r
+        for r in caplog.records
+        if r.exc_info and getattr(r, "account_id", None) == accounts[FIRST]
+    ]
+    assert len(tracebacks) == 1
+    retried = [
+        r
+        for r in caplog.records
+        if getattr(r, "error_type", None) == "CredentialUnavailable"
+        and getattr(r, "account_id", None) == accounts[FIRST]
+    ]
+    assert retried  # later passes say what failed, without the body of the first traceback
+
+    def fixed(connection):
         return [
-            PublishTask(
-                fakes[SECOND],
-                clock,
-                settings.media_dir,
-                PUBLIC,
-                account_id=connection.id,
-                sleep=lambda seconds: clock.advance(seconds=seconds),
-            )
+            publish_task(clock, settings, fakes, connection),
+            ConnectionTask(
+                fakes[connection.external_account_id], clock, None, account_id=connection.id
+            ),
         ]
 
-    AccountTasks(accounts_of_simulation, tasks_for)(sessions)
+    AccountTasks(accounts_of_simulation, fixed, clock)(sessions)
 
-    assert post_status(sessions, second_post) == "published"
-    failed = [r for r in caplog.records if getattr(r, "account_id", None) == accounts[FIRST]]
-    assert failed and all(r.levelname == "ERROR" for r in failed)
+    assert rows_by_account(sessions)[accounts[FIRST]].status == "ok"
+    assert (accounts[FIRST], "credential_unreadable") not in incidents(sessions)
+    assert post_status(sessions, first_post) == "published"
 
 
 def test_a_new_account_is_picked_up_on_a_later_pass_without_a_restart(
@@ -406,3 +438,42 @@ def test_events_and_deliveries_are_the_account_of_the_task(
     assert sorted(deliveries) == sorted([accounts[FIRST], accounts[SECOND]])
     assert statuses_of(sessions, accounts[FIRST]) == ["sent"]
     assert statuses_of(sessions, accounts[SECOND]) == ["sent"]
+
+
+# What the worker keeps between passes
+
+
+def test_the_client_of_an_account_that_is_gone_is_forgotten(sessions, settings, clock, accounts):
+    """A deleted connection takes its client with it: nothing that keeps per-account state survives
+    the account it belonged to."""
+    clients = Clients(settings, clock, None)
+    with sessions() as session:
+        first_row = session.get_one(Connection, accounts[FIRST])
+    runner = AccountTasks(
+        accounts_of_simulation, lambda connection: [], clock, forget=clients.forget
+    )
+    runner(sessions)
+    kept = clients(first_row)
+
+    with sessions() as session, session.begin():
+        session.delete(session.get_one(Connection, accounts[FIRST]))
+    runner(sessions)
+
+    assert clients(first_row) is not kept
+
+
+def test_the_worker_says_once_that_it_has_no_account_to_work_on(sessions, clock, caplog):
+    """An installation with no account yet waits quietly: one line, not one per pass every ten
+    seconds."""
+    caplog.set_level(logging.INFO, logger="jorgex_social.worker")
+    runner = AccountTasks(lambda sessions: [], lambda connection: [], clock)
+
+    runner(sessions)
+    runner(sessions)
+
+    lines = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "no account to work on yet; waiting for one"
+    ]
+    assert len(lines) == 1
