@@ -41,8 +41,9 @@ COOKIE = "jxs_session"
 # The account the operator used last, for where `/ui/` and the old URLs send them next. It never
 # decides what a request works on: every page and form carries its account in the URL.
 ACCOUNT_COOKIE = "jxs_account"
-# A convenience, not a login: it lapses, and `/ui/` falls back to the first connected account.
-ACCOUNT_COOKIE_MAX_AGE = 180 * 24 * 60 * 60
+# A convenience, not a login: it lapses with the session, and `/ui/` falls back to the first
+# connected account.
+ACCOUNT_COOKIE_MAX_AGE = int(operator.SESSION_LIFETIME.total_seconds())
 INVALID = "Invalid credentials."
 TOO_MANY = "Too many attempts. Try again later."
 BUSY = "The server is busy. Try again in a moment."
@@ -303,9 +304,10 @@ def _login_redirect(request: Request, reason: LoginRequired) -> Response:
         # The form cannot be kept, but the operator goes back to it rather than to Home.
         location += "?" + urlencode({"next": SETTINGS_HOME})
     response = RedirectResponse(location, status_code=303, headers=HEADERS)
-    # Expired or unknown: no use keeping it.
+    # Expired or unknown: no use keeping it, nor the account it was used for.
     if COOKIE in request.cookies and not isinstance(reason, SignInTooOld):
         response.delete_cookie(COOKIE, path="/ui")
+        response.delete_cookie(ACCOUNT_COOKIE, path="/ui")
     return response
 
 
@@ -484,6 +486,8 @@ def logout(request: Request):
     _end_presented_session(request)
     response = RedirectResponse("/ui/login", status_code=303, headers=HEADERS)
     response.delete_cookie(COOKIE, path="/ui")
+    # The account was a convenience of that session, not something to keep after signing out.
+    response.delete_cookie(ACCOUNT_COOKIE, path="/ui")
     return response
 
 
@@ -621,16 +625,16 @@ def media_file(media_id: str, request: Request, session: ReadSessionDep, account
     """The image of a post, for its thumbnail; only JPEGs of this account still on disk."""
     media = session.get(Media, media_id)
     if (
-        media is None
-        or media.account_id != account.id
-        or media.type != MediaType.JPEG
-        or media.deleted_at
+        media is not None
+        and media.account_id == account.id
+        and media.type == MediaType.JPEG
+        and not media.deleted_at
     ):
-        raise PageNotFound("media")
-    path = storage.path_of(request.app.state.settings.media_dir, media)
-    if not path.is_file():
-        raise PageNotFound("media")
-    return FileResponse(path, media_type="image/jpeg", headers=HEADERS)
+        path = storage.path_of(request.app.state.settings.media_dir, media)
+        if path.is_file():
+            return FileResponse(path, media_type="image/jpeg", headers=HEADERS)
+    # Under the account's pages, like every other 404 of one: the account is still known.
+    return render_account_page(request, account, "not_found.html", 404, what="media")
 
 
 @account_pages.get("/stats")

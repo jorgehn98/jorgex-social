@@ -12,18 +12,24 @@
 </head>
 <body>
 {% block body %}
-{# Every page of an account builds its links from `base`, `/ui/a/{account}`; a page that is not
-   one account's (Settings, sign-in) has none, and its links go through the old paths, which
-   redirect to the account the operator used last. #}
+{# Every page of an account builds its links from `base`, `/ui/a/{account}`. A page that is not
+   one account's (Settings, an unknown account, the home with nothing connected) has none: it
+   offers only Home, which opens the account the operator last used or lets them pick one. #}
 {% set nav_base = base or "/ui" %}
 <header class="top">
   <div class="top-inner">
     <a class="wordmark" href="{{ nav_base }}/">{% include "_wordmark.html" %}</a>
     <nav aria-label="Sections">
+      {% if base %}
       {% for path, label in [("/", "Home"), ("/posts", "Posts"), ("/stats", "Stats"), ("/rules", "Rules"), ("/events", "Events"), ("/incidents", "Incidents")] %}
       {% set href = nav_base ~ path %}
       <a href="{{ href }}"{% if request.url.path == href or (path != "/" and request.url.path.startswith(href)) %} aria-current="page"{% endif %}>{{ label }}</a>
       {% endfor %}
+      {% else %}
+      {# A page that is not one account's has no section to open: the sections need an account, and
+         `/ui/` is where the operator picks the one they mean. #}
+      <a href="{{ nav_base }}/"{% if request.url.path == nav_base ~ "/" %} aria-current="page"{% endif %}>Home</a>
+      {% endif %}
     </nav>
     {% if active_account %}
     <a class="account-chip" href="{{ nav_base }}/" title="The account these pages work on">@{{ active_account.username }}</a>

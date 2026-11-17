@@ -32,15 +32,10 @@ from jorgex_social.ui.routes import ACCOUNT_COOKIE, COOKIE, INVALID, cookie_is_s
 START = datetime(2026, 10, 30, 12, 0, 10, tzinfo=UTC)
 PASSWORD = "correct horse battery staple"
 TOTP_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
-PAGES = [
-    "/ui/",
-    "/ui/posts",
-    "/ui/stats",
-    "/ui/rules",
-    "/ui/events",
-    "/ui/incidents",
-    "/ui/settings/appearance",
-]
+# The pages of one account, as the suffix of `/ui/a/{account}`: "" is its home.
+SECTIONS = ["", "/posts", "/stats", "/rules", "/events", "/incidents"]
+# The URLs from before the account went into the path: a bookmark may still hold one.
+LEGACY = ["/ui/posts", "/ui/stats", "/ui/rules", "/ui/events", "/ui/incidents"]
 
 
 @pytest.fixture
@@ -105,7 +100,16 @@ def rows(app, query, **params):
 
 
 @pytest.mark.parametrize(
-    "path", [*PAGES, "/ui/settings", "/ui/posts/any", "/ui/stats/any", "/ui/media/any"]
+    "path",
+    [
+        "/ui/",
+        "/ui/settings",
+        "/ui/settings/appearance",
+        *LEGACY,
+        "/ui/posts/any",
+        "/ui/stats/any",
+        "/ui/media/any",
+    ],
 )
 def test_pages_redirect_to_login_without_a_session(client, path):
     response = client.get(path, follow_redirects=False)
@@ -388,8 +392,21 @@ def test_the_database_holds_one_operator_at_most(app, clock):
 
 
 @pytest.mark.usefixtures("enrolled")
-@pytest.mark.parametrize("path", PAGES)
-def test_pages_render_with_an_empty_database(client, clock, path):
+@pytest.mark.parametrize("path", SECTIONS)
+def test_account_pages_render_with_an_empty_database(client, clock, connected, path):
+    log_in(client, clock)
+
+    response = client.get(f"{connected}{path or '/'}")
+
+    assert response.status_code == 200
+    assert "<script" not in response.text
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.usefixtures("enrolled")
+@pytest.mark.parametrize("path", ["/ui/", "/ui/settings/appearance"])
+def test_the_installation_pages_render_with_an_empty_database(client, clock, path):
     log_in(client, clock)
 
     response = client.get(path)
@@ -1657,11 +1674,13 @@ JPEG = b"\xff\xd8\xff\xe0" + b"0" * 64
 
 @pytest.fixture
 def two(app, settings, clock, enrolled):
-    """Two connected accounts of the mode, the first one older, each with a post and a photo: every
-    page has something of its own to show, and something of the other one it must not."""
+    """Two connected accounts of the mode, the first one older, each with a post and a photo, a
+    rule with an event and its reply, an incident and a day of stats. Every page has something of
+    its own to show, and something of the other account it must not."""
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     (settings.media_dir / "photo.jpeg").write_bytes(JPEG)
     now = clock.now()
+    day = datetime(2026, 10, 29, tzinfo=UTC)
     with app.state.sessionmaker() as session, session.begin():
         first = scope.current_account(session, app.state.network)
         first.external_account_id, first.username = FIRST, "first_account"
@@ -1671,9 +1690,9 @@ def two(app, settings, clock, enrolled):
         session.add(second)
         session.flush()
         found = {}
-        for account, caption in (
-            (first, "A piece of the first"),
-            (second, "A piece of the second"),
+        for account, piece, reach, followers in (
+            (first, "first", 301, 1201),
+            (second, "second", 601, 2201),
         ):
             media = Media(
                 account_id=account.id,
@@ -1688,19 +1707,83 @@ def two(app, settings, clock, enrolled):
                 account_id=account.id,
                 type="image",
                 status="published",
-                caption=caption,
+                caption=f"A piece of the {piece}",
                 content_hash="b" * 64,
                 published_at=now,
                 items=[PostItem(position=0, media_id=media.id)],
             )
             session.add(post)
             session.flush()
+            rule = Rule(
+                account_id=account.id,
+                name=f"Rule of the {piece} account",
+                channel="comment",
+                priority=1,
+                active=True,
+                activated_at=now,
+                content={
+                    "keywords": [f"word of the {piece}"],
+                    "private_replies": [f"Reply of the {piece}"],
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(rule)
+            session.flush()
+            event = Event(
+                account_id=account.id,
+                type="comment",
+                external_ref=f"comment-of-the-{piece}",
+                occurred_at=now,
+                received_at=now,
+                rule_id=rule.id,
+            )
+            session.add(event)
+            session.flush()
+            session.add(
+                Delivery(
+                    account_id=account.id,
+                    event_id=event.id,
+                    rule_id=rule.id,
+                    action="private_reply",
+                    status="sent",
+                    text=f"Reply of the {piece}",
+                    created_at=now,
+                )
+            )
+            session.add(
+                ChannelIncident(
+                    account_id=account.id,
+                    type="credential_expiring",
+                    opened_at=now - timedelta(hours=2),
+                    detail={"who": f"the {piece} account"},
+                )
+            )
+            session.add(
+                AccountSnapshot(
+                    account_id=account.id,
+                    period_start=day,
+                    period_end=day + timedelta(days=1),
+                    taken_at=now,
+                    followers=followers,
+                    metrics={"reach": reach, "views": 500, "accounts_engaged": 20},
+                )
+            )
             found[account.external_account_id] = {
                 "id": account.id,
                 "base": f"/ui/a/{account.id}",
                 "post": post.id,
                 "media": media.id,
             }
+        # The operator's own: no account, so every account sees it, by design.
+        session.add(
+            ChannelIncident(
+                account_id=None,
+                type="sign_in_password_accepted",
+                opened_at=now - timedelta(minutes=5),
+                detail={"failed": 3},
+            )
+        )
     return {"first": found[FIRST], "second": found[SECOND]}
 
 
@@ -1745,6 +1828,7 @@ def test_the_home_opens_the_account_used_last(client, clock, two):
     assert "httponly" in cookie
     assert "samesite=strict" in cookie
     assert "path=/ui" in cookie
+    assert f"max-age={int(operator.SESSION_LIFETIME.total_seconds())}" in cookie
     assert "secure" not in cookie  # loopback over plain http, like the session cookie
 
 
@@ -1818,7 +1902,11 @@ def test_a_post_or_a_photo_of_another_account_is_not_found(client, clock, two):
     post = client.get(f"{second['base']}/posts/{first['post']}")
     assert post.status_code == 404
     assert "There is no such post" in post.text
-    assert client.get(f"{second['base']}/media/{first['media']}").status_code == 404
+
+    media = client.get(f"{second['base']}/media/{first['media']}")
+    assert media.status_code == 404
+    # Still inside the account: its own links, never an old path that would open another one.
+    assert f'href="{second["base"]}/posts"' in media.text
 
     served = client.get(f"{first['base']}/media/{first['media']}")
     assert served.status_code == 200
@@ -1843,10 +1931,17 @@ def test_an_account_of_the_other_mode_or_not_connected_is_not_found(client, cloc
 
 
 def test_an_account_page_without_a_session_asks_for_credentials(client, two):
-    response = client.get(f"{two['first']['base']}/posts", follow_redirects=False)
+    """The session comes before the account: without one, an id is never answered with a 404."""
+    invented = "/ui/a/0193fa00-0000-7000-8000-000000000000"
 
-    assert response.status_code == 303
-    assert response.headers["location"].startswith("/ui/login?next=")
+    for base, path in (
+        (invented, "/posts"),
+        (two["first"]["base"], "/posts"),
+        (two["first"]["base"], "/media/whatever"),
+    ):
+        response = client.get(f"{base}{path}", follow_redirects=False)
+        assert response.status_code == 303, (base, path)
+        assert response.headers["location"].startswith("/ui/login?next="), (base, path)
 
 
 def test_an_old_url_opens_the_same_page_under_the_last_account(client, clock, two):
@@ -1877,3 +1972,73 @@ def test_a_page_is_read_only_and_an_old_url_takes_no_post_at_all(client, clock, 
     assert client.post("/ui/posts").status_code == 405
     assert client.post("/ui/rules").status_code == 405
     assert client.post(f"{two['first']['base']}/posts").status_code == 405
+
+
+def test_every_page_of_an_account_shows_only_its_rows(client, clock, two):
+    log_in(client, clock)
+    marks = {
+        "first": {
+            "rules": "Rule of the first account",
+            "events": "comment-of-the-first",
+            "incidents": "who=the first account",
+            "stats": "1,201",
+        },
+        "second": {
+            "rules": "Rule of the second account",
+            "events": "comment-of-the-second",
+            "incidents": "who=the second account",
+            "stats": "2,201",
+        },
+    }
+
+    for name, other in (("first", "second"), ("second", "first")):
+        base = two[name]["base"]
+        for section, mark in marks[name].items():
+            page = client.get(f"{base}/{section}").text
+            assert mark in page, (name, section)
+            assert marks[other][section] not in page, (name, section)
+        # The operator's own incidents belong to the installation, so every account sees them.
+        assert "sign_in_password_accepted" in client.get(f"{base}/incidents").text
+
+
+def test_signing_out_forgets_the_last_account(client, clock, two):
+    log_in(client, clock)
+    assert client.get(f"{two['second']['base']}/").status_code == 200
+
+    response = client.post("/ui/logout", follow_redirects=False)
+
+    cleared = response.headers.get_list("set-cookie")
+    assert any(
+        cookie.startswith(f"{ACCOUNT_COOKIE}=") and "Max-Age=0" in cookie for cookie in cleared
+    )
+
+
+def test_an_expired_session_forgets_the_last_account(client, clock, two):
+    log_in(client, clock)
+    assert client.get(f"{two['second']['base']}/").status_code == 200
+    clock.advance(days=8)
+
+    response = client.get(f"{two['first']['base']}/posts", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/ui/login")
+    cleared = response.headers.get_list("set-cookie")
+    assert any(
+        cookie.startswith(f"{ACCOUNT_COOKIE}=") and "Max-Age=0" in cookie for cookie in cleared
+    )
+
+
+def test_the_last_account_cookie_is_secure_over_https(settings, clock, two):
+    public = "https://social.example.com"
+    app = create_app(replace(settings, public_url=public), clock)
+    client = TestClient(app, base_url=public, headers={"origin": public})
+    assert log_in(client, clock).status_code == 303
+
+    response = client.get(f"{two['first']['base']}/")
+
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"{ACCOUNT_COOKIE}={two['first']['id']}")
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+    assert "SameSite=strict" in cookie
+    assert "Path=/ui" in cookie
