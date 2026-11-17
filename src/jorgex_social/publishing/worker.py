@@ -2,6 +2,9 @@
 
 Every step commits in its own short transaction and no transaction is open during a call to
 Instagram, so a crash at any point leaves rows the next pass can resolve.
+
+One task per account: it publishes and resolves that account's posts with that account's
+credential, kill switch and quota (worker.AccountTasks builds one per connection).
 """
 
 import logging
@@ -14,8 +17,8 @@ from pathlib import Path
 from sqlalchemy import func, or_, select, union
 from sqlalchemy.orm import Session, sessionmaker
 
-from jorgex_social.account import audit, kill_switch, scope
-from jorgex_social.account.models import Outcome
+from jorgex_social.account import audit, kill_switch
+from jorgex_social.account.models import Connection, Outcome
 from jorgex_social.clock import Clock
 from jorgex_social.instagram.client import TIMEOUT_SECONDS
 from jorgex_social.instagram.errors import (
@@ -161,11 +164,13 @@ class PublishTask:
         media_dir: Path,
         public_base_url: str | None,
         *,
+        account_id: str,
         grace: timedelta = timedelta(minutes=30),
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.instagram = instagram
         self.clock = clock
+        self.account_id = account_id
         self.media_dir = media_dir
         self.public_base_url = public_base_url
         self.grace = grace
@@ -183,14 +188,13 @@ class PublishTask:
             self._started_at = self.clock.now()
         self.publish_due(sessions)
         self.resolve(sessions)
-        self.purge(sessions)
 
     # Due posts
 
     def publish_due(self, sessions: sessionmaker) -> None:
         now = self.clock.now()
         with sessions() as session, session.begin():
-            account = scope.account_of(session, self.instagram.network)
+            account = session.get(Connection, self.account_id)
             if account is None or account.kill_switch:
                 # Posts stay scheduled; once it is off, those past the grace window fail below.
                 return
@@ -220,7 +224,7 @@ class PublishTask:
     def _start(self, sessions: sessionmaker, now: datetime) -> _Plan | None:
         """Marks the next due post publishing, with an attempt and public URLs, in one commit."""
         with sessions() as session, session.begin():
-            account = scope.account_of(session, self.instagram.network)
+            account = session.get(Connection, self.account_id)
             if account is None or account.kill_switch:
                 return None
             post = session.scalar(
@@ -483,12 +487,11 @@ class PublishTask:
         # safety net if the lock is ever bypassed).
         cutoff = max(now - STALE_ATTEMPT, self._started_at or now - STALE_ATTEMPT)
         with sessions() as session, session.begin():
-            account_id = scope.account_id_of(session, self.instagram.network)
             stale = session.scalars(
                 select(PublishAttempt)
                 .join(Post)
                 .where(
-                    Post.account_id == account_id,
+                    Post.account_id == self.account_id,
                     PublishAttempt.result == AttemptResult.IN_PROGRESS,
                     PublishAttempt.started_at < cutoff,
                 )
@@ -508,7 +511,7 @@ class PublishTask:
                     select(PublishAttempt, Post)
                     .join(Post)
                     .where(
-                        Post.account_id == account_id,
+                        Post.account_id == self.account_id,
                         Post.status == PostStatus.OUTCOME_UNKNOWN,
                         PublishAttempt.result == AttemptResult.UNKNOWN,
                         PublishAttempt.resolved_at.is_(None),
@@ -569,17 +572,16 @@ class PublishTask:
             return None
         product = ProductType.REELS if pending.type == PostType.REEL else ProductType.FEED
         with sessions() as session:
-            account_id = scope.account_id_of(session, self.instagram.network)
             taken = set(
                 session.scalars(
                     select(Post.external_ref).where(
-                        Post.account_id == account_id, Post.external_ref.is_not(None)
+                        Post.account_id == self.account_id, Post.external_ref.is_not(None)
                     )
                 )
             )
         listed = self.instagram.list_media(max_items=RECENT_MEDIA_TO_SEARCH)
         # Already paid for: it also refreshes what agents see of the account.
-        store_recent_media(sessions, account_id, listed, self.clock.now())
+        store_recent_media(sessions, self.account_id, listed, self.clock.now())
         candidates = [
             m
             for m in listed
@@ -670,28 +672,43 @@ class PublishTask:
             media.delete_at = self.clock.now() + KEEP_AFTER_PUBLISH
         bind_to_published(session, post, self.clock.now())
 
-    def purge(self, sessions: sessionmaker) -> None:
-        """Deletes files no post still in play uses: seven days after publishing, or seven days
-        after upload when never published (unused, or only in cancelled posts)."""
-        now = self.clock.now()
-        in_use = union(
-            select(PostItem.media_id).join(Post).where(Post.status.in_(ACTIVE)),
-            select(Post.cover_media_id).where(
-                Post.status.in_(ACTIVE), Post.cover_media_id.is_not(None)
-            ),
-        )
-        with sessions() as session, session.begin():
-            expired = session.scalars(
-                select(Media).where(
-                    or_(
-                        Media.delete_at <= now,
-                        Media.delete_at.is_(None) & (Media.created_at <= now - KEEP_AFTER_PUBLISH),
-                    ),
-                    Media.deleted_at.is_(None),
-                    Media.id.not_in(in_use),
-                )
+
+def purge(sessions: sessionmaker, media_dir: Path, now: datetime) -> None:
+    """Deletes files no post still in play uses: seven days after publishing, or seven days after
+    upload when never published (unused, or only in cancelled posts). A media belongs to the post
+    that uses it, and a post to one account: this looks at every account's posts, so it runs once
+    per pass, not once per account."""
+    in_use = union(
+        select(PostItem.media_id).join(Post).where(Post.status.in_(ACTIVE)),
+        select(Post.cover_media_id).where(
+            Post.status.in_(ACTIVE), Post.cover_media_id.is_not(None)
+        ),
+    )
+    with sessions() as session, session.begin():
+        expired = session.scalars(
+            select(Media).where(
+                or_(
+                    Media.delete_at <= now,
+                    Media.delete_at.is_(None) & (Media.created_at <= now - KEEP_AFTER_PUBLISH),
+                ),
+                Media.deleted_at.is_(None),
+                Media.id.not_in(in_use),
             )
-            for media in expired:
-                path_of(self.media_dir, media).unlink(missing_ok=True)
-                media.deleted_at = now
-                revoke_url(media)
+        )
+        for media in expired:
+            path_of(media_dir, media).unlink(missing_ok=True)
+            media.deleted_at = now
+            revoke_url(media)
+
+
+class PurgeTask:
+    """Worker task: removes the media files nothing uses any more. It is not per account."""
+
+    __name__ = "purge"
+
+    def __init__(self, media_dir: Path, clock: Clock) -> None:
+        self.media_dir = media_dir
+        self.clock = clock
+
+    def __call__(self, sessions: sessionmaker) -> None:
+        purge(sessions, self.media_dir, self.clock.now())

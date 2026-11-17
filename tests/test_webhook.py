@@ -17,15 +17,16 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from jorgex_social.access.tokens import create_token
-from jorgex_social.account import scope
+from jorgex_social.account import incidents, scope
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import ChannelIncident, Connection
+from jorgex_social.account.models import ChannelIncident, Connection, IncidentType
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerRequest
 from jorgex_social.logs import JsonFormatter, hide_query_strings
 from jorgex_social.publishing.models import Post
+from jorgex_social.replies.intake import Intake
 from jorgex_social.replies.models import Conversation, Delivery, Event
 from jorgex_social.replies.task import ReplyTask
 from jorgex_social.replies.webhook import parse
@@ -99,11 +100,11 @@ def headers(app):
 
 
 @pytest.fixture
-def task(ig, clock, sessions):
+def task(ig, clock, sessions, account_id):
     # The connection check records the account's id, as it does first in the worker. Polling
     # every two minutes, as in production, so a pass in between only sends.
-    ConnectionTask(ig, clock, None)(sessions)
-    return ReplyTask(ig, clock, webhook=True)
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    return ReplyTask(ig, clock, account_id=account_id, webhook=True)
 
 
 def make_rule(client, headers, channel="comment", content=COMMENT_RULE):
@@ -124,12 +125,14 @@ def publish(ig) -> str:
 # ("Instagram webhook notification examples").
 
 
-def comment_payload(comment_id, media_id, text, *, author=PERSON, at=START, **extra):
+def comment_payload(
+    comment_id, media_id, text, *, author=PERSON, account=ACCOUNT_ID, at=START, **extra
+):
     return {
         "object": "instagram",
         "entry": [
             {
-                "id": ACCOUNT_ID,
+                "id": account,
                 "time": int(at.timestamp()),
                 "field": "comments",
                 "value": {
@@ -144,14 +147,16 @@ def comment_payload(comment_id, media_id, text, *, author=PERSON, at=START, **ex
     }
 
 
-def message_payload(mid, text, *, sender=PERSON, recipient=ACCOUNT_ID, at=START, echo=False):
+def message_payload(
+    mid, text, *, sender=PERSON, recipient=ACCOUNT_ID, account=ACCOUNT_ID, at=START, echo=False
+):
     millis = int(at.timestamp() * 1000)
     message = {"mid": mid, "text": text, **({"is_echo": True} if echo else {})}
     return {
         "object": "instagram",
         "entry": [
             {
-                "id": ACCOUNT_ID,
+                "id": account,
                 "time": millis,
                 "messaging": [
                     {
@@ -508,8 +513,8 @@ def test_message_timestamps_in_milliseconds_and_comment_times_in_seconds():
     seconds = comment_payload("c", "media", "hi", at=START)
     later = START + timedelta(hours=1)
 
-    [message] = parse(millis, ACCOUNT_ID, later).messages
-    [(_, comment)] = parse(seconds, ACCOUNT_ID, later).comments
+    [message] = parse(millis, later).accounts[ACCOUNT_ID].messages
+    [(_, comment)] = parse(seconds, later).accounts[ACCOUNT_ID].comments
 
     assert message.created_at == START
     assert comment.timestamp == START
@@ -523,8 +528,155 @@ def test_deleted_and_self_test_messages_are_not_activity():
     deleted["entry"][0]["messaging"][0]["message"]["is_deleted"] = True
 
     for case in (payload, deleted):
-        notification = parse(case, ACCOUNT_ID, START)
+        notification = parse(case, START).accounts[ACCOUNT_ID]
         assert (notification.messages, notification.echoes) == ([], [])
+
+
+# Two accounts in one installation (decision 10)
+
+SECOND = "17841488888888888"
+
+
+def add_account(sessions, username="second_account") -> str:
+    with sessions() as session, session.begin():
+        connection = Connection(network="simulation", external_account_id=SECOND, username=username)
+        session.add(connection)
+        session.flush()
+        return connection.id
+
+
+def add_message_rule(sessions, account_id) -> None:
+    from jorgex_social.replies.rules import Rule
+
+    with sessions() as session, session.begin():
+        session.add(
+            Rule(
+                account_id=account_id,
+                name="dm",
+                channel="message",
+                priority=1,
+                active=True,
+                activated_at=START - timedelta(days=1),
+                content=MESSAGE_RULE,
+                created_at=START,
+                updated_at=START,
+            )
+        )
+
+
+def account_rows(sessions) -> dict[str, Connection]:
+    with sessions() as session:
+        return {row.external_account_id: row for row in session.scalars(select(Connection))}
+
+
+def test_one_notification_with_two_accounts_feeds_each_account_s_own(
+    client, headers, ig, sessions, task, clock, settings, caplog
+):
+    """One signed body, one Meta app: each `entry[].id` goes to its connection's intake, and the
+    marker of the second account's message reaches neither the first account nor the logs."""
+    caplog.set_level(logging.DEBUG)
+    make_rule(client, headers)  # the first account answers comments
+    second = add_account(sessions)
+    add_message_rule(sessions, second)
+    media = publish(ig)
+    comment_id = ig.add_comment(media, "precio")
+    first = account_rows(sessions)[ACCOUNT_ID].id
+    payload = comment_payload(comment_id, media, "precio", at=clock.now())
+    payload["entry"].append(
+        message_payload(
+            "mid-second",
+            f"precio {MARKERS[1]}",
+            account=SECOND,
+            recipient=SECOND,
+            at=clock.now(),
+        )["entry"][0]
+    )
+
+    assert notify(client, payload).status_code == 200
+
+    with sessions() as session:
+        events = [
+            (event.account_id, str(event.type), event.external_ref)
+            for event in session.scalars(select(Event))
+        ]
+        deliveries = [
+            (delivery.account_id, str(delivery.action))
+            for delivery in session.scalars(select(Delivery))
+        ]
+        notified = {row.id: row.webhook_notified_at for row in session.scalars(select(Connection))}
+    assert sorted(events) == sorted(
+        [(first, "comment", comment_id), (second, "message", "mid-second")]
+    )
+    assert sorted(deliveries) == sorted(
+        [(first, "private_reply"), (first, "public_reply"), (second, "message")]
+    )
+    assert notified == {first: clock.now(), second: clock.now()}
+    assert MARKERS[1] not in dump(settings)
+    assert MARKERS[1] not in logged(caplog)
+
+
+def test_a_notification_of_one_account_touches_nothing_of_the_other(
+    client, ig, sessions, task, clock, caplog
+):
+    """No event, delivery, conversation or incident is ever opened for another account, and only
+    the account the notification names counts as having a working webhook."""
+    caplog.set_level(logging.DEBUG)
+    second = add_account(sessions)
+    add_message_rule(sessions, second)
+    first = account_rows(sessions)[ACCOUNT_ID].id
+    with sessions() as session, session.begin():
+        for account_id in (first, second):
+            incidents.sync(
+                session,
+                account_id,
+                IncidentType.WEBHOOK_SILENT,
+                True,
+                clock.now(),
+                {"polled_events": 2},
+            )
+    clock.advance(minutes=1)
+
+    assert (
+        notify(
+            client, message_payload("mid-b", "precio", account=SECOND, recipient=SECOND)
+        ).status_code
+        == 200
+    )
+
+    with sessions() as session:
+        events = [
+            (event.account_id, event.external_ref) for event in session.scalars(select(Event))
+        ]
+        deliveries = [delivery.account_id for delivery in session.scalars(select(Delivery))]
+        rows = {row.id: row for row in session.scalars(select(Connection))}
+        open_incidents = [
+            (incident.account_id, incident.type)
+            for incident in session.scalars(
+                select(ChannelIncident).where(ChannelIncident.closed_at.is_(None))
+            )
+        ]
+    assert events == [(second, "mid-b")]
+    assert deliveries == [second]
+    assert rows[first].webhook_notified_at is None
+    assert rows[second].webhook_notified_at == clock.now()
+    assert open_incidents == [(first, "webhook_silent")]  # the second one closed itself
+
+
+def test_an_entry_of_an_account_this_installation_does_not_have_is_dropped(
+    client, headers, ig, sessions, task, clock, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    make_rule(client, headers)
+    media = publish(ig)
+    payload = comment_payload("999", media, f"precio {MARKERS[0]}", account="17841477777777777")
+
+    assert notify(client, payload).status_code == 200
+
+    assert events(sessions) == []
+    assert deliveries(sessions) == []
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(getattr(r, "account_ids", None) == ["17841477777777777"] for r in warnings)
+    assert MARKERS[0] not in logged(caplog)
 
 
 # Human intervention
@@ -753,6 +905,39 @@ def test_notifications_for_another_account_do_not_count_as_the_webhook_working(
     assert MARKERS[0] not in logged(caplog)
 
 
+def test_a_notification_with_nothing_usable_does_not_count_as_the_webhook_working(
+    client, ig, sessions, task, clock
+):
+    """An entry of our account whose field this service ignores proves nothing about delivery: it
+    is not what closes webhook_silent either."""
+    media = publish(ig)
+    ig.add_comment(media, "hola")
+    task(sessions)
+    clock.advance(hours=24, minutes=1)
+    ig.add_comment(media, "otra")
+    task(sessions)
+    assert open_incidents(sessions) == 1
+
+    notify(
+        client,
+        {
+            "object": "instagram",
+            "entry": [
+                {
+                    "id": ACCOUNT_ID,
+                    "time": int(clock.now().timestamp()),
+                    "field": "live_comments",
+                    "value": {"id": "919", "text": "precio"},
+                }
+            ],
+        },
+    )
+
+    assert open_incidents(sessions) == 1
+    with sessions() as session:
+        assert session.scalar(select(Connection.webhook_notified_at)) is None
+
+
 def test_webhook_silent_needs_activity_the_webhook_missed(ig, sessions, task, clock):
     task(sessions)
     clock.advance(hours=25)
@@ -772,9 +957,9 @@ def test_webhook_silent_stays_closed_while_notifications_arrive(client, ig, sess
     assert open_incidents(sessions) == 0
 
 
-def test_without_the_webhook_configured_webhook_silent_never_opens(ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
-    task = ReplyTask(ig, clock)
+def test_without_the_webhook_configured_webhook_silent_never_opens(ig, sessions, clock, account_id):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    task = ReplyTask(ig, clock, account_id=account_id)
     media = publish(ig)
     task(sessions)
     clock.advance(hours=25)
@@ -805,12 +990,61 @@ def test_a_failure_while_processing_answers_500_without_quoting_it(
     def explode(*args, **kwargs):
         raise RuntimeError(f"could not store {MARKERS[0]}")
 
-    monkeypatch.setattr(app.state.intake, "comments", explode)
+    monkeypatch.setattr(Intake, "comments", explode)
     response = notify(client, comment_payload("915", publish(ig), f"precio {MARKERS[0]}"))
 
     assert response.status_code == 500  # Meta retries
     assert "RuntimeError" in logged(caplog)
     assert MARKERS[0] not in logged(caplog)
+
+
+def test_each_account_that_fails_in_one_body_is_logged_with_its_type(
+    client, ig, sessions, task, caplog, clock, monkeypatch
+):
+    """With two accounts in the body, one line says which account failed and with what, so the
+    first failure is not the only trace; the message could quote the body, so only its type."""
+    caplog.set_level(logging.DEBUG)
+    second = add_account(sessions)
+    first = account_rows(sessions)[ACCOUNT_ID].id
+    media = publish(ig)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError(f"could not store {MARKERS[0]}")
+
+    monkeypatch.setattr(Intake, "comments", explode)
+    payload = comment_payload("916", media, f"precio {MARKERS[0]}", at=clock.now())
+    payload["entry"].append(
+        comment_payload("917", media, "precio", account=SECOND, at=clock.now())["entry"][0]
+    )
+
+    assert notify(client, payload).status_code == 500
+
+    failures = [
+        r
+        for r in caplog.records
+        if getattr(r, "error_type", None) == "RuntimeError"
+        and getattr(r, "account_id", None) is not None
+    ]
+    assert sorted(r.account_id for r in failures) == sorted([first, second])
+    assert MARKERS[0] not in logged(caplog)
+
+
+def test_entries_that_name_no_account_are_counted_not_stored(
+    client, headers, ig, sessions, task, caplog
+):
+    """An entry with no `id` cannot be attributed: counted in the log, and the entries that do name
+    an account are still processed."""
+    caplog.set_level(logging.DEBUG)
+    make_rule(client, headers)
+    media = publish(ig)
+    payload = comment_payload("918", media, "precio")
+    payload["entry"].insert(0, {"time": int(START.timestamp()), "field": "comments"})
+
+    assert notify(client, payload).status_code == 200
+
+    assert [event.external_ref for event in events(sessions)] == ["918"]
+    counted = [r for r in caplog.records if getattr(r, "entries", None) == 1]
+    assert counted
 
 
 def test_the_access_log_never_shows_query_strings(app, caplog):
@@ -912,11 +1146,13 @@ def test_an_opt_out_word_by_webhook_pauses_and_sends_nothing(
     assert events(sessions)[-1].rule_id is None
 
 
-def test_the_webhook_uses_the_configured_opt_out_words_and_stores_none(settings, clock, ig):
+def test_the_webhook_uses_the_configured_opt_out_words_and_stores_none(
+    settings, clock, ig, account_id
+):
     marker = "QZX-opt-out-3307"
     app = create_app(replace(settings, opt_out_words=(marker,)), clock)
     sessions = app.state.sessionmaker
-    ConnectionTask(ig, clock, None)(sessions)
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
 
     notify(TestClient(app), message_payload("mid-1", marker))
     notify(TestClient(app), message_payload("mid-2", "stop", sender=OTHERS[0]))
@@ -926,10 +1162,10 @@ def test_the_webhook_uses_the_configured_opt_out_words_and_stores_none(settings,
     assert marker not in dump(settings)
 
 
-def test_an_empty_list_turns_opt_out_off_by_webhook(settings, clock, ig):
+def test_an_empty_list_turns_opt_out_off_by_webhook(settings, clock, ig, account_id):
     app = create_app(replace(settings, opt_out_words=()), clock)
     sessions = app.state.sessionmaker
-    ConnectionTask(ig, clock, None)(sessions)
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
 
     notify(TestClient(app), message_payload("mid-1", "stop"))
 

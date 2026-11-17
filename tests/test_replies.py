@@ -75,10 +75,10 @@ def headers(app):
 
 
 @pytest.fixture
-def task(ig, clock, sessions):
+def task(ig, clock, sessions, account_id):
     # The connection check records the account's id, as it does first in the worker.
-    ConnectionTask(ig, clock, None)(sessions)
-    return ReplyTask(ig, clock, poll_every=timedelta(0))
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    return ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))
 
 
 def publish(ig) -> str:
@@ -530,6 +530,7 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
         account = scope.current_account(session, "instagram")
         account.external_account_id = "1784"
         account.username = "own"
+        account_id = account.id
         for channel, content in (
             ("comment", PRICE_RULE),
             (
@@ -554,7 +555,7 @@ def test_third_party_text_and_usernames_from_the_real_client_are_not_kept(
                 )
             )
 
-    ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))(sessions)
 
     posted = [parse_qs(body.decode()) for method, _, body in meta.calls if method == "POST"]
     assert len(posted) == 3  # public reply, private reply, message
@@ -632,14 +633,14 @@ class FakeMeta:
 
 
 def test_one_private_reply_per_comment_even_across_restarts(
-    client, headers, ig, sessions, task, clock
+    client, headers, ig, sessions, task, clock, account_id
 ):
     make_rule(client, headers)
     media = publish(ig)
     ig.add_comment(media, "precio")
 
     task(sessions)
-    restarted = ReplyTask(ig, clock, poll_every=timedelta(0))
+    restarted = ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))
     restarted(sessions)
     clock.advance(minutes=5)
     restarted(sessions)
@@ -665,7 +666,7 @@ def test_one_private_reply_per_comment_even_across_restarts(
 
 
 def test_a_send_interrupted_by_a_crash_is_never_repeated(
-    client, headers, ig, sessions, task, clock
+    client, headers, ig, sessions, task, clock, account_id
 ):
     make_rule(
         client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
@@ -681,7 +682,7 @@ def test_a_send_interrupted_by_a_crash_is_never_repeated(
     ig.reply_private = crash_after_sending
     task(sessions)  # the failure is contained: the cycle goes on
     ig.reply_private = original
-    ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))(sessions)
 
     assert len(ig.sent) == 1
     assert by_action(sessions) == {"private_reply": ("failed", "unknown")}
@@ -813,10 +814,12 @@ def test_windows_close(client, headers, ig, sessions, task, clock):
 
 
 def test_the_hourly_cap_holds_the_excess_until_the_hour_passes(
-    client, headers, ig, sessions, clock
+    client, headers, ig, sessions, clock, account_id
 ):
-    ConnectionTask(ig, clock, None)(sessions)
-    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_private_cap=1)
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    capped = ReplyTask(
+        ig, clock, account_id=account_id, poll_every=timedelta(0), hourly_private_cap=1
+    )
     make_rule(
         client, headers, content={"keywords": ["precio"], "private_replies": ["DM", "DM 2", "DM 3"]}
     )
@@ -841,10 +844,12 @@ def test_the_hourly_cap_holds_the_excess_until_the_hour_passes(
 
 
 def test_the_private_cap_does_not_hold_the_answer_to_a_message(
-    client, headers, ig, sessions, clock
+    client, headers, ig, sessions, clock, account_id
 ):
-    ConnectionTask(ig, clock, None)(sessions)
-    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_private_cap=1)
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    capped = ReplyTask(
+        ig, clock, account_id=account_id, poll_every=timedelta(0), hourly_private_cap=1
+    )
     make_rule(client, headers, content=PRIVATE_ONLY)
     make_rule(client, headers, channel="message", content={**PRIVATE_ONLY, "keywords": ["info"]})
     media = publish(ig)
@@ -907,10 +912,10 @@ def test_a_rate_limited_send_waits_for_the_next_poll(client, headers, ig, sessio
 
 
 def test_sends_on_every_pass_but_waits_for_the_next_poll_after_a_rate_limit(
-    client, headers, ig, sessions, clock
+    client, headers, ig, sessions, clock, account_id
 ):
-    ConnectionTask(ig, clock, None)(sessions)
-    task = ReplyTask(ig, clock)  # polls every 120 seconds
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    task = ReplyTask(ig, clock, account_id=account_id)  # polls every 120 seconds
     make_rule(client, headers)
     media = publish(ig)
     task(sessions)
@@ -932,9 +937,9 @@ def test_sends_on_every_pass_but_waits_for_the_next_poll_after_a_rate_limit(
     assert by_action(sessions) == {"public_reply": ("sent", None), "private_reply": ("sent", None)}
 
 
-def test_polls_at_most_once_per_interval(ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
-    task = ReplyTask(ig, clock)  # every 120 seconds
+def test_polls_at_most_once_per_interval(ig, sessions, clock, account_id):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    task = ReplyTask(ig, clock, account_id=account_id)  # every 120 seconds
     polls = []
     original = ig.list_media
     ig.list_media = lambda max_items=None: polls.append(clock.now()) or original(max_items)
@@ -948,10 +953,10 @@ def test_polls_at_most_once_per_interval(ig, sessions, clock):
     assert polls == [START, START + timedelta(seconds=120)]
 
 
-def test_without_a_connected_account_nothing_is_polled(ig, sessions, clock):
+def test_without_a_connected_account_nothing_is_polled(ig, sessions, clock, account_id):
     ig.list_media = lambda max_items=None: pytest.fail("polled without knowing the account")
 
-    ReplyTask(ig, clock)(sessions)
+    ReplyTask(ig, clock, account_id=account_id)(sessions)
 
 
 def test_retention_purges_events_deliveries_and_conversations(
@@ -1043,10 +1048,14 @@ def test_a_rule_test_says_when_the_rule_needs_another_media(client, headers):
 # Retention and polling scope
 
 
-def test_activity_near_the_retention_limit_is_never_evaluated(client, headers, ig, sessions, clock):
+def test_activity_near_the_retention_limit_is_never_evaluated(
+    client, headers, ig, sessions, clock, account_id
+):
     """With retention of 8 days, a purged event is not seen as new and answered again."""
-    ConnectionTask(ig, clock, None)(sessions)
-    task = ReplyTask(ig, clock, poll_every=timedelta(0), retention=timedelta(days=8))
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    task = ReplyTask(
+        ig, clock, account_id=account_id, poll_every=timedelta(0), retention=timedelta(days=8)
+    )
     make_rule(client, headers)
     media = publish(ig)
     clock.advance(minutes=1)
@@ -1064,9 +1073,13 @@ def test_activity_near_the_retention_limit_is_never_evaluated(client, headers, i
     assert count(sessions, Event) == 0
 
 
-def test_a_comment_older_than_the_horizon_records_nothing(client, headers, ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
-    task = ReplyTask(ig, clock, poll_every=timedelta(0), retention=timedelta(days=8))
+def test_a_comment_older_than_the_horizon_records_nothing(
+    client, headers, ig, sessions, clock, account_id
+):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    task = ReplyTask(
+        ig, clock, account_id=account_id, poll_every=timedelta(0), retention=timedelta(days=8)
+    )
     make_rule(client, headers)
     media = publish(ig)
     ig.add_comment(media, "precio", at=clock.now())
@@ -1163,6 +1176,7 @@ def test_malformed_and_repeated_comments_from_meta_are_handled(sessions, clock):
         account = scope.current_account(session, "instagram")
         account.external_account_id = "1784"
         account.username = "own"
+        account_id = account.id
         session.add(
             Rule(
                 account_id=account.id,
@@ -1177,7 +1191,7 @@ def test_malformed_and_repeated_comments_from_meta_are_handled(sessions, clock):
             )
         )
 
-    ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))(sessions)
 
     with sessions() as session:
         assert session.scalars(select(Event.external_ref).where(Event.type == "comment")).all() == [
@@ -1466,9 +1480,13 @@ def test_a_public_reply_expires_after_a_day_and_the_private_one_does_not(
     }
 
 
-def test_the_public_cap_lets_the_private_reply_through(client, headers, ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
-    capped = ReplyTask(ig, clock, poll_every=timedelta(0), hourly_public_cap=1)
+def test_the_public_cap_lets_the_private_reply_through(
+    client, headers, ig, sessions, clock, account_id
+):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    capped = ReplyTask(
+        ig, clock, account_id=account_id, poll_every=timedelta(0), hourly_public_cap=1
+    )
     make_rule(client, headers)
     media = publish(ig)
     ig.add_comment(media, "precio", author_id=PERSON)
@@ -1566,10 +1584,10 @@ def test_an_opt_out_skips_what_is_pending_for_that_person(
     }
 
 
-def test_an_empty_list_turns_opt_out_off(client, headers, ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
+def test_an_empty_list_turns_opt_out_off(client, headers, ig, sessions, clock, account_id):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
     make_rule(client, headers, channel="message", content=INFO_RULE)
-    task = ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=())
+    task = ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0), opt_out_words=())
 
     ig.add_message(PERSON, "stop")
     task(sessions)
@@ -1580,7 +1598,7 @@ def test_an_empty_list_turns_opt_out_off(client, headers, ig, sessions, clock):
 
 
 def test_resume_lifts_an_opt_out_and_seeing_the_message_again_does_not_undo_it(
-    client, headers, ig, sessions, task, clock
+    client, headers, ig, sessions, task, clock, account_id
 ):
     make_rule(client, headers, channel="message", content=INFO_RULE)
     ig.add_message(PERSON, "stop")
@@ -1591,19 +1609,21 @@ def test_resume_lifts_an_opt_out_and_seeing_the_message_again_does_not_undo_it(
     # A new task reads every recent conversation again, as after a restart.
     clock.advance(seconds=1)
     ig.add_message(PERSON, "info")
-    ReplyTask(ig, clock, poll_every=timedelta(0))(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))(sessions)
 
     assert resumed.json()["paused_forever"] is False
     assert conversations(client, headers)[0]["paused_forever"] is False
     assert [text.split(" ")[0] for _, _, text in ig.sent] == ["Hi"]
 
 
-def test_an_opt_out_is_audited_without_its_text(client, headers, ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
+def test_an_opt_out_is_audited_without_its_text(client, headers, ig, sessions, clock, account_id):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
     marker = "QZX-opt-out-5521"
     ig.add_message(PERSON, marker)
 
-    ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=[marker])(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0), opt_out_words=[marker])(
+        sessions
+    )
 
     [conversation] = conversations(client, headers)
     with sessions() as session:
@@ -1735,22 +1755,28 @@ def test_other_text_is_no_opt_out(client, headers, ig, sessions, task, text):
     assert conversation["paused_forever"] is False
 
 
-def test_a_configured_word_is_compared_without_its_end_marks(client, headers, ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
+def test_a_configured_word_is_compared_without_its_end_marks(
+    client, headers, ig, sessions, clock, account_id
+):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
     ig.add_message(PERSON, "halt")
 
-    ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=["¡Hált!"])(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0), opt_out_words=["¡Hált!"])(
+        sessions
+    )
 
     [conversation] = conversations(client, headers)
     assert conversation["paused_forever"] is True
 
 
-def test_a_word_of_only_marks_never_opts_out(client, headers, ig, sessions, clock):
-    ConnectionTask(ig, clock, None)(sessions)
+def test_a_word_of_only_marks_never_opts_out(client, headers, ig, sessions, clock, account_id):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
     ig.add_message(PERSON, "!!!")
     ig.add_message(OTHER_PERSON, "")
 
-    ReplyTask(ig, clock, poll_every=timedelta(0), opt_out_words=["!!!"])(sessions)
+    ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0), opt_out_words=["!!!"])(
+        sessions
+    )
 
     assert [c["paused_forever"] for c in conversations(client, headers)] == [False, False]
 

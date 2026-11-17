@@ -92,6 +92,9 @@ class FakeInstagram:
     The credential is untracked (never expires) until it is first renewed or a
     `credential_issued_at` is given; from then on it expires after `credential_lifetime` unless
     renewed, renewal follows Meta's rules, and `revoke()` makes every call fail as Meta does.
+
+    `account_id` is the id this fake answers as (its `account()`, and the sender of what it sends):
+    each simulated connection gets its own fake, so two of them are two accounts.
     """
 
     network = "simulation"
@@ -100,12 +103,14 @@ class FakeInstagram:
         self,
         clock: Clock,
         *,
+        account_id: str = ACCOUNT_ID,
         video_processing: timedelta = timedelta(seconds=30),
         quota_total: int = 100,
         credential_issued_at: datetime | None = None,
         credential_lifetime: timedelta = CREDENTIAL_LIFETIME,
     ) -> None:
         self.clock = clock
+        self.account_id = account_id
         self.video_processing = video_processing
         self.quota_total = quota_total
         self.credential_issued_at = credential_issued_at
@@ -192,7 +197,7 @@ class FakeInstagram:
         return self._run(
             "account",
             lambda: Account(
-                id=ACCOUNT_ID,
+                id=self.account_id,
                 username="simulated_account",
                 account_type="MEDIA_CREATOR",
                 followers_count=1000,
@@ -401,7 +406,7 @@ class FakeInstagram:
             # Like Instagram: the reply opens (or continues) a conversation with the author.
             if stored.comment.author_id:
                 self._thread(stored.comment.author_id).messages.append(
-                    Message(message_id, ACCOUNT_ID, self.clock.now(), text)
+                    Message(message_id, self.account_id, self.clock.now(), text)
                 )
             return message_id
 
@@ -422,7 +427,7 @@ class FakeInstagram:
             if last is None or self.clock.now() - last > MESSAGING_WINDOW:
                 raise Refused("outside the 24-hour messaging window", code=10, subcode=2018278)
             message_id = self._record("send_message", recipient_id, text)
-            thread.messages.append(Message(message_id, ACCOUNT_ID, self.clock.now(), text))
+            thread.messages.append(Message(message_id, self.account_id, self.clock.now(), text))
             return message_id
 
         return self._run("send_message", send)

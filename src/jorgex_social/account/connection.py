@@ -93,8 +93,9 @@ def connect(
     switching = scope.connected(current) and current.external_account_id != account.id
     if switching and not replace:
         raise ConnectError(
-            f"this installation is connected to another {network} account; one installation "
-            "serves one account (use --replace to switch accounts)"
+            f"this installation is already connected to another {network} account, and adding a "
+            "second one is not available yet; --replace switches to a different account, "
+            "replacing the one connected"
         )
     try:
         renewal = instagram.refresh_token()
@@ -138,19 +139,43 @@ def connect(
     return connection
 
 
+def mark_unreadable(sessions: sessionmaker, account_id: str, now: datetime) -> None:
+    """Records that an account's stored credential cannot be read, as the connection check does
+    when it finds that: the status the API reports and the incident for the operator. Used when
+    the client cannot even be built (a key that does not decrypt, no credential in the row), where
+    no check can run; the next check that can run closes the incident again."""
+    with sessions() as session, session.begin():
+        connection = session.get(Connection, account_id)
+        if connection is None:
+            return
+        connection.status = ConnectionStatus.UNREADABLE
+        incidents.sync(session, account_id, IncidentType.CREDENTIAL_UNREADABLE, True, now)
+
+
 class ConnectionTask:
-    """Worker task: checks the connection at most once an hour (renewing the credential when
-    due) and keeps the incidents in step with what it finds. Watching for publish outcomes left
-    unresolved needs no network, so it runs on every pass."""
+    """Worker task: checks one account's connection at most once an hour (renewing the credential
+    when due) and keeps that account's incidents in step with what it finds. Watching for publish
+    outcomes left unresolved needs no network, so it runs on every pass.
+
+    One task per account: the error counter and the time of the last check are the account's, and
+    a failure here reaches neither another account nor the loop (worker.AccountTasks)."""
 
     __name__ = "connection"
 
-    def __init__(self, instagram: Instagram, clock: Clock, key: bytes | None) -> None:
+    def __init__(
+        self,
+        instagram: Instagram,
+        clock: Clock,
+        key: bytes | None,
+        *,
+        account_id: str,
+    ) -> None:
         """`key` is the one the worker's client decrypts with: renewing with any other would
         store a credential the client cannot read. None only in simulation without a key."""
         self.instagram = instagram
         self.clock = clock
         self.key = key
+        self.account_id = account_id
         self._last_check: datetime | None = None
         self._consecutive_errors = 0
 
@@ -165,11 +190,13 @@ class ConnectionTask:
     def check(self, sessions: sessionmaker, now: datetime) -> None:
         network = self.instagram.network
         with sessions() as session:
-            connection = scope.account_of(session, network)
+            connection = session.get(Connection, self.account_id)
+        if connection is None:
+            return  # the account is gone; the worker stops running its tasks on the next pass
         if not scope.connected(connection) and network != FakeInstagram.network:
             return  # nothing connected; the API reports it as missing
         unreadable = False
-        if connection is not None and should_renew(connection, now):
+        if should_renew(connection, now):
             unreadable = not self._renew(sessions, connection, now)
 
         account: Account | None = None
@@ -192,7 +219,7 @@ class ConnectionTask:
         elif not (auth_failed or unreadable):
             self._consecutive_errors += 1
         with sessions() as session, session.begin():
-            connection = scope.current_account(session, network)
+            connection = session.get_one(Connection, self.account_id)
             if unreadable:
                 connection.status = ConnectionStatus.UNREADABLE
             elif account is not None:
@@ -226,7 +253,6 @@ class ConnectionTask:
     def _renew(self, sessions: sessionmaker, before: Connection, now: datetime) -> bool:
         """Returns False when the stored credential does not decrypt with the worker's key; then
         Meta is not asked, since a renewed token could not be stored readably."""
-        network = self.instagram.network
         if self.key is None:
             log.error("no secret key: the credential cannot be renewed")
             return False
@@ -253,14 +279,10 @@ class ConnectionTask:
                 )
             return True
         with sessions() as session, session.begin():
-            connection = scope.account_of(session, network)
-            if (
-                connection is None
-                or connection.id != before.id
-                or connection.credential_encrypted != before.credential_encrypted
-            ):
-                # Reconnected (maybe to another account) while Meta answered: the stored
-                # credential is newer than the one renewed, so the renewal is dropped.
+            connection = session.get(Connection, before.id)
+            if connection is None or connection.credential_encrypted != before.credential_encrypted:
+                # Reconnected while Meta answered: the stored credential is newer than the one
+                # renewed, so the renewal is dropped.
                 log.warning("connection changed during renewal; renewal discarded")
                 audit.record(
                     session,
@@ -291,14 +313,13 @@ class ConnectionTask:
     def watch_unresolved(self, sessions: sessionmaker, now: datetime) -> None:
         """Posts whose outcome the resolver has not settled for over an hour need a human."""
         with sessions() as session, session.begin():
-            account_id = scope.account_id_of(session, self.instagram.network)
-            if account_id is None:
-                return  # nothing written for this mode yet: no account's incident to open
+            if session.get(Connection, self.account_id) is None:
+                return  # the account is gone: there is no account's incident to open
             post_ids = session.scalars(
                 select(Post.id)
                 .join(PublishAttempt)
                 .where(
-                    Post.account_id == account_id,
+                    Post.account_id == self.account_id,
                     Post.status == PostStatus.OUTCOME_UNKNOWN,
                     PublishAttempt.result == AttemptResult.UNKNOWN,
                     PublishAttempt.resolved_at.is_(None),
@@ -309,7 +330,7 @@ class ConnectionTask:
             ).all()
             incidents.sync(
                 session,
-                account_id,
+                self.account_id,
                 IncidentType.PUBLISH_UNRESOLVED,
                 bool(post_ids),
                 now,

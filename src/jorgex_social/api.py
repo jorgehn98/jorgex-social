@@ -21,7 +21,6 @@ from jorgex_social.publishing.api import public_router as media_files_router
 from jorgex_social.publishing.api import router as publishing_router
 from jorgex_social.remote_mcp import server as remote_mcp
 from jorgex_social.replies.api import router as replies_router
-from jorgex_social.replies.intake import Intake
 from jorgex_social.replies.webhook import router as webhook_router
 from jorgex_social.stats.api import recent_media_router
 from jorgex_social.stats.api import router as stats_router
@@ -45,12 +44,8 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     app.state.network = network_for(settings)
     app.state.sessionmaker = make_sessionmaker(make_engine(settings))
     app.state.read_sessionmaker = make_sessionmaker(make_engine(settings, write=False))
-    # The webhook records events through the same intake as the worker's polling.
-    app.state.intake = Intake(
-        app.state.network,
-        retention=timedelta(days=settings.retention_days),
-        opt_out_words=settings.opt_out_words,
-    )
+    # The webhook records events through the same intake as the worker's polling, one per account
+    # (replies/webhook.py builds it from the account a notification names).
     app.state.human_pause = timedelta(minutes=settings.human_pause_minutes)
     app.state.login_limiter = RateLimiter(
         [

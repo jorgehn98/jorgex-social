@@ -13,6 +13,7 @@ import uvicorn
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
 from jorgex_social import logs, worker
 from jorgex_social.access import operator
@@ -23,15 +24,15 @@ from jorgex_social.account.connection import ConnectError, ConnectionTask, conne
 from jorgex_social.account.credential import NotConnected
 from jorgex_social.account.crypto import SecretKeyError, ensure_key, load_key
 from jorgex_social.account.models import Connection
-from jorgex_social.clock import SystemClock
+from jorgex_social.clock import Clock, SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
-from jorgex_social.instagram import make_instagram
+from jorgex_social.instagram import Clients, network_for
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import InstagramError
 from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.oauth import store as oauth
-from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask
+from jorgex_social.publishing.worker import SIMULATED_PUBLIC_URL, PublishTask, PurgeTask
 from jorgex_social.replies.task import ReplyTask
 from jorgex_social.stats.snapshots import SnapshotTask
 
@@ -265,44 +266,76 @@ def acquire_worker_lock(settings: Settings):
     return lock
 
 
+def worker_tasks(
+    settings: Settings, clock: Clock, sessions: sessionmaker, key: bytes | None
+) -> list[worker.Task]:
+    """What the worker runs each pass: the media purge, then the tasks of every account of the
+    mode. Each connection gets its own client and its own set of tasks, built the first pass the
+    account is seen; building one account's client can fail and then only that account stops."""
+    network = network_for(settings)
+    public_url = settings.public_url or (SIMULATED_PUBLIC_URL if settings.simulation else None)
+    clients = Clients(settings, clock, key)
+
+    def accounts(sessions: sessionmaker) -> list[Connection]:
+        """In simulation every row of the network is a fake account, connected or not yet; in real
+        mode only the connections that have an account, so the row a first write created before
+        `connect-instagram` is not worked on."""
+        with sessions() as session:
+            return scope.accounts_of(session, network, connected_only=not settings.simulation)
+
+    def tasks_for(account: Connection) -> list[worker.Task]:
+        instagram = clients(account)
+        return [
+            PublishTask(
+                instagram,
+                clock,
+                settings.media_dir,
+                public_url,
+                account_id=account.id,
+                grace=timedelta(minutes=settings.publish_grace_minutes),
+            ),
+            SnapshotTask(instagram, clock, account_id=account.id),
+            ConnectionTask(instagram, clock, key, account_id=account.id),
+            # After the connection check, which in simulation is what records the account's id.
+            ReplyTask(
+                instagram,
+                clock,
+                account_id=account.id,
+                poll_every=timedelta(seconds=settings.reply_poll_seconds),
+                hourly_private_cap=settings.hourly_private_reply_cap,
+                hourly_public_cap=settings.hourly_public_reply_cap,
+                per_minute=settings.replies_per_minute,
+                retention=timedelta(days=settings.retention_days),
+                cooldown=timedelta(minutes=settings.reply_cooldown_minutes),
+                webhook=settings.webhook_enabled,
+                opt_out_words=settings.opt_out_words,
+            ),
+        ]
+
+    return [
+        PurgeTask(settings.media_dir, clock),
+        worker.AccountTasks(accounts, tasks_for, clock, forget=clients.forget),
+    ]
+
+
 def cmd_worker(_: argparse.Namespace, settings: Settings) -> None:
     lock = acquire_worker_lock(settings)  # noqa: F841  (held until the process exits)
     logs.configure()
     stop = threading.Event()
     sessions = make_sessionmaker(make_engine(settings))
     clock = SystemClock()
-    # One key for the client and the renewals, so a renewed credential is always readable.
+    # One key for the clients and the renewals, so a renewed credential is always readable.
     key = (
         None
         if settings.simulation and not settings.secret_key_file.exists()
         else load_key(settings.secret_key_file)
     )
-    instagram = make_instagram(settings, clock, key)
-    public_url = settings.public_url or (SIMULATED_PUBLIC_URL if settings.simulation else None)
-    tasks = [
-        PublishTask(
-            instagram,
-            clock,
-            settings.media_dir,
-            public_url,
-            grace=timedelta(minutes=settings.publish_grace_minutes),
-        ),
-        SnapshotTask(instagram, clock),
-        ConnectionTask(instagram, clock, key),
-        # After the connection check, which in simulation is what records the account's id.
-        ReplyTask(
-            instagram,
-            clock,
-            poll_every=timedelta(seconds=settings.reply_poll_seconds),
-            hourly_private_cap=settings.hourly_private_reply_cap,
-            hourly_public_cap=settings.hourly_public_reply_cap,
-            per_minute=settings.replies_per_minute,
-            retention=timedelta(days=settings.retention_days),
-            cooldown=timedelta(minutes=settings.reply_cooldown_minutes),
-            webhook=settings.webhook_enabled,
-            opt_out_words=settings.opt_out_words,
-        ),
-    ]
+    if settings.simulation:
+        # The one fake account: created now, as the first write does, so a fresh simulation has an
+        # account to work on. Its id and username are filled by the connection check.
+        with sessions() as session, session.begin():
+            scope.current_account(session, network_for(settings))
+    tasks = worker_tasks(settings, clock, sessions, key)
     # Setting the Event from a signal handler can deadlock with the loop waiting on it, so the
     # loop runs in a thread (which inherits the blocked mask) and the main thread waits for the
     # signal synchronously. `docker stop` sends SIGTERM.

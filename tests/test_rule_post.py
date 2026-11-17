@@ -63,18 +63,19 @@ def headers(app):
 
 
 @pytest.fixture
-def replies(ig, clock, sessions):
-    ConnectionTask(ig, clock, None)(sessions)
-    return ReplyTask(ig, clock, poll_every=timedelta(0))
+def replies(ig, clock, sessions, account_id):
+    ConnectionTask(ig, clock, None, account_id=account_id)(sessions)
+    return ReplyTask(ig, clock, account_id=account_id, poll_every=timedelta(0))
 
 
 @pytest.fixture
-def publisher(ig, clock, settings):
+def publisher(ig, clock, settings, account_id):
     return PublishTask(
         ig,
         clock,
         settings.media_dir,
         "https://social.test",
+        account_id=account_id,
         sleep=lambda s: clock.advance(seconds=s),
     )
 

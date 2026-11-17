@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from jorgex_social.account import audit, scope
+from jorgex_social.account import audit
 from jorgex_social.config import Settings
 from jorgex_social.instagram.types import Comment, Message
 from jorgex_social.replies.models import (
@@ -41,15 +41,18 @@ RETENTION_MARGIN = timedelta(days=1)
 
 
 class Intake:
+    """The events of one account. Each account has its own: its rules, its conversations and its
+    unique keys, so nothing that arrives for one can fire a rule of another (decision 10)."""
+
     def __init__(
         self,
-        network: str,
+        account_id: str,
         *,
         retention: timedelta = timedelta(days=90),
         choose: Callable[[Sequence[str]], str] = random.choice,
         opt_out_words: Iterable[str] = Settings.opt_out_words,
     ) -> None:
-        self.network = network
+        self.account_id = account_id
         self.retention = retention
         self.choose = choose
         # Without the empty form: a message with no words is not a request to stop.
@@ -89,9 +92,8 @@ class Intake:
         ]
         if not others:
             return
-        account_id = scope.current_account(session, self.network).id
-        known = self._known(session, account_id, Channel.COMMENT, [c.id for _, c in others])
-        rules = active_rules(session, account_id, Channel.COMMENT)
+        known = self._known(session, self.account_id, Channel.COMMENT, [c.id for _, c in others])
+        rules = active_rules(session, self.account_id, Channel.COMMENT)
         for media_ref, comment in others:
             if comment.id in known:
                 continue
@@ -100,7 +102,7 @@ class Intake:
                 rules, comment.text, media_ref=media_ref, occurred_at=comment.timestamp
             )
             event = Event(
-                account_id=account_id,
+                account_id=self.account_id,
                 type=Channel.COMMENT,
                 external_ref=comment.id,
                 media_ref=media_ref,
@@ -136,33 +138,30 @@ class Intake:
         )
         if not theirs:
             return
-        account_id = scope.current_account(session, self.network).id
         ids = [m.id for m in theirs]
-        known = self._known(session, account_id, Channel.MESSAGE, ids)
+        known = self._known(session, self.account_id, Channel.MESSAGE, ids)
         # Our own sends, in case Instagram names their sender with an id other than the one
         # the connection holds.
         known |= set(
             session.scalars(
                 select(Delivery.result_ref).where(
-                    Delivery.account_id == account_id, Delivery.result_ref.in_(ids)
+                    Delivery.account_id == self.account_id, Delivery.result_ref.in_(ids)
                 )
             )
         )
-        rules = active_rules(session, account_id, Channel.MESSAGE)
+        rules = active_rules(session, self.account_id, Channel.MESSAGE)
         for message in theirs:
             if message.id in known:
                 continue
             known.add(message.id)
-            person = self._conversation(
-                session, account_id, message.sender_id, message.created_at, now
-            )
+            person = self._conversation(session, message.sender_id, message.created_at, now)
             rule = None
             if opt_out_form(message.text) in self.opt_out_words:
                 self._opt_out(session, person, now)
             else:
                 rule = first_match(rules, message.text, occurred_at=message.created_at)
             event = Event(
-                account_id=account_id,
+                account_id=self.account_id,
                 type=Channel.MESSAGE,
                 external_ref=message.id,
                 conversation_id=person.id,
@@ -189,16 +188,17 @@ class Intake:
         )
 
     def _conversation(
-        self, session: Session, account_id: str, person_id: str, written_at: datetime, now: datetime
+        self, session: Session, person_id: str, written_at: datetime, now: datetime
     ) -> Conversation:
         conversation = session.scalar(
             select(Conversation).where(
-                Conversation.account_id == account_id, Conversation.external_id == person_id
+                Conversation.account_id == self.account_id,
+                Conversation.external_id == person_id,
             )
         )
         if conversation is None:
             conversation = Conversation(
-                account_id=account_id,
+                account_id=self.account_id,
                 external_id=person_id,
                 last_user_message_at=written_at,
                 window_until=written_at + MESSAGING_WINDOW,

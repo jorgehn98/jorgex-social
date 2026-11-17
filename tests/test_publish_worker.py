@@ -13,7 +13,12 @@ from jorgex_social.instagram.fake import FakeInstagram
 from jorgex_social.instagram.types import ContainerKind, ContainerStatus, ProductType
 from jorgex_social.publishing import worker
 from jorgex_social.publishing.models import Media, Post
-from jorgex_social.publishing.worker import LONGEST_ATTEMPT, STALE_ATTEMPT, PublishTask
+from jorgex_social.publishing.worker import (
+    LONGEST_ATTEMPT,
+    STALE_ATTEMPT,
+    PublishTask,
+    PurgeTask,
+)
 from jorgex_social.stats.models import PostSnapshot, RecentMedia
 from jorgex_social.stats.snapshots import SnapshotTask
 
@@ -68,11 +73,22 @@ def requests(ig):
 
 
 @pytest.fixture
-def task(ig, clock, settings):
+def task(ig, clock, settings, account_id):
     # Polling sleeps move the manual clock, so video processing finishes without real waiting.
     return PublishTask(
-        ig, clock, settings.media_dir, BASE_URL, sleep=lambda s: clock.advance(seconds=s)
+        ig,
+        clock,
+        settings.media_dir,
+        BASE_URL,
+        account_id=account_id,
+        sleep=lambda s: clock.advance(seconds=s),
     )
+
+
+@pytest.fixture
+def purge_task(settings, clock):
+    """The worker's media purge: it looks at every account's posts, so it is not per account."""
+    return PurgeTask(settings.media_dir, clock)
 
 
 class Api:
@@ -200,7 +216,7 @@ def test_trial_reel_is_sent_with_its_graduation(api, task, sessions, requests, t
 
 
 def test_media_url_is_public_during_the_attempt_and_revoked_after(
-    api, client, sessions, ig, clock, settings, requests
+    api, client, sessions, ig, clock, settings, requests, account_id
 ):
     post_id = api.post()
     api.publish_now(post_id)
@@ -211,7 +227,9 @@ def test_media_url_is_public_during_the_attempt_and_revoked_after(
         seen.append(client.get(requests[0].url))
         clock.advance(seconds=seconds)
 
-    PublishTask(ig, clock, settings.media_dir, BASE_URL, sleep=sleep)(sessions)
+    PublishTask(ig, clock, settings.media_dir, BASE_URL, account_id=account_id, sleep=sleep)(
+        sessions
+    )
 
     assert seen and all(r.status_code == 200 and r.content == MP4 for r in seen)
     assert client.get(requests[0].url).status_code == 404
@@ -441,7 +459,7 @@ def test_published_post_does_not_change(api, client, headers, task, sessions):
 # Containers that do not get ready
 
 
-def test_container_error_fails_the_post(api, sessions, ig, clock, settings, requests):
+def test_container_error_fails_the_post(api, sessions, ig, clock, settings, requests, account_id):
     post_id = api.post()
     api.publish_now(post_id)
     containers = []
@@ -452,7 +470,9 @@ def test_container_error_fails_the_post(api, sessions, ig, clock, settings, requ
 
     original = ig.create_container
     ig.create_container = lambda r: containers.append(original(r)) or containers[-1]
-    PublishTask(ig, clock, settings.media_dir, BASE_URL, sleep=sleep)(sessions)
+    PublishTask(ig, clock, settings.media_dir, BASE_URL, account_id=account_id, sleep=sleep)(
+        sessions
+    )
 
     post = api.get(post_id)
     assert (post["status"], post["failure"]) == ("failed", "container_error")
@@ -460,13 +480,18 @@ def test_container_error_fails_the_post(api, sessions, ig, clock, settings, requ
     assert published(ig) == []
 
 
-def test_slow_container_times_out(api, sessions, clock, settings):
+def test_slow_container_times_out(api, sessions, clock, settings, account_id):
     slow = FakeInstagram(clock, video_processing=timedelta(hours=1))
     post_id = api.post()
     api.publish_now(post_id)
 
     PublishTask(
-        slow, clock, settings.media_dir, BASE_URL, sleep=lambda s: clock.advance(seconds=s)
+        slow,
+        clock,
+        settings.media_dir,
+        BASE_URL,
+        account_id=account_id,
+        sleep=lambda s: clock.advance(seconds=s),
     )(sessions)
 
     post = api.get(post_id)
@@ -628,12 +653,12 @@ def test_manual_resolution(api, client, headers, task, sessions, ig):
     assert published(ig) == []  # the worker did not touch what was settled by hand
 
 
-def test_task_refuses_to_run_without_public_url(api, sessions, ig, clock, settings):
+def test_task_refuses_to_run_without_public_url(api, sessions, ig, clock, settings, account_id):
     post_id = api.post()
     api.publish_now(post_id)
 
     with pytest.raises(RuntimeError, match="PUBLIC_URL"):
-        PublishTask(ig, clock, settings.media_dir, None)(sessions)
+        PublishTask(ig, clock, settings.media_dir, None, account_id=account_id)(sessions)
 
     assert api.get(post_id)["status"] == "scheduled"
 
@@ -642,7 +667,7 @@ def test_task_refuses_to_run_without_public_url(api, sessions, ig, clock, settin
 
 
 def test_files_are_purged_seven_days_after_publishing_unless_still_in_use(
-    api, task, sessions, clock, settings
+    api, task, purge_task, sessions, clock, settings
 ):
     shared = api.upload()
     post_id = api.post("image", "One", [shared])
@@ -652,13 +677,16 @@ def test_files_are_purged_seven_days_after_publishing_unless_still_in_use(
     api.publish_now(post_id)
     api.publish_now(other_id)
     task(sessions)
+    purge_task(sessions)
 
     clock.advance(days=6)
     task(sessions)
+    purge_task(sessions)
     assert len(list(settings.media_dir.iterdir())) == 2
 
     clock.advance(days=1, minutes=1)
     task(sessions)
+    purge_task(sessions)
 
     assert [p.stem for p in settings.media_dir.iterdir()] == [shared]
     with sessions() as session:
@@ -666,12 +694,14 @@ def test_files_are_purged_seven_days_after_publishing_unless_still_in_use(
         assert session.get(Media, shared).deleted_at is None
 
 
-def test_published_stories_get_snapshots_during_their_first_day(api, task, sessions, ig, clock):
+def test_published_stories_get_snapshots_during_their_first_day(
+    api, task, sessions, ig, clock, account_id
+):
     post_id = api.post("story", "", [api.upload()])
     api.publish_now(post_id)
     task(sessions)
     ref = api.get(post_id)["external_ref"]
-    snapshots = SnapshotTask(ig, clock)
+    snapshots = SnapshotTask(ig, clock, account_id=account_id)
 
     def taken():
         with sessions() as session:
@@ -737,7 +767,7 @@ def test_stale_threshold_outlasts_the_longest_legitimate_attempt():
 
 
 def test_a_second_worker_does_not_republish_a_long_carousel_in_progress(
-    api, sessions, ig, clock, settings
+    api, sessions, ig, clock, settings, account_id
 ):
     """Slow carousel children keep worker A busy far beyond the old 15-minute threshold while
     worker B runs on the same database: B must not take A's attempt for dead."""
@@ -747,7 +777,12 @@ def test_a_second_worker_does_not_republish_a_long_carousel_in_progress(
     post_id = api.post("carousel", "Long carousel", items)
     api.publish_now(post_id)
     second = PublishTask(
-        ig, clock, settings.media_dir, BASE_URL, sleep=lambda s: clock.advance(seconds=s)
+        ig,
+        clock,
+        settings.media_dir,
+        BASE_URL,
+        account_id=account_id,
+        sleep=lambda s: clock.advance(seconds=s),
     )
 
     # B was already running before A's attempt started (the lock prevents this in production;
@@ -758,7 +793,9 @@ def test_a_second_worker_does_not_republish_a_long_carousel_in_progress(
         clock.advance(seconds=seconds)
         second(sessions)  # B runs on every pass while A waits on Instagram
 
-    PublishTask(ig, clock, settings.media_dir, BASE_URL, sleep=sleep)(sessions)
+    PublishTask(ig, clock, settings.media_dir, BASE_URL, account_id=account_id, sleep=sleep)(
+        sessions
+    )
 
     post = api.get(post_id)
     assert clock.now() - START > timedelta(minutes=30)  # A really ran that long
@@ -789,7 +826,7 @@ def test_an_attempt_closed_by_someone_else_is_left_alone(api, task, sessions, ig
 
 
 def test_purge_keeps_failed_posts_and_drops_unused_files_after_a_week(
-    api, client, headers, task, sessions, ig, clock, settings
+    api, client, headers, task, purge_task, sessions, ig, clock, settings
 ):
     unused = api.upload(JPEG + b"unused")
     cancelled = api.upload(JPEG + b"cancelled")
@@ -803,11 +840,11 @@ def test_purge_keeps_failed_posts_and_drops_unused_files_after_a_week(
     assert api.get(failed_post)["status"] == "failed"
 
     clock.advance(days=6, hours=23)
-    task.purge(sessions)
+    purge_task(sessions)
     assert len(list(settings.media_dir.iterdir())) == 3
 
     clock.advance(hours=2)
-    task.purge(sessions)
+    purge_task(sessions)
 
     assert [p.stem for p in settings.media_dir.iterdir()] == [failed]
     with sessions() as session:
@@ -863,7 +900,12 @@ def test_a_restarted_worker_resolves_the_dead_attempt_at_once(api, task, session
 
     clock.advance(minutes=1)  # the process restarts with a fresh task
     restarted = PublishTask(
-        ig, clock, task.media_dir, BASE_URL, sleep=lambda s: clock.advance(seconds=s)
+        ig,
+        clock,
+        task.media_dir,
+        BASE_URL,
+        account_id=task.account_id,
+        sleep=lambda s: clock.advance(seconds=s),
     )
     restarted(sessions)
     restarted(sessions)
@@ -929,7 +971,7 @@ def test_kill_switch_stops_containers_and_publishing(
 
 
 def test_kill_switch_turned_on_mid_attempt_stops_before_media_publish(
-    api, sessions, ig, clock, settings, switch, publishes
+    api, sessions, ig, clock, settings, switch, publishes, account_id
 ):
     post_id, next_id = api.post(), api.post()
     api.publish_now(post_id)
@@ -939,7 +981,9 @@ def test_kill_switch_turned_on_mid_attempt_stops_before_media_publish(
         switch(True)  # while the video container processes
         clock.advance(seconds=seconds)
 
-    PublishTask(ig, clock, settings.media_dir, BASE_URL, sleep=sleep)(sessions)
+    PublishTask(ig, clock, settings.media_dir, BASE_URL, account_id=account_id, sleep=sleep)(
+        sessions
+    )
 
     post = api.get(post_id)
     assert publishes == []
@@ -967,12 +1011,12 @@ def test_kill_switch_holds_the_resolvers_retry(api, task, sessions, ig, switch, 
 
 
 def test_unresolved_outcome_opens_an_incident_after_an_hour_and_closes(
-    api, task, sessions, ig, clock, settings
+    api, task, sessions, ig, clock, settings, account_id
 ):
     from jorgex_social.account.connection import ConnectionTask
     from jorgex_social.account.models import ChannelIncident
 
-    watcher = ConnectionTask(ig, clock, None)
+    watcher = ConnectionTask(ig, clock, None, account_id=account_id)
     post_id = api.post()
     api.publish_now(post_id)
     ig.fail_next("publish", Unavailable("502"), after=True)
