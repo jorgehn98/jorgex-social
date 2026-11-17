@@ -52,6 +52,17 @@ def test_token_goes_in_the_header_never_in_the_url():
     assert TOKEN not in repr(ig)
 
 
+def test_an_account_answer_without_a_user_id_is_a_connection_error():
+    """The credential's own id is no substitute: in the connect command it is "me", and two
+    accounts would then share one row."""
+    ig, transport = client((200, {"username": "someone"}))
+
+    with pytest.raises(Unavailable, match="user id"):
+        ig.account()
+
+    assert urlsplit(transport.calls[0][1]).path.endswith("/me")
+
+
 def test_get_params_go_in_the_query_and_post_params_in_the_body():
     ig, transport = client((200, {"status_code": "FINISHED"}), (200, {"id": "9"}))
 

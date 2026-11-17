@@ -885,7 +885,7 @@ def test_next_scheduled_is_ordered_and_limited_by_schedule_in_the_query(app, clo
             )
 
     with app.state.read_sessionmaker() as session:
-        account_id = scope.account_id_of(session, app.state.network)
+        account_id = scope.account_of(session, app.state.network).id
         found = next_scheduled(session, account_id, limit=2)
 
     assert [post["caption"] for post in found] == ["Due soonest", "Next one"]

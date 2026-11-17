@@ -67,11 +67,11 @@ def parse_grants(values: list[str]) -> dict[str, str]:
     return grants
 
 
-def token_account(session, value: str) -> Connection:
-    """The connected account `value` names: its username, or its `account_id` as list-tokens shows
-    it. A token works on one account and cannot be moved, so an install connects the account
-    first."""
-    accounts = scope.connected_accounts(session)
+def token_account(session, value: str, network: str) -> Connection:
+    """The connected account of `network` that `value` names: its username, or its `account_id` as
+    list-tokens shows it. A token works on one account and cannot be moved, so an install connects
+    the account first."""
+    accounts = scope.accounts_of(session, network, connected_only=True)
     if not accounts:
         raise TokenError(
             "no account is connected: connect one first with `jorgex-social connect-instagram`"
@@ -88,7 +88,7 @@ def token_account(session, value: str) -> Connection:
 def cmd_create_token(args: argparse.Namespace, settings: Settings) -> None:
     sessions = make_sessionmaker(make_engine(settings))
     with sessions() as session, session.begin():
-        account = token_account(session, args.account)
+        account = token_account(session, args.account, network_for(settings))
         token, secret = create_token(session, args.name, parse_grants(args.grant), account.id)
         result = {
             "name": token.name,
@@ -222,18 +222,17 @@ def cmd_connect_instagram(args: argparse.Namespace, settings: Settings) -> None:
         clock.now(),
     )
     connection = result.connection
-    print(
-        json.dumps(
-            {
-                "result": "added" if result.added else "refreshed",
-                "network": connection.network,
-                "username": connection.username,
-                "account_type": connection.account_type,
-                "credential_expires_at": connection.credential_expires_at.isoformat(),
-            },
-            indent=2,
-        )
-    )
+    shown = {
+        "result": "added" if result.added else "refreshed",
+        "network": connection.network,
+        "username": connection.username,
+        "account_type": connection.account_type,
+        "credential_expires_at": connection.credential_expires_at.isoformat(),
+    }
+    if result.carried is not None:
+        # What the pre-existing row already owned: connecting the wrong account would keep it.
+        shown["carried"] = result.carried
+    print(json.dumps(shown, indent=2))
 
 
 def cmd_serve(args: argparse.Namespace, settings: Settings) -> None:

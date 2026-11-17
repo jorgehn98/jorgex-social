@@ -686,38 +686,49 @@ def test_a_grant_of_one_account_sees_nothing_of_the_other(app, agent, browser):
     assert api(agent, tokens["access_token"], f"/v1/posts/{theirs['id']}").status_code == 404
 
 
-def test_a_grant_of_the_other_mode_is_refused(app, agent, browser):
-    """A grant on the account of the other mode cannot write what the worker never sweeps: the
-    API refuses it with account_in_other_mode, as it does for an API token."""
+def test_an_account_of_the_other_mode_is_not_offered(app, agent, browser):
+    """A grant works in the service's mode: the other mode's account is neither offered nor
+    accepted, so no client ends up with a credential the API always refuses."""
+    with app.state.sessionmaker() as session, session.begin():
+        session.add(
+            Connection(
+                id="other-mode",
+                network="instagram",  # the service runs in simulation
+                external_account_id="1784real",
+                username="real_account",
+                account_type="BUSINESS",
+            )
+        )
+    client_id = register(agent).json()["client_id"]
+    page, fields = open_consent(browser, start(agent, client_id, pkce()[1]).headers["location"])
+
+    assert re.findall(r'name="account_id" value="([^"]+)"', page.text) == [account_id(app)]
+    fields["account_id"] = "other-mode"
+
+    assert answer(browser, fields, posts="write").status_code == 400
+    with app.state.read_sessionmaker() as session:
+        assert session.scalar(select(OAuthGrant)) is None
+
+
+def test_a_token_of_the_other_mode_is_refused_by_the_api(app, agent):
+    """A credential bound to the other mode's account can still exist from before a mode change;
+    every call with it answers account_in_other_mode and touches nothing."""
     with app.state.sessionmaker() as session, session.begin():
         other_mode = Connection(
             id="other-mode",
-            network="instagram",  # the service runs in simulation
+            network="instagram",
             external_account_id="1784real",
             username="real_account",
             account_type="BUSINESS",
         )
         session.add(other_mode)
+        session.flush()
         _, secret = create_token(session, "real-agent", {"posts": "write"}, other_mode.id)
-    client_id = register(agent).json()["client_id"]
-    verifier, challenge = pkce()
-    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
-    fields["account_id"] = other_mode.id
-    code = query_of(answer(browser, fields, posts="write"))["code"]
-    tokens = exchange(agent, client_id, code, verifier).json()
 
-    # Both credentials say which account they work on, and this one is of the other mode.
-    for response in (api(agent, tokens["access_token"]), api(agent, secret)):
-        assert response.json()["account"]["network"] == "instagram"
-    for response in (
-        api(agent, tokens["access_token"], "/v1/posts"),
-        api(agent, secret, "/v1/posts"),
-    ):
-        assert response.status_code == 403
-        assert response.json()["detail"]["code"] == "account_in_other_mode"
-    # A credential of this mode works, so the refusal is about the mode and not everything.
-    _, mine = connect(agent, browser, posts="read")
-    assert api(agent, mine["access_token"], "/v1/posts").status_code == 200
+    response = api(agent, secret, "/v1/posts")
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "account_in_other_mode"
 
 
 def test_the_code_needs_its_account_still_connected(app, agent, browser):

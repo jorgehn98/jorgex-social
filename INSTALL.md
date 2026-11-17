@@ -92,20 +92,21 @@ role (tester) in it, so add each of your own accounts there (see
 Each account has its own credential, posts, scheduled publications, rules, replies, statistics,
 audit log, incidents and kill switch. Connect each one with `connect-instagram`; then create one
 token per account per agent with `create-token --account`, because a token sees one account and can
-reach no other. Run `connect-instagram` again whenever a token needs renewing or replacing:
-connecting the same account refreshes its credential in place and leaves its posts and tokens
-alone, and connecting a different account adds it without touching the others. There is no command
-to delete a connection or its data.
+reach no other. Run `connect-instagram` again whenever its Instagram credential needs renewing or
+replacing: connecting the same account refreshes its credential in place and leaves its posts and
+tokens alone, and connecting a different account adds it without touching the others. There is no
+command to delete a connection or its data.
 
 The web interface shows one account at a time. Each account lives at `/ui/a/{account}/`, and the
-header switches between the accounts you have connected; `/ui/` opens the one you used last.
+account card on Home switches between the accounts you have connected; the header shows the active
+account and links back to Home. `/ui/` opens the one you used last.
 `{account}` is the connection id this installation gives the account (`account_id` in
 `list-tokens`, `connection_id` in `GET /v1/token`), not Instagram's user id.
 
 These belong to the installation, not to one account:
 
-- **Appearance**: product name, icon and CSS. `PUT /v1/appearance` with `account:write` of any
-  account changes them for every account and for the sign-in page; so do the MCP tools.
+- **Appearance**: product name, icon and CSS. Any token with `account:write` changes the name and
+  icon for every account and for the sign-in page; the CSS is only written from Settings.
 - **The catalog** of post types, sizes and limits.
 - **`/health`**, which reports the service, not an account.
 - **The webhook configuration**: callback URL, verify token and app secret. Each account still
@@ -252,8 +253,9 @@ Point the MCP server at `http://localhost:8000` while the tunnel is open (see
 ## Web interface
 
 A web interface shows one account at a time at `/ui/a/{account}/`: the connection, scheduled and
-published posts, insights, rules, events and incidents, with a switcher in the header for the
-accounts you connected. Only Settings can change anything, and only with a recent sign-in (see
+published posts, insights, rules, events and incidents, with an account switcher on the Home card;
+the header shows the active account and links back to Home. Only Settings can change anything, and
+only with a recent sign-in (see
 [Your own look](#your-own-look)); agents and scripts keep using the API. Settings belongs to the
 whole installation, so its header offers only Home: the section links need an account and live under
 `/ui/a/{account}/`. It is for one operator, who signs in with a password and a TOTP code from an
@@ -378,7 +380,7 @@ They live in the database, so your backups carry them. Saving requires a sign-in
 and a refused save loses what you typed, so long CSS edits are safer in a file. Agents use `GET` and `PUT /v1/appearance` with
 the `account` group, or the MCP tools `get_appearance` and `set_appearance`, for the name and icon.
 The appearance is the installation's, not one account's: `PUT /v1/appearance` with `account:write`
-of any account changes it for every account and its sign-in page.
+of any account changes the name and icon for every account and its sign-in page.
 
 CSS is the exception: only the Settings page can write it. The API and MCP can read it but refuse to
 change it, whatever the token's permissions, because valid CSS can change what a page shows, for
@@ -701,6 +703,13 @@ install that created a token before connecting anything), that account was never
 still belongs to the `instagram` mode, so a service in simulation refuses its tokens with
 `account_in_other_mode`. Run `connect-instagram` in simulation (any placeholder token is accepted)
 and create a new token for the account `list-tokens` then shows.
+
+The migrations create one row for an installation that had data but no connected account, and that
+row keeps the posts, API tokens and OAuth grants written before the upgrade. The first
+`connect-instagram` after the upgrade fills it, so it must be run with the Instagram account that
+owned that data: connecting a different account would put it on the row of the new one. The command
+prints how many rows the filled row already owned (`carried`), which is the moment to stop and check
+the account if the numbers do not fit.
 
 Compose stops the old worker before it replaces `api`, so the new version migrates with no worker
 running, and starts the new worker once `api` is healthy again. On stop, the worker finishes the

@@ -43,8 +43,8 @@ token per account per agent (`create-token --account`): a token sees one account
 other. The interface opens each account at `/ui/a/{account}/`.
 
 Some things belong to the installation, not to one account: the appearance (product name, icon and
-CSS; `PUT /v1/appearance` with `account:write` of any account changes it for all), the catalog of
-post types and limits, `/health`, and the webhook configuration.
+CSS; any token with `account:write` changes the name and icon for all, while the CSS is only written
+from Settings), the catalog of post types and limits, `/health`, and the webhook configuration.
 
 ## What you need
 

@@ -423,6 +423,34 @@ def test_connecting_the_same_account_again_refreshes_its_row(real, key, clock):
     assert sorted(actions) == ["connection.added", "connection.refreshed"]
 
 
+def test_connecting_the_same_account_again_closes_the_credential_incidents(real, key, clock):
+    """A working credential cures what a broken one caused: its incidents close in the same
+    transaction that stores the credential, not on the worker's next pass."""
+    sessions = real.state.sessionmaker
+    first = connect(
+        sessions, InstagramClient(PASTED, "me", transport=StubTransport()), PASTED, key, clock.now()
+    ).connection
+    with sessions() as session, session.begin():
+        for type_ in ("credential_expired", "credential_unreadable", "permission_revoked"):
+            session.add(ChannelIncident(account_id=first.id, type=type_, opened_at=clock.now()))
+
+    connect(
+        sessions,
+        InstagramClient("new-pasted", "me", transport=StubTransport()),
+        "new-pasted",
+        key,
+        clock.now(),
+    )
+
+    with sessions() as session:
+        assert (
+            session.scalars(
+                select(ChannelIncident.type).where(ChannelIncident.closed_at.is_(None))
+            ).all()
+            == []
+        )
+
+
 def test_connecting_another_account_adds_it_and_leaves_the_first_alone(real, key, clock):
     """The point of several own accounts: a second account is a second row with its own
     credential. The first one's row, credential, posts and tokens stay exactly as they were."""

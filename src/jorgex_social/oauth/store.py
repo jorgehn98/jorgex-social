@@ -194,16 +194,17 @@ def decide(
     session_hash: str,
     permissions: dict[str, str] | None,
     account_id: str | None,
+    network: str,
     now: datetime,
 ) -> str | None:
     """The operator's answer: the URI to send the browser back to, with a code, or with
     `access_denied` when `permissions` is None. The request is used up either way. None when the
     request, its session or its one-use value do not match: then nothing is sent anywhere.
 
-    An allowed request names the one connected account the grant will work on: the client cannot
-    choose it, and the account travels with the code into the grant. `Unconnected` when the value
-    is not a connected account of this installation: the request stays open, so a page that was
-    stale or tampered with costs nothing."""
+    An allowed request names the one connected account of `network` the grant will work on: the
+    client cannot choose it, and the account travels with the code into the grant. `Unconnected`
+    when the value is not a connected account of this installation's mode: the request stays open,
+    so a page that was stale or tampered with costs nothing."""
     pending = _pending(session, request_id, session_hash, now)
     if (
         pending is None
@@ -216,7 +217,9 @@ def decide(
     if client is None:
         return None
     if permissions is not None:
-        connected = {account.id for account in scope.connected_accounts(session)}
+        connected = {
+            account.id for account in scope.accounts_of(session, network, connected_only=True)
+        }
         if account_id not in connected:
             raise Unconnected
     session.delete(pending)
@@ -309,17 +312,22 @@ def code_replayed(session: Session, code: str, now: datetime) -> None:
         _end(session, grant, now, "code_reused")
 
 
-def exchange_code(session: Session, code: str, client_id: str, now: datetime) -> Issued:
+def exchange_code(
+    session: Session, code: str, client_id: str, network: str, now: datetime
+) -> Issued:
     purge(session, now)
     found = find_code(session, code, client_id, now)
     if found is None:
         raise Invalid
     if found.used_at is not None:
         raise Replayed
-    # The account chosen on the consent page must still be a connected one: the operator may have
-    # disconnected it meanwhile, and a grant on a row that is gone would fail on its foreign key.
+    # The account chosen on the consent page must still be a connected one of this mode: the
+    # operator may have disconnected it meanwhile, and a grant on a row that is gone would fail on
+    # its foreign key.
     account_id = found.params.get("account_id")
-    if account_id not in {account.id for account in scope.connected_accounts(session)}:
+    if account_id not in {
+        account.id for account in scope.accounts_of(session, network, connected_only=True)
+    }:
         raise Invalid
     found.used_at = now
     grant = OAuthGrant(
