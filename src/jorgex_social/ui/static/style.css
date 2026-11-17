@@ -611,6 +611,31 @@ ul.variants {
   width: 100%;
 }
 
+/* Consent: the one account the grant works on, before the permission table. */
+.consent-accounts {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  padding: 0.9rem 1rem 0.3rem;
+  margin: 0 0 1rem;
+}
+.consent-accounts legend {
+  padding: 0 0.35rem;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+.consent-accounts label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  color: var(--fg-1);
+}
+.consent-accounts input {
+  width: auto;
+  margin: 0;
+}
+
 /* Charts: one series each, the accent first, the second accent second. */
 
 .chart {

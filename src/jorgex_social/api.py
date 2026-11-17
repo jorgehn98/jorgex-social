@@ -5,12 +5,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from jorgex_social.access.deps import TokenDep
+from jorgex_social.access.deps import ReadSessionDep, TokenDep
 from jorgex_social.access.limits import RateLimiter
 from jorgex_social.access.proxy import TunnelOnlyMiddleware
 from jorgex_social.account.api import appearance_router
 from jorgex_social.account.api import router as account_router
 from jorgex_social.account.audit import AuditMiddleware
+from jorgex_social.account.models import Connection
 from jorgex_social.clock import Clock, SystemClock
 from jorgex_social.config import Settings
 from jorgex_social.db import make_engine, make_sessionmaker
@@ -70,9 +71,23 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
         return JSONResponse({"status": "ok", "simulation": request.app.state.settings.simulation})
 
     @app.get("/v1/token", tags=["access"])
-    def whoami(token: TokenDep) -> dict:
-        """What the calling token is allowed to do, so an agent can check before acting."""
-        return {"name": token.name, "prefix": token.prefix, "permissions": token.permissions}
+    def whoami(token: TokenDep, session: ReadSessionDep) -> dict:
+        """What the calling token is allowed to do and which account it works on, so an agent can
+        check before acting. It can reach that account and no other. `account.id` is the account's
+        id on the network, as `GET /v1/account` reports it (null before connecting);
+        `account.connection_id` is the id this installation gives it."""
+        account = session.get_one(Connection, token.account_id)
+        return {
+            "name": token.name,
+            "prefix": token.prefix,
+            "permissions": token.permissions,
+            "account": {
+                "id": account.external_account_id or None,
+                "network": account.network,
+                "username": account.username,
+                "connection_id": account.id,
+            },
+        }
 
     app.add_middleware(AuditMiddleware)
     # Added last, so it runs first: what it turns away is never audited nor routed.

@@ -22,7 +22,8 @@ from jorgex_social.access.limits import client_key, is_listed
 from jorgex_social.access.models import OperatorSession
 from jorgex_social.access.proxy import via_proxy
 from jorgex_social.account import appearance, scope
-from jorgex_social.account.api import get_account, list_incidents
+from jorgex_social.account.api import account_out, incidents_page
+from jorgex_social.account.models import Connection
 from jorgex_social.publishing import media as storage
 from jorgex_social.publishing.api import get_post, list_posts, next_scheduled
 from jorgex_social.publishing.models import Media, MediaType, PostStatus
@@ -397,8 +398,16 @@ def logout(request: Request):
 
 
 def _account_id(request: Request, session) -> str | None:
-    """The account of the mode; none of the pages list anything before it exists."""
+    """The account of the mode; none of the pages list anything before it exists.
+
+    Until T04 the interface carries no account: it works on the one of its mode. An API call
+    never comes here; its account is the token's (access/deps.py)."""
     return scope.account_id_of(session, request.app.state.network)
+
+
+def _account(request: Request, session) -> Connection | None:
+    """The same account, as the row the pages read it from."""
+    return scope.account_of(session, request.app.state.network)
 
 
 @pages.get("/")
@@ -406,8 +415,16 @@ def home(request: Request, session: ReadSessionDep):
     return render(
         request,
         "home.html",
-        account=get_account(request, session),
-        incidents=list_incidents(request, session, open=True, limit=20),
+        account=account_out(request, session, _account(request, session), installation=True),
+        # The operator also sees the installation's own incidents, such as a leaked password.
+        incidents=incidents_page(
+            session,
+            _account_id(request, session),
+            request.app.state.network,
+            installation=True,
+            open=True,
+            limit=20,
+        ),
         upcoming=next_scheduled(session, _account_id(request, session), limit=5),
     )
 
@@ -534,7 +551,17 @@ def events(request: Request, session: ReadSessionDep):
 
 @pages.get("/incidents")
 def incidents(request: Request, session: ReadSessionDep):
-    return render(request, "incidents.html", incidents=list_incidents(request, session, limit=200))
+    return render(
+        request,
+        "incidents.html",
+        incidents=incidents_page(
+            session,
+            _account_id(request, session),
+            request.app.state.network,
+            installation=True,
+            limit=200,
+        ),
+    )
 
 
 # Settings: one route and one template extending settings_layout.html per section.

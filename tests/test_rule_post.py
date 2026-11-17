@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import event, select
 
 from jorgex_social.access.tokens import create_token
+from jorgex_social.account import scope
 from jorgex_social.account.connection import ConnectionTask
 from jorgex_social.account.models import AuditEntry, Connection
 from jorgex_social.api import create_app
@@ -51,8 +52,12 @@ def sessions(app):
 @pytest.fixture
 def headers(app):
     with app.state.sessionmaker() as session, session.begin():
+        account = scope.current_account(session, app.state.network)
         _, secret = create_token(
-            session, "agent", {"posts": "write", "scheduling": "write", "rules": "write"}
+            session,
+            "agent",
+            {"posts": "write", "scheduling": "write", "rules": "write"},
+            account.id,
         )
     return {"Authorization": f"Bearer {secret}"}
 

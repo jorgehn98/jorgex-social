@@ -13,8 +13,8 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from jorgex_social.access.tokens import hash_token
-from jorgex_social.account import audit
-from jorgex_social.account.models import ActorType, Outcome
+from jorgex_social.account import audit, scope
+from jorgex_social.account.models import ActorType, Connection, Outcome
 from jorgex_social.oauth.models import OAuthClient, OAuthCode, OAuthGrant, OAuthRequest, OAuthToken
 
 ACCESS_LIFETIME = timedelta(hours=1)
@@ -40,6 +40,11 @@ class OAuthError(ValueError):
     pass
 
 
+class Unconnected(ValueError):
+    """A consent answered with an account that is not connected: another installation's, made up,
+    or one that stopped being connected while the page was open."""
+
+
 class Invalid(Exception):
     """A code or refresh token that cannot be used: unknown, expired, used or revoked."""
 
@@ -59,12 +64,14 @@ class Issued:
 
 @dataclass(frozen=True)
 class Access:
-    """What a valid access token allows. Duck-types the API token where the API authorizes
-    (`permissions`) and audits (`prefix`)."""
+    """What a valid access token allows: the groups and levels of its grant, and the one account
+    it works on. Duck-types the API token where the API authorizes (`permissions`, `account_id`)
+    and audits (`prefix`)."""
 
     grant_id: str
     client_id: str
     client_name: str | None
+    account_id: str
     permissions: dict[str, str]
     expires_at: datetime
     # The resource (RFC 8707) its grant was issued for.
@@ -88,6 +95,7 @@ def _audit(
     outcome: Outcome = Outcome.OK,
     *,
     by_operator: bool = False,
+    account_id: str | None = None,
     detail: dict[str, Any] | None = None,
 ) -> None:
     audit.record(
@@ -95,6 +103,7 @@ def _audit(
         now,
         action,
         outcome,
+        account_id=account_id if grant is None else grant.account_id,
         actor_type=ActorType.OPERATOR if by_operator else ActorType.SYSTEM,
         actor_ref=f"oauth:{grant.id}" if grant else None,
         object_type="oauth_grant" if grant else "oauth_client",
@@ -184,11 +193,17 @@ def decide(
     nonce: str,
     session_hash: str,
     permissions: dict[str, str] | None,
+    account_id: str | None,
     now: datetime,
 ) -> str | None:
     """The operator's answer: the URI to send the browser back to, with a code, or with
     `access_denied` when `permissions` is None. The request is used up either way. None when the
-    request, its session or its one-use value do not match: then nothing is sent anywhere."""
+    request, its session or its one-use value do not match: then nothing is sent anywhere.
+
+    An allowed request names the one connected account the grant will work on: the client cannot
+    choose it, and the account travels with the code into the grant. `Unconnected` when the value
+    is not a connected account of this installation: the request stays open, so a page that was
+    stale or tampered with costs nothing."""
     pending = _pending(session, request_id, session_hash, now)
     if (
         pending is None
@@ -197,10 +212,14 @@ def decide(
         or not hmac.compare_digest(pending.nonce_hash, hash_token(nonce))
     ):
         return None
-    session.delete(pending)
     client = find_client(session, pending.client_id, now)
     if client is None:
         return None
+    if permissions is not None:
+        connected = {account.id for account in scope.connected_accounts(session)}
+        if account_id not in connected:
+            raise Unconnected
+    session.delete(pending)
     params = pending.params
     if permissions is None:
         _audit(session, now, "oauth.consent", None, client.id, Outcome.DENIED, by_operator=True)
@@ -221,7 +240,8 @@ def decide(
                     "redirect_uri_provided_explicitly",
                     "resource",
                 )
-            },
+            }
+            | {"account_id": account_id},
             expires_at=now + CODE_LIFETIME,
         )
     )
@@ -233,7 +253,8 @@ def decide(
         None,
         client.id,
         by_operator=True,
-        detail={"permissions": permissions},
+        account_id=account_id,
+        detail={"permissions": permissions, "account_id": account_id},
     )
     return construct_redirect_uri(params["redirect_uri"], code=code, state=params["state"])
 
@@ -295,10 +316,18 @@ def exchange_code(session: Session, code: str, client_id: str, now: datetime) ->
         raise Invalid
     if found.used_at is not None:
         raise Replayed
+    # The account chosen on the consent page must still be a connected one: the operator may have
+    # disconnected it meanwhile, and a grant on a row that is gone would fail on its foreign key.
+    account_id = found.params.get("account_id")
+    if account_id not in {account.id for account in scope.connected_accounts(session)}:
+        raise Invalid
     found.used_at = now
     grant = OAuthGrant(
         id=secrets.token_hex(8),
         client_id=client_id,
+        # Chosen on the consent page and carried by the code: every token of the grant works on
+        # that account and no other.
+        account_id=account_id,
         permissions=found.permissions,
         resource=found.params["resource"],
         created_at=now,
@@ -415,6 +444,7 @@ def find_access(
         grant_id=grant.id,
         client_id=grant.client_id,
         client_name=client.name if client else None,
+        account_id=grant.account_id,
         permissions=grant.permissions,
         expires_at=found.expires_at,
         resource=grant.resource,
@@ -463,8 +493,9 @@ def revoke_all(session: Session, now: datetime, reason: str) -> int:
 
 def list_grants(session: Session) -> list[dict[str, Any]]:
     rows = session.execute(
-        select(OAuthGrant, OAuthClient.name)
+        select(OAuthGrant, OAuthClient.name, Connection.username)
         .join(OAuthClient, OAuthClient.id == OAuthGrant.client_id)
+        .join(Connection, Connection.id == OAuthGrant.account_id)
         .order_by(OAuthGrant.created_at)
     )
     return [
@@ -472,10 +503,12 @@ def list_grants(session: Session) -> list[dict[str, Any]]:
             "id": grant.id,
             "client_id": grant.client_id,
             "client_name": name,
+            "account": account,
+            "account_id": grant.account_id,
             "permissions": grant.permissions,
             "created_at": grant.created_at.isoformat(),
             "expires_at": grant_end(grant).isoformat(),
             "revoked_at": grant.revoked_at and grant.revoked_at.isoformat(),
         }
-        for grant, name in rows
+        for grant, name, account in rows
     ]

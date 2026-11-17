@@ -453,3 +453,208 @@ def test_an_operator_incident_stays_without_an_account(settings):
             ("instagram", closed_at)
         ]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+# One credential, one account (0017)
+
+
+def _credential_rows(db, grant="grant") -> None:
+    db.execute(
+        "INSERT INTO api_tokens (id, name, prefix, hash, permissions, created_at)"
+        " VALUES ('token', 'agent', 'jxs_1', 'hash-token', '{}', 'now')"
+    )
+    db.execute("INSERT INTO oauth_clients (id, info, created_at) VALUES ('client', '{}', 'now')")
+    db.execute(
+        "INSERT INTO oauth_grants (id, client_id, permissions, resource, created_at)"
+        " VALUES (?, 'client', '{}', 'https://social.example.com/mcp', 'now')",
+        (grant,),
+    )
+
+
+def _account_of_each_credential(db) -> dict[str, str]:
+    return {
+        "token": db.execute("SELECT account_id FROM api_tokens").fetchone()[0],
+        "grant": db.execute("SELECT account_id FROM oauth_grants").fetchone()[0],
+    }
+
+
+def _downgrade_to_before_the_credentials_have_one(settings):
+    config = alembic_config(settings)
+    command.downgrade(config, "0016")
+    return config
+
+
+def test_the_credentials_take_the_only_account(settings):
+    config = _downgrade_to_before_the_credentials_have_one(settings)
+    with sqlite3.connect(settings.database_path) as db:
+        db.execute(
+            "INSERT INTO connections (id, network, external_account_id, username, status)"
+            " VALUES ('only', 'instagram', '1784', 'account', 'ok')"
+        )
+        _credential_rows(db)
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert _account_of_each_credential(db) == {"token": "only", "grant": "only"}
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        for table in ("api_tokens", "oauth_grants"):
+            references = db.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            assert ("connections", "account_id", "id") in {(r[2], r[3], r[4]) for r in references}
+            info = db.execute(f"PRAGMA table_info({table})").fetchall()
+            assert next(row[3] for row in info if row[1] == "account_id") == 1
+
+
+def test_the_credentials_skip_the_simulated_account(settings):
+    """Two connections: the credentials work on the real account, never the fake one."""
+    config = _downgrade_to_before_the_credentials_have_one(settings)
+    with sqlite3.connect(settings.database_path) as db:
+        db.execute(
+            "INSERT INTO connections (id, network, external_account_id, username, status)"
+            " VALUES ('sim', 'simulation', '', '', 'ok')"
+        )
+        db.execute(
+            "INSERT INTO connections (id, network, external_account_id, username, status)"
+            " VALUES ('real', 'instagram', '1784', 'account', 'ok')"
+        )
+        _credential_rows(db)
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert _account_of_each_credential(db) == {"token": "real", "grant": "real"}
+
+
+def test_with_no_account_the_credentials_get_the_one_a_first_write_makes(settings):
+    """A database with credentials and no connection keeps working: the account exists, with no
+    external id until `connect-instagram` fills it."""
+    config = _downgrade_to_before_the_credentials_have_one(settings)
+    with sqlite3.connect(settings.database_path) as db:
+        _credential_rows(db)
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        connections = db.execute(
+            "SELECT id, network, external_account_id FROM connections"
+        ).fetchall()
+        assert len(connections) == 1
+        created, network, external = connections[0]
+        assert (network, external) == ("instagram", "")
+        assert _account_of_each_credential(db) == {"token": created, "grant": created}
+
+
+def test_a_fresh_install_gains_no_connection(settings):
+    """No credential, no account: the migration invents nothing to back up."""
+    with sqlite3.connect(settings.database_path) as db:
+        assert db.execute("SELECT count(*) FROM connections").fetchone() == (0,)
+
+
+def test_it_stops_when_two_accounts_could_own_the_credentials(settings):
+    """Ambiguity stops the migration before it touches the schema, so it can run again once the
+    operator has chosen: here, by removing one of the two connections."""
+    config = _downgrade_to_before_the_credentials_have_one(settings)
+    with sqlite3.connect(settings.database_path) as db:
+        for account in ("one", "two"):
+            db.execute(
+                "INSERT INTO connections (id, network, external_account_id, username, status)"
+                " VALUES (?, 'instagram', ?, ?, 'ok')",
+                (account, f"1784{account}", account),
+            )
+        _credential_rows(db)
+
+    with pytest.raises(RuntimeError, match="cannot tell which account"):
+        command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert db.execute("SELECT count(*) FROM connections").fetchone() == (2,)
+        for table in ("api_tokens", "oauth_grants"):
+            assert "account_id" not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        db.execute("DELETE FROM connections WHERE id = 'two'")
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert _account_of_each_credential(db) == {"token": "one", "grant": "one"}
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_the_audit_log_keeps_the_accounts_past(settings):
+    """Historical entries that are an account's get it, so a token reads what happened before the
+    upgrade; the operator's own stay without one. The log is still append-only."""
+    config = _downgrade_to_before_the_credentials_have_one(settings)
+    with sqlite3.connect(settings.database_path) as db:
+        db.execute(
+            "INSERT INTO connections (id, network, external_account_id, username, status)"
+            " VALUES ('only', 'instagram', '1784', 'account', 'ok')"
+        )
+        _credential_rows(db)
+        for entry_id, actor, action in (
+            ("published", "system", "post.published"),
+            ("archived", "token", "rule.archived"),
+            ("sign-in", "operator", "operator.login"),
+            ("settings", "operator", "appearance.updated"),
+        ):
+            db.execute(
+                "INSERT INTO audit_log (id, occurred_at, actor_type, action, outcome)"
+                " VALUES (?, '2026-11-01T00:00:00.000000+00:00', ?, ?, 'ok')",
+                (entry_id, actor, action),
+            )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(settings.database_path) as db:
+        named = dict(db.execute("SELECT id, account_id FROM audit_log").fetchall())
+        assert named == {
+            "published": "only",
+            "archived": "only",
+            "sign-in": None,
+            "settings": None,
+        }
+        # Still append-only, with the trigger back exactly as 0016 left it.
+        for statement in ("UPDATE audit_log SET outcome = 'ok'", "DELETE FROM audit_log"):
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                db.execute(statement)
+
+    # And the past reaches the token of that account through the API.
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from jorgex_social.access.tokens import create_token
+    from jorgex_social.api import create_app
+    from jorgex_social.db import make_engine, make_sessionmaker
+
+    # The account is a real one, so the service runs in real mode: a token of the other mode is
+    # refused (access/deps.py).
+    app = create_app(replace(settings, simulation=False))
+    with make_sessionmaker(make_engine(settings))() as session, session.begin():
+        _, secret = create_token(session, "history-reader", {"account": "read"}, "only")
+    entries = (
+        TestClient(app)
+        .get("/v1/account/audit", headers={"Authorization": f"Bearer {secret}"})
+        .json()
+    )
+
+    assert {entry["action"] for entry in entries} == {"post.published", "rule.archived"}
+
+
+def test_downgrading_gives_the_account_column_back(settings):
+    config = alembic_config(settings)
+    command.downgrade(config, "0016")
+    with sqlite3.connect(settings.database_path) as db:
+        db.execute(
+            "INSERT INTO connections (id, network, external_account_id, username, status)"
+            " VALUES ('only', 'instagram', '1784', 'account', 'ok')"
+        )
+        _credential_rows(db)
+    command.upgrade(config, "head")
+
+    command.downgrade(config, "0016")
+
+    with sqlite3.connect(settings.database_path) as db:
+        assert db.execute("SELECT id FROM api_tokens").fetchall() == [("token",)]
+        assert db.execute("SELECT id FROM oauth_grants").fetchall() == [("grant",)]
+        for table in ("api_tokens", "oauth_grants"):
+            assert "account_id" not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []

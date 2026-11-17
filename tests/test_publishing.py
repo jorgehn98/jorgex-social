@@ -38,7 +38,10 @@ def app(settings, clock):
 @pytest.fixture
 def headers(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", {"posts": "write", "scheduling": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(
+            session, "agent", {"posts": "write", "scheduling": "write"}, account.id
+        )
     return {"Authorization": f"Bearer {secret}"}
 
 
@@ -127,7 +130,8 @@ def test_upload_over_the_limit_leaves_nothing(client, headers, app, monkeypatch)
 
 def test_upload_needs_posts_write(app, client):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "reader", {"posts": "read"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "reader", {"posts": "read"}, account.id)
 
     response = client.post(
         "/v1/media",
@@ -376,7 +380,8 @@ def test_editing_replaces_items_in_order(client, headers):
 def test_scheduling_needs_its_own_group(app, client, headers):
     post = reel(client, headers)
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "writer", {"posts": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "writer", {"posts": "write"}, account.id)
 
     response = client.post(
         f"/v1/posts/{post['id']}/publish-now",
@@ -504,16 +509,14 @@ def test_delete_refuses_posts_in_flight_or_on_instagram(app, client, headers, st
     assert client.get(f"/v1/posts/{post['id']}", headers=headers).json()["status"] == status
 
 
-def test_delete_unknown_already_deleted_or_other_mode_is_404(settings, clock, client, headers):
+def test_delete_unknown_or_already_deleted_is_404(client, headers):
     post = reel(client, headers)
     client.delete(f"/v1/posts/{post['id']}", headers=headers)
-    other = reel(client, headers)
-    real = TestClient(
-        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
-    )
 
-    for c, post_id in ((client, "nope"), (client, post["id"]), (real, other["id"])):
-        response = c.delete(f"/v1/posts/{post_id}", headers=headers)
+    # A post of another account is the same answer: this file checks the unknown ones, and
+    # tests/test_isolation.py the other account's.
+    for post_id in ("nope", post["id"]):
+        response = client.delete(f"/v1/posts/{post_id}", headers=headers)
         assert response.status_code == 404
         assert response.json()["detail"]["code"] == "not_found"
 
@@ -521,7 +524,10 @@ def test_delete_unknown_already_deleted_or_other_mode_is_404(settings, clock, cl
 def test_delete_needs_posts_write(app, client, headers):
     post = reel(client, headers)
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "scheduler", {"posts": "read", "scheduling": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(
+            session, "scheduler", {"posts": "read", "scheduling": "write"}, account.id
+        )
 
     response = client.delete(
         f"/v1/posts/{post['id']}", headers={"Authorization": f"Bearer {secret}"}
@@ -605,7 +611,10 @@ def test_real_mode_without_public_url_refuses_to_schedule(settings, clock):
     )
     client = TestClient(real)
     with real.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", {"posts": "write", "scheduling": "write"})
+        account = scope.current_account(session, real.state.network)
+        _, secret = create_token(
+            session, "agent", {"posts": "write", "scheduling": "write"}, account.id
+        )
     headers = {"Authorization": f"Bearer {secret}"}
     post = reel(client, headers)
 
@@ -613,33 +622,6 @@ def test_real_mode_without_public_url_refuses_to_schedule(settings, clock):
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "public_url_missing"
-
-
-def test_simulated_posts_never_show_in_real_mode(settings, clock, client, headers):
-    reel(client, headers)
-    real = create_app(Settings(database_path=settings.database_path, simulation=False), clock)
-
-    assert TestClient(real).get("/v1/posts", headers=headers).json() == []
-
-
-def test_the_idempotency_key_is_the_caller_s_not_the_installation_s(
-    settings, clock, client, headers
-):
-    """Two accounts may use the same key: it is only unique within the one that sends it."""
-    simulated = reel(client, headers, idempotency_key="note-1")
-    real = TestClient(
-        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
-    )
-
-    same_key = real.post(
-        "/v1/posts",
-        json={"type": "image", "items": simulated["items"], "idempotency_key": "note-1"},
-        headers=headers,
-    )
-
-    assert same_key.status_code == 201
-    assert same_key.json()["id"] != simulated["id"]
-    assert same_key.json()["network"] == "instagram"
 
 
 # Public media URL

@@ -1,12 +1,12 @@
-"""Which account the service is working on.
+"""Which account a piece of work is about.
 
 Every row of the domain carries `account_id`, never the network: with two accounts of one network
-the network identifies nothing (decision 10). This module is the one place that says which account
-that is, so the queries only ever ask it.
+the network identifies nothing (decision 10). This module is the one place the *service's own* code
+asks which account that is: the worker, the webhook and the operator's web interface, which still
+work on the one account of each mode until the interface carries the account in its URL.
 
-Today one installation serves one account per mode (decision 07): the real one, or the simulated
-one. T02 replaces the account of the mode with the account of the caller's token, and only what
-these functions read changes.
+An API call never comes here: its account is the caller's, resolved from the token or the OAuth
+grant in `access/deps.py` (T02).
 """
 
 from sqlalchemy import select
@@ -45,3 +45,13 @@ def current_account(session: Session, network: str) -> Connection:
         session.add(account)
         session.flush()
     return account
+
+
+def connected_accounts(session: Session) -> list[Connection]:
+    """The accounts a credential can be bound to: the ones that have been connected, oldest
+    first. A row created by a first write is not one of them yet."""
+    return list(
+        session.scalars(
+            select(Connection).where(Connection.external_account_id != "").order_by(Connection.id)
+        )
+    )

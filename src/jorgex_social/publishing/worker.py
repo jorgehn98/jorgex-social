@@ -103,7 +103,14 @@ def _audit_post(
     detail: dict | None = None,
 ) -> None:
     audit.record(
-        session, now, action, outcome, object_type="post", object_id=post.id, detail=detail
+        session,
+        now,
+        action,
+        outcome,
+        account_id=post.account_id,
+        object_type="post",
+        object_id=post.id,
+        detail=detail,
     )
 
 

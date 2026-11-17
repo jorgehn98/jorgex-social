@@ -269,6 +269,7 @@ def _pause_for_echoes(
             session,
             now,
             "conversation.paused",
+            account_id=conversation.account_id,
             object_type="conversation",
             object_id=conversation.id,
             detail={"cause": "human_reply", "until": until.isoformat()},

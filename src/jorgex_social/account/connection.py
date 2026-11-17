@@ -128,6 +128,7 @@ def connect(
             session,
             now,
             "connection.replaced" if switching else "connection.connected",
+            account_id=connection.id,
             actor_type=ActorType.OPERATOR,
             object_type="connection",
             object_id=connection.id,
@@ -245,6 +246,7 @@ class ConnectionTask:
                     now,
                     "credential.renewed",
                     Outcome.ERROR,
+                    account_id=before.id,
                     object_type="connection",
                     object_id=before.id,
                     detail={"error_code": exc.code},
@@ -265,6 +267,7 @@ class ConnectionTask:
                     now,
                     "credential.renewed",
                     Outcome.ERROR,
+                    account_id=before.id,
                     object_type="connection",
                     object_id=before.id,
                     detail={"discarded": "connection_changed"},
@@ -278,6 +281,7 @@ class ConnectionTask:
                 session,
                 now,
                 "credential.renewed",
+                account_id=connection.id,
                 object_type="connection",
                 object_id=connection.id,
             )
@@ -288,6 +292,8 @@ class ConnectionTask:
         """Posts whose outcome the resolver has not settled for over an hour need a human."""
         with sessions() as session, session.begin():
             account_id = scope.account_id_of(session, self.instagram.network)
+            if account_id is None:
+                return  # nothing written for this mode yet: no account's incident to open
             post_ids = session.scalars(
                 select(Post.id)
                 .join(PublishAttempt)

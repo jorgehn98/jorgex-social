@@ -11,13 +11,14 @@ from sqlalchemy.orm import Session, joinedload, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from jorgex_social.access.deps import (
+    AccountIdDep,
     ReadSessionDep,
     SessionDep,
     require,
     require_outside_transaction,
 )
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import audit, scope
+from jorgex_social.account import audit
 from jorgex_social.account.audit import set_detail
 from jorgex_social.publishing import catalog
 from jorgex_social.publishing import media as storage
@@ -72,9 +73,9 @@ def _write_chunk(fh: BinaryIO, digest, chunk: bytes) -> None:
     fh.write(chunk)
 
 
-def _save_media(sessions: sessionmaker, network: str, media: Media) -> None:
+def _save_media(sessions: sessionmaker, account_id: str, media: Media) -> None:
     with sessions() as session, session.begin():
-        media.account_id = scope.current_account(session, network).id
+        media.account_id = account_id
         session.add(media)
 
 
@@ -84,10 +85,11 @@ def _save_media(sessions: sessionmaker, network: str, media: Media) -> None:
     response_model=MediaOut,
     dependencies=[Depends(require_outside_transaction(Group.POSTS, Level.WRITE))],
 )
-async def upload_media(request: Request):
+async def upload_media(request: Request, account: AccountIdDep):
     """Upload one file as the raw request body (for example `curl --data-binary @file`), with
     Content-Type image/jpeg, video/mp4 or video/quicktime. The stored type comes from the file
-    signature, not from the header."""
+    signature, not from the header. The file belongs to this token's account: a post of any
+    other account cannot use it."""
     content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     if content_type not in storage.UPLOAD_CONTENT_TYPES:
         raise _error(
@@ -95,12 +97,13 @@ async def upload_media(request: Request):
             "unsupported_media_type",
             f"Content-Type must be one of {', '.join(sorted(storage.UPLOAD_CONTENT_TYPES))}.",
         )
-    return await save_upload(request)
+    return await save_upload(request, account)
 
 
-async def save_upload(request: Request) -> Media:
+async def save_upload(request: Request, account_id: str) -> Media:
     """Streams the request body to disk as a new media (at most MAX_UPLOAD_BYTES, typed by its
-    signature) and stores it. Also behind the one-use upload URLs of remote agents."""
+    signature) and stores it for `account_id`. Also behind the one-use upload URLs of remote
+    agents."""
     limit = storage.MAX_UPLOAD_BYTES
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit:
@@ -140,9 +143,7 @@ async def save_upload(request: Request) -> Media:
         created_at=request.app.state.clock.now(),  # unused media are purged by age
     )
     try:
-        await run_in_threadpool(
-            _save_media, request.app.state.sessionmaker, request.app.state.network, media
-        )
+        await run_in_threadpool(_save_media, request.app.state.sessionmaker, account_id, media)
     except BaseException:
         final.unlink(missing_ok=True)
         raise
@@ -247,16 +248,23 @@ class PostDetail(PostOut):
     attempts: list[AttemptOut]
 
 
-def _media(session: Session, media_ids: list[str]) -> dict[str, Media]:
-    found = {m.id: m for m in session.scalars(select(Media).where(Media.id.in_(media_ids)))}
+def _media(session: Session, account_id: str | None, media_ids: list[str]) -> dict[str, Media]:
+    """The media named, of this account only. One of another account is `unknown_media`, exactly
+    like an id that does not exist: a post never says that another account's file is there."""
+    found = {
+        m.id: m
+        for m in session.scalars(
+            select(Media).where(Media.account_id == account_id, Media.id.in_(media_ids))
+        )
+    }
     missing = sorted(set(media_ids) - set(found))
     if missing:
         raise _error(422, "unknown_media", "Unknown media ids.", media_ids=missing)
     return found
 
 
-def _check(session: Session, post: Post) -> Check:
-    media = _media(session, post.media_ids)
+def _check(session: Session, account_id: str | None, post: Post) -> Check:
+    media = _media(session, account_id, post.media_ids)
     return catalog.validate(
         PostType(post.type),
         post.caption,
@@ -267,8 +275,8 @@ def _check(session: Session, post: Post) -> Check:
     )
 
 
-def _out(session: Session, post: Post, *, detail: bool = False) -> dict:
-    check = _check(session, post)
+def _out(session: Session, account_id: str | None, post: Post, *, detail: bool = False) -> dict:
+    check = _check(session, account_id, post)
     out = {
         **{field: getattr(post, field) for field in PostOut.model_fields if hasattr(post, field)},
         "items": [item.media_id for item in post.items],
@@ -282,6 +290,7 @@ def _out(session: Session, post: Post, *, detail: bool = False) -> dict:
 
 def _set_content(
     session: Session,
+    account_id: str | None,
     post: Post,
     post_type: PostType,
     caption: str,
@@ -290,7 +299,7 @@ def _set_content(
     thumb_offset_ms: int | None,
     trial: TrialMode | None,
 ) -> None:
-    media = _media(session, item_ids + ([cover_id] if cover_id else []))
+    media = _media(session, account_id, item_ids + ([cover_id] if cover_id else []))
     post.type = post_type
     post.caption = caption
     post.cover_media_id = cover_id
@@ -311,13 +320,9 @@ def _set_content(
     post.items = [PostItem(position=i, media_id=media_id) for i, media_id in enumerate(item_ids)]
 
 
-def _account(request: Request, session: SessionDep) -> str | None:
-    # The account of the mode: simulated posts never show in real mode, and the other way round.
-    # None before anything exists for the mode, which matches no row.
-    return scope.account_id_of(session, request.app.state.network)
-
-
-Account = Annotated[str | None, Depends(_account)]
+# The account of the call: the token's or its OAuth grant's. The web interface resolves the one
+# account of the mode itself and passes its id, as it does for every page.
+Account = AccountIdDep
 
 
 def _post(session: Session, account_id: str | None, post_id: str) -> Post:
@@ -344,11 +349,14 @@ def _require_status(post: Post, allowed: set[PostStatus], action: str) -> None:
     response_model=PostOut,
     dependencies=PostsWrite,
 )
-def create_post(body: PostIn, request: Request, session: SessionDep, response: Response):
+def create_post(
+    body: PostIn, request: Request, session: SessionDep, response: Response, account: Account
+):
     """Create a draft. The response carries its content_hash and the catalog errors and
     warnings; a draft with errors is kept but cannot be scheduled."""
-    account_id = scope.current_account(session, request.app.state.network).id
+    account_id = account
     if body.idempotency_key:
+        # Unique per account: the same key sent to another account is another draft (0016).
         existing = session.scalar(
             select(Post).where(
                 Post.account_id == account_id, Post.idempotency_key == body.idempotency_key
@@ -356,7 +364,7 @@ def create_post(body: PostIn, request: Request, session: SessionDep, response: R
         )
         if existing is not None:
             response.status_code = status.HTTP_200_OK
-            return _out(session, existing)
+            return _out(session, account_id, existing)
     post = Post(
         account_id=account_id,
         source_ref=body.source_ref,
@@ -365,6 +373,7 @@ def create_post(body: PostIn, request: Request, session: SessionDep, response: R
     )
     _set_content(
         session,
+        account_id,
         post,
         body.type,
         body.caption,
@@ -373,7 +382,7 @@ def create_post(body: PostIn, request: Request, session: SessionDep, response: R
         body.thumb_offset_ms,
         body.trial,
     )
-    return _out(session, post)
+    return _out(session, account_id, post)
 
 
 @router.get("/posts", response_model=list[PostOut], dependencies=PostsRead)
@@ -396,7 +405,7 @@ def list_posts(
     )
     if status:
         query = query.where(Post.status == status)
-    return [_out(session, post) for post in session.scalars(query)]
+    return [_out(session, account, post) for post in session.scalars(query)]
 
 
 def next_scheduled(session: Session, account_id: str | None, limit: int) -> list[dict]:
@@ -408,13 +417,13 @@ def next_scheduled(session: Session, account_id: str | None, limit: int) -> list
         .order_by(Post.scheduled_for, Post.id)
         .limit(limit)
     )
-    return [_out(session, post) for post in session.scalars(query)]
+    return [_out(session, account_id, post) for post in session.scalars(query)]
 
 
 @router.get("/posts/{post_id}", response_model=PostDetail, dependencies=PostsRead)
 def get_post(post_id: str, session: SessionDep, account: Account):
     """One post with its publish attempts."""
-    return _out(session, _post(session, account, post_id), detail=True)
+    return _out(session, account, _post(session, account, post_id), detail=True)
 
 
 @router.patch("/posts/{post_id}", response_model=PostOut, dependencies=PostsWrite)
@@ -429,6 +438,7 @@ def update_post(post_id: str, body: PostPatch, session: SessionDep, account: Acc
             raise _error(422, "invalid_value", f"{required} cannot be null.")
     _set_content(
         session,
+        account,
         post,
         body.type if "type" in fields else PostType(post.type),
         body.caption if "caption" in fields else post.caption,
@@ -441,7 +451,7 @@ def update_post(post_id: str, body: PostPatch, session: SessionDep, account: Acc
         post.source_ref = body.source_ref
     post.status = PostStatus.DRAFT
     post.scheduled_for = None
-    return _out(session, post)
+    return _out(session, account, post)
 
 
 class ScheduleIn(BaseModel):
@@ -459,7 +469,12 @@ class PublishNowIn(BaseModel):
 
 
 def _schedule(
-    request: Request, session: Session, post: Post, when: datetime, expected_hash: str | None
+    request: Request,
+    session: Session,
+    account_id: str | None,
+    post: Post,
+    when: datetime,
+    expected_hash: str | None,
 ) -> dict:
     _require_status(post, SCHEDULABLE, "schedule")
     if expected_hash is not None and expected_hash != post.content_hash:
@@ -469,7 +484,7 @@ def _schedule(
             "The post changed since that hash was computed.",
             content_hash=post.content_hash,
         )
-    check = _check(session, post)
+    check = _check(session, account_id, post)
     if check.errors:
         raise _error(
             422,
@@ -487,7 +502,7 @@ def _schedule(
     post.status = PostStatus.SCHEDULED
     post.scheduled_for = when.astimezone(UTC)
     post.failure = None
-    return _out(session, post)
+    return _out(session, account_id, post)
 
 
 @router.post("/posts/{post_id}/schedule", response_model=PostOut, dependencies=SchedulingWrite)
@@ -499,7 +514,7 @@ def schedule_post(
     if body.scheduled_for < request.app.state.clock.now():
         raise _error(422, "in_the_past", "scheduled_for is in the past; use publish-now.")
     post = _post(session, account, post_id)
-    return _schedule(request, session, post, body.scheduled_for, body.expected_hash)
+    return _schedule(request, session, account, post, body.scheduled_for, body.expected_hash)
 
 
 @router.post("/posts/{post_id}/publish-now", response_model=PostOut, dependencies=SchedulingWrite)
@@ -508,7 +523,9 @@ def publish_now(
 ):
     """Schedule for now; the worker picks it up on its next pass."""
     post = _post(session, account, post_id)
-    return _schedule(request, session, post, request.app.state.clock.now(), body.expected_hash)
+    return _schedule(
+        request, session, account, post, request.app.state.clock.now(), body.expected_hash
+    )
 
 
 @router.post("/posts/{post_id}/cancel", response_model=PostOut, dependencies=SchedulingWrite)
@@ -517,7 +534,7 @@ def cancel_post(post_id: str, session: SessionDep, account: Account):
     _require_status(post, EDITABLE, "cancel")
     post.status = PostStatus.CANCELLED
     post.scheduled_for = None
-    return _out(session, post)
+    return _out(session, account, post)
 
 
 def _iso(moment: datetime | None) -> str | None:
@@ -547,6 +564,7 @@ def delete_post(post_id: str, request: Request, session: SessionDep, account: Ac
             session,
             now,
             "rule.archived",
+            account_id=account,
             object_type="rule",
             object_id=rule.id,
             detail={"deleted_post_id": post.id},
@@ -617,13 +635,13 @@ def resolve_post(
         post.status = PostStatus.PUBLISHED
         post.external_ref = body.media_ref
         post.published_at = now
-        for media in _media(session, post.media_ids).values():
+        for media in _media(session, account, post.media_ids).values():
             media.delete_at = now + storage.KEEP_AFTER_PUBLISH
         bind_to_published(session, post, now)
-    for media in _media(session, post.media_ids).values():
+    for media in _media(session, account, post.media_ids).values():
         storage.revoke_url(media)
     for attempt in post.attempts:
         if attempt.result == AttemptResult.UNKNOWN and attempt.resolved_at is None:
             attempt.resolved_at = now
             attempt.resolved_as = Resolution.MANUAL
-    return _out(session, post, detail=True)
+    return _out(session, account, post, detail=True)

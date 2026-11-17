@@ -58,16 +58,24 @@ database, so a second one (`--scale worker=2`) exits with an error and restarts 
 reliable on a local Docker volume, not necessarily on a network filesystem; keep `/data` local.
 
 A fresh install runs in simulation mode: a fake Instagram with synthetic data, and no call ever
-reaches Meta. Create an API token, granting only the groups the client needs:
+reaches Meta. A token works on one account and can reach nothing of any other, so connect the
+account first and then create a token for it, granting only the groups the client needs:
 
 ```sh
-docker compose exec api jorgex-social create-token --name my-agent \
+# In simulation the fake account accepts any placeholder token; nothing reaches Meta.
+docker compose exec api jorgex-social connect-instagram
+docker compose exec api jorgex-social create-token --name my-agent --account simulated_account \
   --grant posts=write --grant scheduling=write --grant stats=read
 curl -H "Authorization: Bearer jxs_your_token_here" http://127.0.0.1:8000/v1/token
 ```
 
-The token is printed once. `jorgex-social list-tokens` and `revoke-token --name ...` manage them the
-same way. The API reference is at `/docs` in simulation; in real mode it answers 404 unless
+`--account` takes the account's username or its `account_id` (the connection's id), as
+`list-tokens` shows them; with more than one account connected, create one token per account. A
+token works only in the mode of its account: a service in real mode refuses a token of the
+simulated account with `account_in_other_mode`, and the other way round, because the worker only
+publishes to the accounts of its own mode. Create a token per mode instead of reusing one. The token is printed once and works on that account
+alone. `jorgex-social list-tokens` and `revoke-token --name ...` manage them the same way. The API
+reference is at `/docs` in simulation; in real mode it answers 404 unless
 `JORGEX_SOCIAL_API_DOCS=true`.
 
 ## Reverse proxy
@@ -272,9 +280,14 @@ or, in a `.mcp.json`:
 The first time, the client opens your browser on this service: sign in (even if you are already
 signed in, when that was over an hour ago), and a consent page shows the name the client gives
 itself (unverified: anyone can claim any name), where the answer goes back to (the client's own
-machine, `localhost` or `127.0.0.1` with a port) and the six groups, each with write, read or deny. Approve only a connection you started yourself, and only the groups the agent
-needs. The client then keeps and renews its tokens on its own (access tokens last an hour; the
-renewal token thirty days and changes on every use).
+machine, `localhost` or `127.0.0.1` with a port), which of your connected accounts the client may
+use (exactly one; with a single account it is already chosen) and the six groups, each with write,
+read or deny. Approve only a connection you started yourself, and only the groups the agent
+needs. Every token the client gets from that consent works on that account and on no other: for a
+second account, the client goes through consent again. The client then keeps and renews its tokens
+on its own (access tokens last an hour; the renewal token thirty days and changes on every use).
+Without a connected account the page says so and grants nothing: connect one first
+(`connect-instagram`).
 
 Every tool of the local MCP server is there, and each call is checked against what you granted: a
 denied group answers with a `forbidden` error. Files are not read from a path, which would be the
@@ -436,7 +449,15 @@ accounts, and this one serves only yours. If a new app behaves differently, plea
 2. In `.env`, set `JORGEX_SOCIAL_PUBLIC_URL=https://social.example.com` (your domain) and
    `JORGEX_SOCIAL_SIMULATION=false`.
 3. Apply the change with `docker compose up -d`. `GET /v1/account` reports the connection, open
-   incidents, the kill switch and the webhook.
+   incidents, the kill switch and the webhook. Create a token for the real account, since the one
+   you made in simulation works on the simulated account alone:
+
+   ```sh
+   docker compose exec api jorgex-social create-token --name my-agent --account <its username> \
+     --grant posts=write --grant scheduling=write --grant stats=read
+   ```
+
+   `list-tokens` shows which account each token works on.
 
 In real mode the worker refuses to start without a connected account, so connect before switching.
 
@@ -620,6 +641,13 @@ docker compose down && docker compose up -d --build
 
 Then run the real-address check in [Reverse proxy](#reverse-proxy) before relying on the sign-in
 limits.
+
+A token that existed before the version that bound each one to an account is bound to the
+installation's account by that upgrade. If the database had no connection at all (a simulation
+install that created a token before connecting anything), that account was never connected: it
+still belongs to the `instagram` mode, so a service in simulation refuses its tokens with
+`account_in_other_mode`. Run `connect-instagram` in simulation (any placeholder token is accepted)
+and create a new token for the account `list-tokens` then shows.
 
 Compose stops the old worker before it replaces `api`, so the new version migrates with no worker
 running, and starts the new worker once `api` is healthy again. On stop, the worker finishes the

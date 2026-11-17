@@ -183,6 +183,7 @@ class Intake:
             session,
             now,
             "conversation.opted_out",
+            account_id=person.account_id,
             object_type="conversation",
             object_id=person.id,
         )

@@ -18,16 +18,19 @@ from fastapi.testclient import TestClient
 from mcp.client.auth import OAuthClientProvider
 from mcp.server.auth.provider import TokenError
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 
 from jorgex_social.access import operator
-from jorgex_social.account import appearance, crypto
+from jorgex_social.access.tokens import create_token
+from jorgex_social.account import appearance, crypto, scope
+from jorgex_social.account.models import Connection
 from jorgex_social.api import create_app
 from jorgex_social.cli import main
 from jorgex_social.clock import ManualClock
 from jorgex_social.config import Settings
 from jorgex_social.oauth import store
 from jorgex_social.oauth.models import OAuthGrant, OAuthToken
+from jorgex_social.publishing.models import Media
 from jorgex_social.ui.routes import COOKIE
 
 PUBLIC = "http://localhost"
@@ -37,6 +40,10 @@ START = datetime(2026, 10, 30, 12, 0, 10, tzinfo=UTC)
 PASSWORD = "correct horse battery staple"
 TOTP_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 ALL_DENIED = {g: "deny" for g in ("posts", "scheduling", "rules", "events", "stats", "account")}
+# The account a client is allowed over: the simulated one, with the id the fake reports.
+ACCOUNT = "simulated_account"
+ACCOUNT_ID = "17841400000000000"
+JPEG = b"\xff\xd8\xff\xe0" + b"j" * 64
 
 
 @pytest.fixture
@@ -63,7 +70,31 @@ def app(settings, clock):
             pyotp.TOTP(TOTP_SECRET).at(earlier),
             earlier,
         )
+        # A client can only be allowed over a connected account: there is one from the start.
+        account = scope.current_account(session, app.state.network)
+        account.external_account_id = ACCOUNT_ID
+        account.username = ACCOUNT
+        account.account_type = "BUSINESS"
     return app
+
+
+def account_id(app) -> str:
+    with app.state.read_sessionmaker() as session:
+        return session.scalar(select(Connection.id))
+
+
+def add_account(app, username: str) -> str:
+    """A second connected account, for the tests that choose between them."""
+    with app.state.sessionmaker() as session, session.begin():
+        account = Connection(
+            id=username,
+            network=app.state.network,
+            external_account_id=f"1784{username}",
+            username=username,
+            account_type="BUSINESS",
+        )
+        session.add(account)
+    return account.id
 
 
 @pytest.fixture
@@ -122,8 +153,13 @@ def start(agent, client_id, challenge, **params):
 
 
 def open_consent(browser, location):
+    """The page, and the fields a browser would post back: the request, its one-use value and the
+    first account the page offers (the only one, or the preselected one)."""
     page = browser.get(location, follow_redirects=False)
     fields = dict(re.findall(r'name="(req|nonce)" value="([^"]+)"', page.text))
+    offered = re.findall(r'name="account_id" value="([^"]+)"', page.text)
+    if offered:
+        fields["account_id"] = offered[0]
     return page, fields
 
 
@@ -235,6 +271,8 @@ async def operator_oauth(transport, clock, **levels):
         page = await browser.get(to_consent.headers["location"])
         seen["page"] = page
         fields = dict(re.findall(r'name="(req|nonce)" value="([^"]+)"', page.text))
+        offered = re.findall(r'name="account_id" value="([^"]+)"', page.text)
+        fields["account_id"] = offered[0]
         seen.update(fields)
         seen["back"] = await browser.post(
             "/ui/oauth/consent", data={**fields, "decision": "allow", **levels}
@@ -505,7 +543,7 @@ def test_the_consent_page_shows_the_client_as_unverified_and_allows_only_its_ori
     assert page.status_code == 200
     assert "Totally Official" in page.text and "unverified" in page.text
     assert "127.0.0.1:33418" in page.text
-    assert set(fields) == {"req", "nonce"}
+    assert set(fields) == {"req", "nonce", "account_id"}
     csp = page.headers["content-security-policy"]
     assert "form-action 'self' http://127.0.0.1:33418;" in csp
     assert "form-action 'self';" in browser.get("/ui/").headers["content-security-policy"]
@@ -600,6 +638,166 @@ def test_an_unknown_level_is_refused(agent, browser):
     _, fields = open_consent(browser, start(agent, client_id, pkce()[1]).headers["location"])
 
     assert answer(browser, fields, posts="admin").status_code == 400
+
+
+def test_the_answer_names_the_account_the_grant_works_on(app, agent, browser):
+    """The page offers every connected account and the grant stores the chosen one; every token
+    issued from it works on that account and no other."""
+    second = add_account(app, "second_account")
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    page, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+
+    shown = re.findall(r'name="account_id" value="([^"]+)"', page.text)
+    assert set(shown) == {account_id(app), second}
+    assert "checked" not in page.text.split("</fieldset>")[0]  # two accounts: none chosen
+
+    fields["account_id"] = second
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    tokens = exchange(agent, client_id, code, verifier).json()
+
+    with app.state.read_sessionmaker() as session:
+        assert session.scalar(select(OAuthGrant.account_id)) == second
+    shown_account = api(agent, tokens["access_token"]).json()["account"]
+    assert shown_account["connection_id"] == second
+    # A second consent of the same client, on the other account, is another grant.
+    _, second_client = connect(agent, browser, stats="read")
+    assert api(agent, second_client["access_token"]).json()["account"]["connection_id"] == (
+        account_id(app)
+    )
+
+
+def test_a_grant_of_one_account_sees_nothing_of_the_other(app, agent, browser):
+    other = add_account(app, "other_account")
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "other-agent", {"posts": "write"}, other)
+    theirs = api(agent, secret, "/v1/posts", "POST", json={"type": "image", "items": []}).json()
+
+    _, tokens = connect(agent, browser, posts="read")
+    mine = api(agent, tokens["access_token"], "/v1/posts").json()
+
+    assert mine == []
+    assert api(agent, tokens["access_token"], f"/v1/posts/{theirs['id']}").status_code == 404
+
+
+def test_a_grant_of_the_other_mode_is_refused(app, agent, browser):
+    """A grant on the account of the other mode cannot write what the worker never sweeps: the
+    API refuses it with account_in_other_mode, as it does for an API token."""
+    with app.state.sessionmaker() as session, session.begin():
+        other_mode = Connection(
+            id="other-mode",
+            network="instagram",  # the service runs in simulation
+            external_account_id="1784real",
+            username="real_account",
+            account_type="BUSINESS",
+        )
+        session.add(other_mode)
+        _, secret = create_token(session, "real-agent", {"posts": "write"}, other_mode.id)
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+    fields["account_id"] = other_mode.id
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    tokens = exchange(agent, client_id, code, verifier).json()
+
+    # Both credentials say which account they work on, and this one is of the other mode.
+    for response in (api(agent, tokens["access_token"]), api(agent, secret)):
+        assert response.json()["account"]["network"] == "instagram"
+    for response in (
+        api(agent, tokens["access_token"], "/v1/posts"),
+        api(agent, secret, "/v1/posts"),
+    ):
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "account_in_other_mode"
+    # A credential of this mode works, so the refusal is about the mode and not everything.
+    _, mine = connect(agent, browser, posts="read")
+    assert api(agent, mine["access_token"], "/v1/posts").status_code == 200
+
+
+def test_the_code_needs_its_account_still_connected(app, agent, browser):
+    """Between the consent page and the exchange the account may go away: the client gets a new
+    code through consent instead of a grant that cannot be stored."""
+    second = add_account(app, "second_account")
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+    fields["account_id"] = second
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    with app.state.sessionmaker() as session, session.begin():
+        session.get(Connection, second).external_account_id = ""  # disconnected
+
+    response = exchange(agent, client_id, code, verifier)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_grant"
+    assert rows(app, "SELECT count(*) FROM oauth_grants") == [(0,)]
+
+
+def test_a_remote_upload_lands_on_the_account_of_its_grant(app, agent, browser):
+    """A one-use upload URL carries the grant, so the file belongs to that grant's account and no
+    other account can put it in a post."""
+    second = add_account(app, "second_account")
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+    fields["account_id"] = second
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    tokens = exchange(agent, client_id, code, verifier).json()
+    access = tokens["access_token"]
+
+    issued = api(agent, access, "/v1/upload-urls", "POST").json()
+    uploaded = agent.post(urlsplit(issued["url"]).path, content=JPEG)
+    assert uploaded.status_code == 201
+    media = uploaded.json()
+
+    with app.state.read_sessionmaker() as session:
+        assert session.scalar(select(Media.account_id).where(Media.id == media["id"])) == second
+    # The other account's credential cannot use it, in a post or as a cover.
+    with app.state.sessionmaker() as session, session.begin():
+        _, secret = create_token(session, "first-agent", {"posts": "write"}, account_id(app))
+    others = agent.post(
+        "/v1/posts",
+        json={"type": "image", "items": [media["id"]], "cover_media_id": media["id"]},
+        headers={"authorization": f"Bearer {secret}"},
+    )
+    assert others.status_code == 422
+    assert others.json()["detail"]["code"] == "unknown_media"
+    # Its own account writes the post with it.
+    mine = api(agent, access, "/v1/posts", "POST", json={"type": "image", "items": [media["id"]]})
+    assert mine.status_code == 201
+    assert mine.json()["items"] == [media["id"]]
+
+
+def test_a_forged_account_is_refused_and_grants_nothing(app, agent, browser):
+    add_account(app, "second_account")
+    client_id = register(agent).json()["client_id"]
+    verifier, challenge = pkce()
+    _, fields = open_consent(browser, start(agent, client_id, challenge).headers["location"])
+
+    response = answer(browser, {**fields, "account_id": "made-up"}, posts="write")
+
+    assert response.status_code == 400
+    assert "not connected" in response.text
+    assert rows(app, "SELECT count(*) FROM oauth_codes") == [(0,)]
+    assert rows(app, "SELECT count(*) FROM oauth_grants") == [(0,)]
+    # The request was not used up: answering it with an account the page offers still works.
+    code = query_of(answer(browser, fields, posts="write"))["code"]
+    assert exchange(agent, client_id, code, verifier).status_code == 200
+
+
+def test_with_no_account_there_is_nothing_to_authorize(app, agent, browser):
+    with app.state.sessionmaker() as session, session.begin():
+        session.execute(delete(Connection))
+    client_id = register(agent).json()["client_id"]
+
+    page = browser.get(
+        start(agent, client_id, pkce()[1]).headers["location"], follow_redirects=False
+    )
+
+    assert page.status_code == 409
+    assert "No account is connected" in page.text
+    assert 'name="decision"' not in page.text and 'name="account_id"' not in page.text
+    assert rows(app, "SELECT count(*) FROM oauth_requests") == [(1,)]  # still open, untouched
 
 
 # Codes

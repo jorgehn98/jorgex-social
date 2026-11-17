@@ -7,14 +7,67 @@ from jorgex_social.cli import main
 from jorgex_social.db import make_engine
 
 
+def connect_account(settings, monkeypatch) -> None:
+    """Connects the simulated account, as an install does before creating its first token."""
+    import io
+
+    monkeypatch.setenv("JORGEX_SOCIAL_SECRET_KEY_FILE", str(settings.secret_key_file))
+    monkeypatch.setattr("sys.stdin", io.StringIO("pasted-token-not-real\n"))
+    main(["connect-instagram"])
+
+
 def test_create_token_prints_secret_once(settings, monkeypatch, capsys):
     monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+    connect_account(settings, monkeypatch)
+    capsys.readouterr()
 
-    main(["create-token", "--name", "agent", "--grant", "posts=write"])
+    main(
+        [
+            "create-token",
+            "--name",
+            "agent",
+            "--account",
+            "simulated_account",
+            "--grant",
+            "posts=write",
+        ]
+    )
 
     out = json.loads(capsys.readouterr().out)
     assert out["token"].startswith("jxs_")
     assert out["permissions"]["posts"] == "write"
+    assert out["account"]["username"] == "simulated_account"
+    assert out["account"]["network"] == "simulation"
+
+
+def test_create_token_needs_a_connected_account(settings, monkeypatch, capsys):
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+
+    with pytest.raises(SystemExit, match="no account is connected"):
+        main(["create-token", "--name", "agent", "--account", "simulated_account"])
+
+    connect_account(settings, monkeypatch)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit, match="no connected account is named"):
+        main(["create-token", "--name", "agent", "--account", "somebody_else"])
+
+
+def test_create_token_accepts_the_account_id(settings, monkeypatch, capsys):
+    monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
+    connect_account(settings, monkeypatch)
+    capsys.readouterr()
+
+    main(["create-token", "--name", "agent", "--account", "simulated_account"])
+    account_id = json.loads(capsys.readouterr().out)["account"]["connection_id"]
+    main(["create-token", "--name", "reader", "--account", account_id])
+
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["account"]["connection_id"] == account_id
+    main(["list-tokens"])
+    tokens = {token["name"]: token for token in json.loads(capsys.readouterr().out)}
+    assert tokens["reader"]["account"] == "simulated_account"
+    assert tokens["reader"]["account_id"] == account_id
 
 
 def test_migrate_creates_schema_from_scratch(tmp_path, monkeypatch):
@@ -62,7 +115,9 @@ def test_worker_stops_on_sigterm(settings):
 
 def test_revoked_token_is_listed_without_secret(settings, monkeypatch, capsys):
     monkeypatch.setenv("JORGEX_SOCIAL_DATABASE_PATH", str(settings.database_path))
-    main(["create-token", "--name", "agent"])
+    connect_account(settings, monkeypatch)
+    capsys.readouterr()
+    main(["create-token", "--name", "agent", "--account", "simulated_account"])
     secret = json.loads(capsys.readouterr().out)["token"]
 
     main(["revoke-token", "--name", "agent"])

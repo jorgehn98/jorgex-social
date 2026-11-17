@@ -16,8 +16,17 @@
   <form class="card" method="post" action="/ui/oauth/consent">
     <span class="wordmark">{% include "_wordmark.html" %}</span>
     <h1>Connect a client</h1>
-    <p>A client calling itself <strong>{{ client_name or "(no name)" }}</strong> <span class="muted">(unverified)</span> asks to use this account.</p>
+    <p>A client calling itself <strong>{{ client_name or "(no name)" }}</strong> <span class="muted">(unverified)</span> asks to use one of your accounts. Everything it does afterwards happens on that account, and it cannot reach any other.</p>
     <p class="muted">Your answer goes back to <code>{{ host }}{% if port %}:{{ port }}{% endif %}</code>. Approve only a connection you started yourself, and only the groups it needs.</p>
+    <fieldset class="consent-accounts">
+      <legend>Account</legend>
+      {% for account in accounts %}
+      <label>
+        <input type="radio" name="account_id" value="{{ account.id }}"{% if account.id == chosen %} checked{% endif %} required>
+        <span><strong>{{ account.username }}</strong> <span class="muted">{{ account.network }}</span></span>
+      </label>
+      {% endfor %}
+    </fieldset>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Group</th>{% for level in levels %}<th>{{ level }}</th>{% endfor %}</tr></thead>

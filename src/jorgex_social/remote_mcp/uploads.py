@@ -16,7 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from jorgex_social.access.deps import Principal, require
 from jorgex_social.access.limits import client_key
 from jorgex_social.access.tokens import Group, Level, hash_token
-from jorgex_social.account.audit import set_actor
+from jorgex_social.account.audit import set_account, set_actor
 from jorgex_social.oauth import store as oauth
 from jorgex_social.oauth.models import OAuthGrant
 from jorgex_social.publishing import media as storage
@@ -65,10 +65,10 @@ def _usable(session: Session, token: str, now: datetime) -> UploadUrl | None:
     return found
 
 
-def spend(state, token: str) -> str | None:
+def spend(state, token: str) -> tuple[str, str] | None:
     """Marks the URL used before a byte is written, so it never takes two uploads, and returns
-    its grant. Looked up first in a read transaction: a made-up token never takes the write
-    lock."""
+    its grant and the account that grant works on. Looked up first in a read transaction: a
+    made-up token never takes the write lock."""
     with state.read_sessionmaker() as session, session.begin():
         if _usable(session, token, state.clock.now()) is None:
             return None
@@ -77,7 +77,7 @@ def spend(state, token: str) -> str | None:
         if found is None:
             return None
         found.used_at = state.clock.now()
-        return found.grant_id
+        return found.grant_id, session.get_one(OAuthGrant, found.grant_id).account_id
 
 
 @router.post("/v1/upload-urls", status_code=status.HTTP_201_CREATED, tags=["publishing"])
@@ -127,8 +127,10 @@ async def upload(upload_token: str, request: Request):
     client = client_key(request.client.host if request.client else None)
     if state.oauth_limiter.hit(client, state.clock.now()) is not None:
         raise HTTPException(429)
-    grant_id = await run_in_threadpool(spend, state, upload_token)
-    if grant_id is None:
+    spent = await run_in_threadpool(spend, state, upload_token)
+    if spent is None:
         raise HTTPException(404)
+    grant_id, account_id = spent
     set_actor(request, f"oauth:{grant_id}")  # audited under the grant, like its API calls
-    return await save_upload(request)
+    set_account(request, account_id)  # and the media belong to that account
+    return await save_upload(request, account_id)

@@ -68,7 +68,10 @@ def task(ig, clock, key):
 
 def headers_for(app, **grants):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, f"agent-{len(grants)}-{sorted(grants)}", grants)
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(
+            session, f"agent-{len(grants)}-{sorted(grants)}", grants, account.id
+        )
     return {"Authorization": f"Bearer {secret}"}
 
 

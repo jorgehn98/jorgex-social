@@ -8,10 +8,14 @@ from jorgex_social.db import Base, UTCDateTime, utcnow
 
 
 class ApiToken(Base):
+    """One credential for one account: the API works on that account and can reach no other
+    (decision 10). There is no way to widen or move it."""
+
     __tablename__ = "api_tokens"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid7()))
     name: Mapped[str] = mapped_column(String(100), unique=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("connections.id"))
     # Shown in listings so a token can be recognised without storing it.
     prefix: Mapped[str] = mapped_column(String(16))
     hash: Mapped[str] = mapped_column(String(64), unique=True)

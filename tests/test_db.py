@@ -3,6 +3,7 @@ from sqlalchemy import text
 
 from jorgex_social.access.deps import SessionDep
 from jorgex_social.access.models import ApiToken
+from jorgex_social.account import scope
 from jorgex_social.db import make_engine, make_sessionmaker
 
 
@@ -17,11 +18,15 @@ def test_reads_happen_inside_the_transaction(settings):
 
 def test_failed_commit_is_an_error_not_a_success(app):
     """The commit runs before the response, so the client never sees 2xx for lost data."""
+    with app.state.sessionmaker() as session, session.begin():
+        account_id = scope.current_account(session, app.state.network).id
 
     @app.post("/probe")
     def probe(session: SessionDep):
         for _ in range(2):  # same unique name: only fails when the commit flushes
-            session.add(ApiToken(name="dup", prefix="p", hash=str(_), permissions={}))
+            session.add(
+                ApiToken(name="dup", account_id=account_id, prefix="p", hash=str(_), permissions={})
+            )
         return {"ok": True}
 
     response = TestClient(app, raise_server_exceptions=False).post("/probe")

@@ -12,10 +12,9 @@ from sqlalchemy.exc import IntegrityError
 from jorgex_social.access.tokens import create_token
 from jorgex_social.account import kill_switch, scope
 from jorgex_social.account.connection import ConnectionTask
-from jorgex_social.account.models import AuditEntry, ChannelIncident
+from jorgex_social.account.models import AuditEntry, ChannelIncident, Connection
 from jorgex_social.api import create_app
 from jorgex_social.clock import ManualClock
-from jorgex_social.config import Settings
 from jorgex_social.instagram.client import InstagramClient
 from jorgex_social.instagram.errors import AccountRestricted, RateLimited, Refused, Unavailable
 from jorgex_social.instagram.fake import ACCOUNT_ID, FakeInstagram
@@ -70,7 +69,8 @@ def sessions(app):
 @pytest.fixture
 def headers(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "agent", {"rules": "write", "events": "read"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "agent", {"rules": "write", "events": "read"}, account.id)
     return {"Authorization": f"Bearer {secret}"}
 
 
@@ -392,7 +392,8 @@ def test_rule_test_endpoint_stores_nothing(client, headers, settings):
 
 def test_permissions(app, client, headers):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "reader", {"rules": "read", "events": "read"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "reader", {"rules": "read", "events": "read"}, account.id)
     reader = {"Authorization": f"Bearer {secret}"}
 
     assert client.get("/v1/rules", headers=reader).status_code == 200
@@ -1248,7 +1249,8 @@ def kill_switch_is_on(sessions):
 @pytest.fixture
 def operator(app):
     with app.state.sessionmaker() as session, session.begin():
-        _, secret = create_token(session, "operator", {"account": "write"})
+        account = scope.current_account(session, app.state.network)
+        _, secret = create_token(session, "operator", {"account": "write"}, account.id)
     return {"Authorization": f"Bearer {secret}"}
 
 
@@ -1782,18 +1784,20 @@ def test_a_timed_pause_cannot_lift_an_opt_out(client, headers, ig, sessions, tas
     assert client.post(pause, json={"until": until}, headers=headers).status_code == 200
 
 
-def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
-    settings, clock, app, client, headers
-):
-    """The simulation and the real account have one of each, and neither lists the other's."""
-    from fastapi.testclient import TestClient
-
+def test_each_account_sees_only_its_own_events_deliveries_and_conversations(app, client, headers):
+    """Two accounts of the installation have one event, a delivery and a conversation each, and no
+    credential lists the other's: the account, not the installation, decides what a call sees."""
     with app.state.sessionmaker() as session, session.begin():
-        for network, person in (("simulation", "person-simulated"), ("instagram", "person-real")):
-            account = scope.current_account(session, network)
+        mine = scope.current_account(session, app.state.network)
+        other = Connection(
+            network=app.state.network, external_account_id="1784other", username="other_account"
+        )
+        session.add(other)
+        session.flush()
+        for account, name in ((mine, "mine"), (other, "other")):
             conversation = Conversation(
                 account_id=account.id,
-                external_id=person,
+                external_id=f"person-{name}",
                 last_user_message_at=START,
                 window_until=START,
                 paused_forever=False,
@@ -1803,7 +1807,7 @@ def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
             )
             rule = Rule(
                 account_id=account.id,
-                name=person,
+                name=name,
                 channel="message",
                 priority=1,
                 active=True,
@@ -1816,7 +1820,7 @@ def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
             event = Event(
                 account_id=account.id,
                 type="message",
-                external_ref=f"message-{network}",
+                external_ref=f"message-{name}",
                 conversation_id=conversation.id,
                 occurred_at=START,
                 received_at=START,
@@ -1835,23 +1839,23 @@ def test_each_mode_sees_only_its_own_events_deliveries_and_conversations(
                     created_at=START,
                 )
             )
+        _, other_secret = create_token(
+            session, "other-agent", {"rules": "read", "events": "read"}, other.id
+        )
+    theirs = {"Authorization": f"Bearer {other_secret}"}
 
-    real = TestClient(
-        create_app(Settings(database_path=settings.database_path, simulation=False), clock)
-    )
-
-    for mode in (client, real):
+    for token in (headers, theirs):
         for resource in ("events", "deliveries", "conversations"):
-            assert len(mode.get(f"/v1/{resource}", headers=headers).json()) == 1, resource
+            assert len(client.get(f"/v1/{resource}", headers=token).json()) == 1, resource
     assert [e["external_ref"] for e in client.get("/v1/events", headers=headers).json()] == [
-        "message-simulation"
+        "message-mine"
     ]
-    assert [e["external_ref"] for e in real.get("/v1/events", headers=headers).json()] == [
-        "message-instagram"
+    assert [e["external_ref"] for e in client.get("/v1/events", headers=theirs).json()] == [
+        "message-other"
     ]
     assert [c["external_id"] for c in client.get("/v1/conversations", headers=headers).json()] == [
-        "person-simulated"
+        "person-mine"
     ]
-    assert [c["external_id"] for c in real.get("/v1/conversations", headers=headers).json()] == [
-        "person-real"
+    assert [c["external_id"] for c in client.get("/v1/conversations", headers=theirs).json()] == [
+        "person-other"
     ]

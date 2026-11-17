@@ -1,13 +1,12 @@
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query
 from pydantic import AwareDatetime, BaseModel
 from sqlalchemy import func, select
 
-from jorgex_social.access.deps import SessionDep, require
+from jorgex_social.access.deps import AccountIdDep, SessionDep, require
 from jorgex_social.access.tokens import Group, Level
-from jorgex_social.account import scope
 from jorgex_social.stats.models import AccountSnapshot, PostSnapshot, RecentMedia
 
 StatsRead = [Depends(require(Group.STATS, Level.READ))]
@@ -38,13 +37,9 @@ Limit = Annotated[int, Query(ge=1, le=1000)]
 Offset = Annotated[int, Query(ge=0)]
 
 
-def _account(request: Request, session: SessionDep) -> str | None:
-    # In simulation the API shows only simulated rows, and in production only real ones: each
-    # mode's rows belong to its own account. None matches no row.
-    return scope.account_id_of(session, request.app.state.network)
-
-
-Account = Annotated[str | None, Depends(_account)]
+# The account of the call: the token's or its OAuth grant's. The web interface passes the one
+# account of the mode, which it still resolves itself.
+Account = AccountIdDep
 
 
 @router.get("/account", response_model=list[AccountSnapshotOut])

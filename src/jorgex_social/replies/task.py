@@ -473,6 +473,8 @@ class ReplyTask:
         with sessions() as session, session.begin():
             account = scope.account_of(session, self.instagram.network)
             account_id = account and account.id
+            if account_id is None:
+                return  # nothing written for this mode yet: no account's incident to open
             if not self.webhook:
                 incidents.sync(session, account_id, IncidentType.WEBHOOK_SILENT, False, now)
                 return
